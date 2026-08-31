@@ -186,7 +186,14 @@ defmodule SymphonyElixir.CoordinationAdapter do
         record_already_satisfied(ledger, action, effect)
 
       {:error, reason, disposition}
-      when disposition in [:preflight_rejected, :retryable_failure, :quarantined, :needs_input, :terminal_failure] ->
+      when disposition in [
+             :preflight_rejected,
+             :retryable_failure,
+             :uncertain,
+             :quarantined,
+             :needs_input,
+             :terminal_failure
+           ] ->
         record_failure(ledger, action, reason, disposition)
 
       other ->

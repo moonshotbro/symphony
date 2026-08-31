@@ -13,9 +13,30 @@ defmodule SymphonyElixir.Codex.CoordinationEffects do
   alias SymphonyElixir.ActionLedger.Action
   alias SymphonyElixir.Codex.AppServer
 
-  @type operation :: :task_messaging | :automation | :fork | :handoff
+  @type operation :: :task_creation | :task_messaging | :automation | :fork | :handoff
 
   @unsupported_operations [:task_messaging, :automation, :handoff]
+
+  @doc "Routes every production coordination effect through its typed, ledger-backed boundary."
+  @spec dispatch(GenServer.server(), ActionLedger.intent(), operation(), term()) ::
+          CoordinationAdapter.dispatch_result(term())
+  def dispatch(ledger, intent, operation, effect), do: dispatch(ledger, intent, operation, effect, [])
+
+  @spec dispatch(GenServer.server(), ActionLedger.intent(), operation(), term(), keyword()) ::
+          CoordinationAdapter.dispatch_result(term())
+  def dispatch(ledger, intent, :task_creation, effect_fun, opts) when is_function(effect_fun, 0) do
+    CoordinationAdapter.dispatch(ledger, intent, effect_fun, opts)
+  end
+
+  def dispatch(ledger, intent, :fork, workspace, opts) when is_binary(workspace) do
+    dispatch_fork(ledger, intent, workspace, opts)
+  end
+
+  def dispatch(ledger, intent, operation, _effect, _opts) when operation in @unsupported_operations do
+    reject_unsupported(ledger, intent, operation)
+  end
+
+  def dispatch(_ledger, _intent, _operation, _effect, _opts), do: {:error, :coordination_operation_invalid}
 
   @doc "Returns the provider capability state without probing or mutating the desktop host."
   @spec capability(operation()) :: :supported | :unsupported
@@ -77,22 +98,45 @@ defmodule SymphonyElixir.Codex.CoordinationEffects do
   def inspect_recovered_fork(%Action{}, _workspace), do: {:error, :fork_action_required}
 
   defp fork_effect(workspace, source_thread_id, opts) do
-    with {:ok, result} <-
-           AppServer.with_control_connection(workspace, &read_and_fork(&1, source_thread_id, opts)),
-         {:ok, source_thread, fork_thread} <- result,
-         {:ok, effect} <- fork_effect_evidence(source_thread, fork_thread, source_thread_id) do
-      {:ok, fork_thread, effect}
-    else
-      {:error, reason} -> {:error, reason, :retryable_failure}
+    case AppServer.with_control_connection(workspace, &read_and_fork(&1, source_thread_id, opts)) do
+      {:ok, {:ok, source_thread, fork_thread}} ->
+        case fork_effect_evidence(source_thread, fork_thread, source_thread_id) do
+          {:ok, effect} -> {:ok, fork_thread, effect}
+          {:error, reason} -> {:error, reason, :retryable_failure}
+        end
+
+      # A failure while reading the source is provably before the mutating
+      # request and may be retried. Once thread/fork has been written, an
+      # absent response is ambiguous: a child may exist, so recover first.
+      {:ok, {:error, {:fork_submitted, reason}}} ->
+        {:error, reason, fork_failure_disposition(reason)}
+
+      {:ok, {:error, reason}} ->
+        {:error, reason, :retryable_failure}
+
+      {:error, reason} ->
+        {:error, reason, :retryable_failure}
     end
   end
 
   defp read_and_fork(connection, source_thread_id, opts) do
-    with {:ok, source_thread} <- AppServer.read_stored_thread(connection, source_thread_id),
-         {:ok, fork_thread} <- AppServer.fork_stored_thread(connection, source_thread_id, opts) do
-      {:ok, source_thread, fork_thread}
+    with {:ok, source_thread} <- AppServer.read_stored_thread(connection, source_thread_id) do
+      case AppServer.fork_stored_thread(connection, source_thread_id, opts) do
+        {:ok, fork_thread} -> {:ok, source_thread, fork_thread}
+        {:error, reason} -> {:error, {:fork_submitted, reason}}
+      end
     end
   end
+
+  # JSON-RPC provider errors are definitive rejections of this request. A
+  # timeout, EOF/closed port, or process exit after Port.command may have
+  # happened after Codex created the child and must never be replayed blindly.
+  defp fork_failure_disposition({:response_error, _error}), do: :retryable_failure
+  defp fork_failure_disposition({:invalid_thread_fork_response, _response}), do: :retryable_failure
+  defp fork_failure_disposition(:fork_identity_reused_source), do: :retryable_failure
+  defp fork_failure_disposition(:invalid_thread_id), do: :retryable_failure
+  defp fork_failure_disposition(:invalid_turn_id), do: :retryable_failure
+  defp fork_failure_disposition(_reason), do: :uncertain
 
   defp inspect_recorded_fork(workspace, source_thread_id, fork_thread_id) do
     case AppServer.with_control_connection(workspace, fn connection ->

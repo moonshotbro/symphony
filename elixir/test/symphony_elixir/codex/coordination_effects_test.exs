@@ -27,6 +27,20 @@ defmodule SymphonyElixir.Codex.CoordinationEffectsTest do
     assert action.observed_effect == %{"disposition" => "provider_capability_unsupported"}
   end
 
+  test "typed production boundary routes task creation and rejects unsupported effects", %{ledger: ledger} do
+    task_creation = %{intent(:fork) | kind: :task_creation, expected_postcondition: "codex.session_observed"}
+
+    assert {:ok, :worker_started, action} =
+             CoordinationEffects.dispatch(ledger, task_creation, :task_creation, fn ->
+               {:ok, :worker_started, %{"disposition" => "worker_spawned"}}
+             end)
+
+    assert action.state == :succeeded
+
+    assert {:error, {:provider_capability_unsupported, :handoff}} =
+             CoordinationEffects.dispatch(ledger, intent(:handoff), :handoff, :no_effect)
+  end
+
   test "fork adapter rejects an intent that cannot bind a source thread", %{ledger: ledger} do
     invalid = Map.delete(intent(:fork), :target)
     assert {:error, :fork_intent_invalid} = CoordinationEffects.dispatch_fork(ledger, invalid, "/tmp")
@@ -140,6 +154,25 @@ defmodule SymphonyElixir.Codex.CoordinationEffectsTest do
     assert action.state == :already_satisfied
   end
 
+  test "lost fork response becomes uncertain and cannot replay a duplicate fork", %{ledger: ledger, root: root} do
+    workspace = prepare_provider!(root, :timeout)
+    trace_file = Path.join(root, "fork-timeout.trace")
+
+    assert {:error, :response_timeout} =
+             CoordinationEffects.dispatch_fork(ledger, intent(:fork), workspace)
+
+    assert File.read!(trace_file) == "thread/fork\n"
+    assert {:ok, action, :existing} = ActionLedger.plan(ledger, intent(:fork))
+    assert action.state == :uncertain
+    action_id = action.id
+
+    assert {:error, {:uncertain_action_quarantined, ^action_id}} =
+             CoordinationEffects.dispatch_fork(ledger, intent(:fork), workspace)
+
+    trace = File.read!(trace_file)
+    assert trace == "thread/fork\n"
+  end
+
   defp intent(kind) do
     %{
       kind: kind,
@@ -158,26 +191,9 @@ defmodule SymphonyElixir.Codex.CoordinationEffectsTest do
     codex_binary = Path.join(root, "fake-codex-#{mode}")
     File.mkdir_p!(workspace)
 
-    child_read_response =
-      case mode do
-        :valid ->
-          ~s({"id":10,"result":{"thread":{"id":"thread-child","sessionId":"session-root","forkedFromId":"thread-source"}}})
+    child_read_response = child_read_response(mode)
 
-        :wrong_fork ->
-          ~s({"id":10,"result":{"thread":{"id":"thread-child","sessionId":"session-root","forkedFromId":"thread-other"}}})
-
-        :read_error ->
-          ~s({"id":10,"error":{"message":"read failed"}})
-      end
-
-    fork_response =
-      case mode do
-        :wrong_fork ->
-          ~s({"id":11,"result":{"thread":{"id":"thread-child","sessionId":"session-root","forkedFromId":"thread-other"}}})
-
-        _ ->
-          ~s({"id":11,"result":{"thread":{"id":"thread-child","sessionId":"session-root","forkedFromId":"thread-source"}}})
-      end
+    timeout_trace = Path.join(root, "fork-timeout.trace")
 
     File.write!(codex_binary, """
     #!/bin/sh
@@ -186,7 +202,7 @@ defmodule SymphonyElixir.Codex.CoordinationEffectsTest do
         *'"method":"initialize"'*) printf '%s\\n' '{"id":1,"result":{}}' ;;
         *'"method":"thread/read"'*'thread-child'*) printf '%s\\n' '#{child_read_response}' ;;
         *'"method":"thread/read"'*) printf '%s\\n' '{"id":10,"result":{"thread":{"id":"thread-source","sessionId":"session-root"}}}' ;;
-        *'"method":"thread/fork"'*) printf '%s\\n' '#{fork_response}' ;;
+        *'"method":"thread/fork"'*) #{fork_command(mode, timeout_trace)} ;;
       esac
     done
     """)
@@ -195,9 +211,26 @@ defmodule SymphonyElixir.Codex.CoordinationEffectsTest do
 
     write_workflow_file!(Workflow.workflow_file_path(),
       workspace_root: workspace_root,
-      codex_command: "#{codex_binary} app-server"
+      codex_command: "#{codex_binary} app-server",
+      codex_read_timeout_ms: if(mode == :timeout, do: 1_000, else: 5_000)
     )
 
     workspace
   end
+
+  defp child_read_response(:wrong_fork),
+    do: ~s({"id":10,"result":{"thread":{"id":"thread-child","sessionId":"session-root","forkedFromId":"thread-other"}}})
+
+  defp child_read_response(:read_error), do: ~s({"id":10,"error":{"message":"read failed"}})
+
+  defp child_read_response(_mode),
+    do: ~s({"id":10,"result":{"thread":{"id":"thread-child","sessionId":"session-root","forkedFromId":"thread-source"}}})
+
+  defp fork_command(:timeout, trace_file), do: "printf '%s\\n' 'thread/fork' >> '#{trace_file}'"
+
+  defp fork_command(:wrong_fork, _trace_file),
+    do: "printf '%s\\n' '{\"id\":11,\"result\":{\"thread\":{\"id\":\"thread-child\",\"sessionId\":\"session-root\",\"forkedFromId\":\"thread-other\"}}}'"
+
+  defp fork_command(_mode, _trace_file),
+    do: "printf '%s\\n' '{\"id\":11,\"result\":{\"thread\":{\"id\":\"thread-child\",\"sessionId\":\"session-root\",\"forkedFromId\":\"thread-source\"}}}'"
 end

@@ -10,8 +10,8 @@ defmodule SymphonyElixir.Orchestrator do
   alias SymphonyElixir.{
     ActionLedger,
     AgentRunner,
+    Codex.CoordinationEffects,
     Config,
-    CoordinationAdapter,
     StatusDashboard,
     Tracker,
     Workspace
@@ -1018,9 +1018,10 @@ defmodule SymphonyElixir.Orchestrator do
     intent = dispatch_action_intent(issue, attempt, worker_host)
 
     dispatch_result =
-      CoordinationAdapter.dispatch(
+      CoordinationEffects.dispatch(
         state.action_ledger,
         intent,
+        :task_creation,
         fn -> start_issue_worker(state, issue, attempt, recipient, worker_host) end,
         terminal_on_success: false,
         inspect_recovered: state.action_inspector
