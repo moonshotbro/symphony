@@ -138,7 +138,7 @@ defmodule SymphonyElixir.GitHub.MergeAdapter do
         emit(telemetry, :already_satisfied, intent)
         {:ok, {:ok, :already_satisfied, %{pull_number: intent.pull_number, disposition: "already_merged"}}}
       else
-        submit_reviewed_merge(action, intent, request_fun, request_opts, telemetry, opts)
+        submit_reviewed_merge(action, intent, request_fun, request_opts, telemetry, router, opts)
       end
     else
       {:error, :stale_source} = error -> stale(action, intent, router, error, opts)
@@ -148,7 +148,7 @@ defmodule SymphonyElixir.GitHub.MergeAdapter do
     end
   end
 
-  defp submit_reviewed_merge(action, intent, request_fun, request_opts, telemetry, opts) do
+  defp submit_reviewed_merge(action, intent, request_fun, request_opts, telemetry, router, opts) do
     with {:ok, checks} <- read_checks(request_fun, request_opts, intent),
          :ok <- verify_checks(checks, intent.required_checks),
          {:ok, _} <- transition(action, :dispatched, %{"disposition" => "expected_head_merge_submitted"}, opts),
@@ -159,7 +159,7 @@ defmodule SymphonyElixir.GitHub.MergeAdapter do
       {:ok, {:ok, :merged, %{pull_number: intent.pull_number, disposition: outcome}}}
     else
       {:error, {:checks_failed, _} = reason} = error -> fail(action, :needs_input, reason, opts, error)
-      {:error, {:github_api_status, 409}} = error -> stale(action, intent, fn _ -> :ok end, error, opts)
+      {:error, {:github_api_status, 409}} = error -> stale(action, intent, router, error, opts)
       {:error, reason} = error -> fail(action, :terminal_failure, reason, opts, error)
     end
   end
