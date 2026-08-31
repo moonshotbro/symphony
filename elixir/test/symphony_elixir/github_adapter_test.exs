@@ -64,7 +64,7 @@ defmodule SymphonyElixir.GitHub.AdapterTest do
     assert {:ok, ["42"]} = GitHubAdapter.fetch_issues_by_ids(["42"])
     assert_receive {:github_ids_called, ["42"]}
 
-    assert [%{"name" => "github_api"}] = GitHubAdapter.agent_tool_specs()
+    assert Enum.map(GitHubAdapter.agent_tool_specs(), & &1["name"]) == ["github_api", "github_merge"]
 
     assert GitHubAdapter.execute_agent_tool(
              "github_api",
@@ -238,7 +238,7 @@ defmodule SymphonyElixir.GitHub.AdapterTest do
              )
   end
 
-  test "github_api preserves REST status and body while rejecting unsafe arguments" do
+  test "github_api is read-only and preserves REST status and body" do
     test_pid = self()
     tracker_settings = tracker_settings()
 
@@ -246,22 +246,22 @@ defmodule SymphonyElixir.GitHub.AdapterTest do
       GitHubAgentTool.execute(
         "github_api",
         %{
-          "method" => "post",
-          "path" => " /repos/octo/repo/issues/42/comments ",
+          "method" => "get",
+          "path" => " /repos/octo/repo/issues/42 ",
           "params" => %{"per_page" => 10},
           "body" => %{"body" => "hello"}
         },
         tracker_settings: tracker_settings,
         github_client: fn method, path, params, body, opts ->
           send(test_pid, {:github_tool_called, method, path, params, body, opts})
-          {:ok, %{status: 201, body: %{"id" => 9}}}
+          {:ok, %{status: 200, body: %{"id" => 9}}}
         end
       )
 
-    assert_received {:github_tool_called, "POST", "/repos/octo/repo/issues/42/comments", %{"per_page" => 10}, %{"body" => "hello"}, [tracker_settings: ^tracker_settings]}
+    assert_received {:github_tool_called, "GET", "/repos/octo/repo/issues/42", %{"per_page" => 10}, %{"body" => "hello"}, [tracker_settings: ^tracker_settings]}
 
     assert response["success"] == true
-    assert Jason.decode!(response["output"]) == %{"status" => 201, "body" => %{"id" => 9}}
+    assert Jason.decode!(response["output"]) == %{"status" => 200, "body" => %{"id" => 9}}
     assert response["contentItems"] == [%{"type" => "inputText", "text" => response["output"]}]
 
     failure =
@@ -282,6 +282,9 @@ defmodule SymphonyElixir.GitHub.AdapterTest do
 
     Enum.each(
       [
+        %{"method" => "POST", "path" => "/repos/octo/repo/issues/42/comments", "body" => %{"body" => "nope"}},
+        %{"method" => "PUT", "path" => "/repos/octo/repo/pulls/7/merge", "body" => %{"sha" => "bad"}},
+        %{"method" => "DELETE", "path" => "/repos/octo/repo/issues/42"},
         %{"method" => "GET", "path" => "https://api.github.com/user"},
         %{"method" => "GET", "path" => "/user", "params" => false},
         %{"path" => "/user"}
@@ -304,7 +307,7 @@ defmodule SymphonyElixir.GitHub.AdapterTest do
   test "github_api reports unsupported tools, malformed calls, and client failures" do
     unsupported = GitHubAgentTool.execute("not_github_api", %{}, [])
     assert unsupported["success"] == false
-    assert Jason.decode!(unsupported["output"])["error"]["supportedTools"] == ["github_api"]
+    assert Jason.decode!(unsupported["output"])["error"]["supportedTools"] == ["github_api", "github_merge"]
 
     Enum.each(
       [
@@ -392,7 +395,7 @@ defmodule SymphonyElixir.GitHub.AdapterTest do
              token_env
            ]
 
-    assert [%{"name" => "github_api"}] = binding.tool_specs
+    assert Enum.map(binding.tool_specs, & &1["name"]) == ["github_api", "github_merge"]
     assert :ok = Config.validate!()
   end
 
