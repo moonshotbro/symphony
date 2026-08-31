@@ -30,6 +30,27 @@ defmodule SymphonyElixir.RecoveryInspectorTest do
     assert evidence.disposition == "codex_thread_read_exact_match"
   end
 
+  test "fails closed when the persisted thread has no matching turn" do
+    root = Path.join(System.tmp_dir!(), "symphony-recovery-turn-mismatch-#{System.unique_integer([:positive])}")
+    workspace_root = Path.join(root, "workspaces")
+    workspace = Path.join(workspace_root, "GH-38")
+    File.mkdir_p!(workspace)
+    on_exit(fn -> File.rm_rf(root) end)
+    write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root)
+
+    assert {:error, :turn_id_mismatch} =
+             RecoveryInspector.inspect(correlation_action(),
+               thread_reader: fn _, actual_workspace, _ ->
+                 {:ok,
+                  %{
+                    "id" => "thread-1",
+                    "cwd" => actual_workspace,
+                    "turns" => [%{"id" => "different-turn"}]
+                  }}
+               end
+             )
+  end
+
   test "does not treat a legacy cached session identifier as provider authority" do
     action = action(%{"workspace_key" => "GH-38", "session_id" => "thread-1-turn-1"})
     assert {:error, {:recovery_correlation_missing, "thread_id"}} = RecoveryInspector.inspect(action)
