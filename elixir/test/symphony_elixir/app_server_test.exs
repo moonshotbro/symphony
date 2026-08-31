@@ -1496,6 +1496,85 @@ defmodule SymphonyElixir.AppServerTest do
     end
   end
 
+  test "app server reads persisted thread metadata and paginated turns without deprecated hydration" do
+    test_root = Path.join(System.tmp_dir!(), "symphony-elixir-thread-read-#{System.unique_integer([:positive])}")
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-READ")
+      codex_binary = Path.join(test_root, "fake-codex")
+      File.mkdir_p!(workspace)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      count=0
+      while IFS= read -r _line; do
+        count=$((count + 1))
+        case "$count" in
+          1) printf '%s\\n' '{"id":1,"result":{}}' ;;
+          2) ;;
+          3) printf '%s\\n' '{"id":4,"result":{"thread":{"id":"thread-read","cwd":"#{workspace}"}}}' ;;
+          4) printf '%s\\n' '{"id":5,"result":{"data":[{"id":"turn-new"}],"nextCursor":"older"}}' ;;
+          5) printf '%s\\n' '{"id":5,"result":{"data":[{"id":"turn-old"}],"nextCursor":null}}'; exit 0 ;;
+          *) exit 1 ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server"
+      )
+
+      assert {:ok, %{"id" => "thread-read", "turns" => [%{"id" => "turn-new"}, %{"id" => "turn-old"}]}} =
+               AppServer.read_thread("thread-read", workspace)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "app server treats only Codex's exact thread-not-loaded response as authoritative absence" do
+    test_root = Path.join(System.tmp_dir!(), "symphony-elixir-thread-absence-#{System.unique_integer([:positive])}")
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-ABSENT")
+      codex_binary = Path.join(test_root, "fake-codex")
+      File.mkdir_p!(workspace)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      count=0
+      while IFS= read -r _line; do
+        count=$((count + 1))
+        case "$count" in
+          1) printf '%s\\n' '{"id":1,"result":{}}' ;;
+          2) ;;
+          3) printf '%s\\n' '{"id":4,"error":{"code":-32600,"message":"thread not loaded: 00000000-0000-0000-0000-000000000000"}}'; exit 0 ;;
+          *) exit 1 ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+      write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root, codex_command: "#{codex_binary} app-server")
+
+      assert {:error, :thread_not_found} =
+               AppServer.read_thread("00000000-0000-0000-0000-000000000000", workspace)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "app server rejects remote workspace traversal before it starts SSH" do
+    write_workflow_file!(Workflow.workflow_file_path(), workspace_root: "/remote/workspaces")
+
+    assert {:error, {:invalid_remote_workspace, :workspace, :traversal}} =
+             AppServer.read_thread("thread-remote", "/remote/workspaces/../outside", worker_host: "worker-01")
+  end
+
   test "app server launches over ssh for remote workers" do
     test_root =
       Path.join(

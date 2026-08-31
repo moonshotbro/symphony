@@ -2386,13 +2386,16 @@ defmodule SymphonyElixir.Orchestrator do
   defp transition_completed_action(action_ledger, action_id, session_id, thread_id, turn_id, running_entry) do
     effect =
       %{
-        "session_id" => session_id,
+        # Codex exposes thread and turn ids, but no provider-issued session id.
+        # Keep this derived value explicitly local so recovery cannot mistake it
+        # for provider authority after a restart.
+        "session_correlation_id" => session_id,
         "thread_id" => thread_id,
         "turn_id" => turn_id,
         "workspace_key" => Workspace.workspace_key(running_entry.issue),
-        "disposition" => "codex_session_observed"
+        "disposition" => "codex_session_observed",
+        "host_assertion" => host_assertion(running_entry[:worker_host])
       }
-      |> maybe_put_effect_worker_host(running_entry[:worker_host])
 
     case ActionLedger.transition(action_ledger, action_id, :succeeded, effect) do
       {:ok, _action} ->
@@ -2404,10 +2407,10 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp maybe_put_effect_worker_host(effect, worker_host) when is_binary(worker_host) and worker_host != "",
-    do: Map.put(effect, "worker_host", worker_host)
+  defp host_assertion(nil), do: %{"type" => "worker_host", "value" => "local"}
 
-  defp maybe_put_effect_worker_host(effect, _worker_host), do: effect
+  defp host_assertion(worker_host) when is_binary(worker_host) and worker_host != "",
+    do: %{"type" => "worker_host", "value" => worker_host}
 
   defp record_running_action_exit(nil, _running_entry, _reason), do: :ok
 

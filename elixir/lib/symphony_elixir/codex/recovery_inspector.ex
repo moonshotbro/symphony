@@ -2,7 +2,7 @@ defmodule SymphonyElixir.Codex.RecoveryInspector do
   @moduledoc """
   Reconciles a recovered task-creation action against Codex's persisted App
   Server thread record. It deliberately fails closed when the durable action
-  lacks the exact thread, turn, workspace, or worker-host correlation needed
+  lacks the exact thread, turn, workspace, or host assertion needed
   to make that read authoritative.
   """
 
@@ -23,7 +23,7 @@ defmodule SymphonyElixir.Codex.RecoveryInspector do
          provider: "codex",
          authoritative: true,
          exists: true,
-         session_id: correlation.session_id,
+         session_correlation_id: correlation.session_correlation_id,
          workspace_key: correlation.workspace_key,
          disposition: "codex_thread_read_exact_match"
        }}
@@ -42,15 +42,17 @@ defmodule SymphonyElixir.Codex.RecoveryInspector do
   defp correlation(%Action{observed_effect: effect}) when is_map(effect) do
     with {:ok, thread_id} <- required(effect, "thread_id"),
          {:ok, turn_id} <- required(effect, "turn_id"),
-         {:ok, session_id} <- required(effect, "session_id"),
+         {:ok, session_correlation_id} <- required(effect, "session_correlation_id"),
          {:ok, workspace_key} <- required(effect, "workspace_key"),
-         {:ok, worker_host} <- optional_host(effect),
-         true <- session_id == "#{thread_id}-#{turn_id}" or {:error, :session_correlation_mismatch} do
+         {:ok, worker_host} <- host_assertion(effect),
+         true <-
+           session_correlation_id == "#{thread_id}-#{turn_id}" or
+             {:error, :session_correlation_mismatch} do
       {:ok,
        %{
          thread_id: thread_id,
          turn_id: turn_id,
-         session_id: session_id,
+         session_correlation_id: session_correlation_id,
          workspace_key: workspace_key,
          worker_host: worker_host
        }}
@@ -66,11 +68,14 @@ defmodule SymphonyElixir.Codex.RecoveryInspector do
     end
   end
 
-  defp optional_host(map) do
-    case Map.get(map, "worker_host") do
-      value when is_binary(value) and value != "" -> {:ok, value}
-      nil -> {:ok, nil}
-      _ -> {:error, :worker_host_invalid}
+  # The App Server does not expose a provider session id.  This is therefore a
+  # derived local correlation id, paired with a typed dispatch-host assertion;
+  # it must never be presented as provider-issued session authority.
+  defp host_assertion(map) do
+    case Map.get(map, "host_assertion") do
+      %{"type" => "worker_host", "value" => "local"} -> {:ok, nil}
+      %{"type" => "worker_host", "value" => value} when is_binary(value) and value != "" -> {:ok, value}
+      _ -> {:error, :host_assertion_invalid}
     end
   end
 
