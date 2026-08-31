@@ -10,6 +10,10 @@ _In this [demo video](https://player.vimeo.com/video/1186371009?h=5626e4b899), S
 > [!WARNING]
 > Symphony is a low-key engineering preview for testing in trusted environments.
 
+The Elixir reference can optionally place mutating task coordination behind a durable,
+privacy-bounded [action ledger](elixir/docs/action_ledger.md). It supplements the existing
+orchestrator with idempotency and restart reconciliation without creating a second scheduler.
+
 ## Running Symphony
 
 ### Requirements

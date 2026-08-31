@@ -7,7 +7,16 @@ defmodule SymphonyElixir.Orchestrator do
   require Logger
   import Bitwise, only: [<<<: 2]
 
-  alias SymphonyElixir.{AgentRunner, Config, StatusDashboard, Tracker, Workspace}
+  alias SymphonyElixir.{
+    ActionLedger,
+    AgentRunner,
+    Config,
+    CoordinationAdapter,
+    StatusDashboard,
+    Tracker,
+    Workspace
+  }
+
   alias SymphonyElixir.Tracker.Issue
 
   @continuation_retry_delay_ms 1_000
@@ -33,6 +42,7 @@ defmodule SymphonyElixir.Orchestrator do
       :poll_check_in_progress,
       :tick_timer_ref,
       :tick_token,
+      :action_ledger,
       task_supervisor: SymphonyElixir.TaskSupervisor,
       running: %{},
       completed: MapSet.new(),
@@ -65,6 +75,8 @@ defmodule SymphonyElixir.Orchestrator do
           tick_timer_ref: nil,
           tick_token: nil,
           task_supervisor: Keyword.get(opts, :task_supervisor, SymphonyElixir.TaskSupervisor),
+          action_ledger: Keyword.get(opts, :action_ledger),
+          claimed: recovered_action_claims(Keyword.get(opts, :action_ledger)),
           codex_totals: @empty_codex_totals,
           codex_rate_limits: nil
         }
@@ -138,6 +150,8 @@ defmodule SymphonyElixir.Orchestrator do
         state = record_session_completion_totals(state, running_entry)
         session_id = running_entry_session_id(running_entry)
 
+        record_running_action_exit(state.action_ledger, running_entry, reason)
+
         state = handle_agent_down(reason, state, issue_id, running_entry, session_id)
 
         Logger.info("Agent task finished for issue_id=#{issue_id} session_id=#{session_id} reason=#{inspect(reason)}")
@@ -159,6 +173,11 @@ defmodule SymphonyElixir.Orchestrator do
           |> maybe_put_runtime_value(:worker_host, runtime_info[:worker_host])
           |> maybe_put_runtime_value(:workspace_path, runtime_info[:workspace_path])
 
+        observe_running_action(state.action_ledger, updated_running_entry, %{
+          "worker_host" => runtime_info[:worker_host],
+          "workspace_key" => Workspace.workspace_key(updated_running_entry.issue)
+        })
+
         notify_dashboard()
         {:noreply, %{state | running: Map.put(running, issue_id, updated_running_entry)}}
     end
@@ -174,6 +193,11 @@ defmodule SymphonyElixir.Orchestrator do
 
       running_entry ->
         {updated_running_entry, token_delta} = integrate_codex_update(running_entry, update)
+
+        complete_running_action_if_session_observed(
+          state.action_ledger,
+          updated_running_entry
+        )
 
         state =
           state
@@ -951,56 +975,117 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp spawn_issue_on_worker_host(%State{} = state, issue, attempt, recipient, worker_host) do
-    case Task.Supervisor.start_child(state.task_supervisor, fn ->
-           AgentRunner.run(issue, recipient, attempt: attempt, worker_host: worker_host)
-         end) do
+    intent = dispatch_action_intent(issue, attempt, worker_host)
+
+    dispatch_result =
+      CoordinationAdapter.dispatch(
+        state.action_ledger,
+        intent,
+        fn -> start_issue_worker(state, issue, attempt, recipient, worker_host) end,
+        terminal_on_success: false
+      )
+
+    handle_worker_dispatch_result(dispatch_result, state, issue, attempt, worker_host)
+  end
+
+  defp start_issue_worker(state, issue, attempt, recipient, worker_host) do
+    task_fun = fn ->
+      AgentRunner.run(issue, recipient, attempt: attempt, worker_host: worker_host)
+    end
+
+    case Task.Supervisor.start_child(state.task_supervisor, task_fun) do
       {:ok, pid} ->
-        ref = Process.monitor(pid)
-
-        Logger.info("Dispatching issue to agent: #{issue_context(issue)} pid=#{inspect(pid)} attempt=#{inspect(attempt)} worker_host=#{worker_host || "local"}")
-
-        running =
-          Map.put(state.running, issue.id, %{
-            pid: pid,
-            ref: ref,
-            identifier: issue.identifier,
-            issue: issue,
-            worker_host: worker_host,
-            workspace_path: nil,
-            session_id: nil,
-            last_codex_message: nil,
-            last_codex_timestamp: nil,
-            last_codex_event: nil,
-            codex_app_server_pid: nil,
-            codex_input_tokens: 0,
-            codex_output_tokens: 0,
-            codex_total_tokens: 0,
-            codex_last_reported_input_tokens: 0,
-            codex_last_reported_output_tokens: 0,
-            codex_last_reported_total_tokens: 0,
-            turn_count: 0,
-            retry_attempt: normalize_retry_attempt(attempt),
-            started_at: DateTime.utc_now()
-          })
-
-        %{
-          state
-          | running: running,
-            claimed: MapSet.put(state.claimed, issue.id),
-            retry_attempts: Map.delete(state.retry_attempts, issue.id)
-        }
+        {:ok, pid,
+         %{
+           "worker_host" => worker_host,
+           "workspace_key" => Workspace.workspace_key(issue),
+           "disposition" => "worker_spawned"
+         }}
 
       {:error, reason} ->
-        Logger.error("Unable to spawn agent for #{issue_context(issue)}: #{inspect(reason)}")
-        next_attempt = if is_integer(attempt), do: attempt + 1, else: nil
-
-        schedule_issue_retry(state, issue.id, next_attempt, %{
-          identifier: issue.identifier,
-          issue_url: issue.url,
-          error: "failed to spawn agent: #{inspect(reason)}",
-          worker_host: worker_host
-        })
+        {:error, reason, :retryable_failure}
     end
+  end
+
+  defp handle_worker_dispatch_result({:ok, pid, action}, state, issue, attempt, worker_host) do
+    Logger.info("Dispatching issue to agent: #{issue_context(issue)} pid=#{inspect(pid)} attempt=#{inspect(attempt)} worker_host=#{worker_host || "local"}")
+
+    running_entry = worker_running_entry(pid, action, issue, attempt, worker_host)
+
+    %{
+      state
+      | running: Map.put(state.running, issue.id, running_entry),
+        claimed: MapSet.put(state.claimed, issue.id),
+        retry_attempts: Map.delete(state.retry_attempts, issue.id)
+    }
+  end
+
+  defp handle_worker_dispatch_result({:already_satisfied, action}, state, issue, _attempt, _host) do
+    Logger.info("Skipping duplicate dispatch already satisfied action_id=#{action.id} #{issue_context(issue)}")
+
+    %{state | claimed: MapSet.put(state.claimed, issue.id)}
+  end
+
+  defp handle_worker_dispatch_result(
+         {:error, {:uncertain_action, action_id}},
+         state,
+         issue,
+         _attempt,
+         _host
+       ) do
+    Logger.warning("Skipping uncertain dispatch pending reconciliation action_id=#{action_id} #{issue_context(issue)}")
+
+    %{state | claimed: MapSet.put(state.claimed, issue.id)}
+  end
+
+  defp handle_worker_dispatch_result(
+         {:error, {:postcondition_record_failed, reason}, pid},
+         state,
+         issue,
+         _attempt,
+         _host
+       ) do
+    terminate_task(pid, state.task_supervisor)
+    Logger.error("Stopped spawned worker after ledger postcondition failure #{issue_context(issue)} reason=#{inspect(reason)}")
+    %{state | claimed: MapSet.put(state.claimed, issue.id)}
+  end
+
+  defp handle_worker_dispatch_result({:error, reason}, state, issue, attempt, worker_host) do
+    Logger.error("Unable to spawn agent for #{issue_context(issue)}: #{inspect(reason)}")
+    next_attempt = if is_integer(attempt), do: attempt + 1, else: nil
+
+    schedule_issue_retry(state, issue.id, next_attempt, %{
+      identifier: issue.identifier,
+      issue_url: issue.url,
+      error: "failed to spawn agent: #{inspect(reason)}",
+      worker_host: worker_host
+    })
+  end
+
+  defp worker_running_entry(pid, action, issue, attempt, worker_host) do
+    %{
+      pid: pid,
+      ref: Process.monitor(pid),
+      identifier: issue.identifier,
+      issue: issue,
+      worker_host: worker_host,
+      workspace_path: nil,
+      session_id: nil,
+      last_codex_message: nil,
+      last_codex_timestamp: nil,
+      last_codex_event: nil,
+      codex_app_server_pid: nil,
+      codex_input_tokens: 0,
+      codex_output_tokens: 0,
+      codex_total_tokens: 0,
+      codex_last_reported_input_tokens: 0,
+      codex_last_reported_output_tokens: 0,
+      codex_last_reported_total_tokens: 0,
+      turn_count: 0,
+      retry_attempt: normalize_retry_attempt(attempt),
+      action_id: if(action, do: action.id, else: nil),
+      started_at: DateTime.utc_now()
+    }
   end
 
   defp revalidate_issue_for_dispatch(%Issue{id: issue_id}, issue_fetcher, terminal_states)
@@ -1474,6 +1559,7 @@ defmodule SymphonyElixir.Orchestrator do
        running: running,
        retrying: retrying,
        blocked: blocked,
+       action_ledger: action_ledger_snapshot(state.action_ledger),
        codex_totals: state.codex_totals,
        rate_limits: Map.get(state, :codex_rate_limits),
        polling: %{
@@ -1987,4 +2073,199 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp integer_like(_value), do: nil
+
+  defp action_ledger_snapshot(nil), do: nil
+
+  defp action_ledger_snapshot(action_ledger) do
+    reconciliation = ActionLedger.reconcile(action_ledger)
+
+    entries =
+      reconciliation.pending ++
+        reconciliation.retryable ++
+        reconciliation.quarantined ++ reconciliation.needs_input
+
+    %{
+      counts: %{
+        pending: length(reconciliation.pending),
+        retryable: length(reconciliation.retryable),
+        quarantined: length(reconciliation.quarantined),
+        needs_input: length(reconciliation.needs_input)
+      },
+      unresolved:
+        Enum.map(entries, fn action ->
+          %{
+            action_id: action.id,
+            kind: action.kind,
+            state: action.state,
+            issue_id: action.source["issue_id"],
+            task_id: action.source["task_id"],
+            goal_id: action.source["goal_id"],
+            policy_fingerprint: action.policy_fingerprint,
+            blocker_classification: action.blocker_classification,
+            resume_condition: action.resume_condition,
+            updated_at: action.updated_at
+          }
+        end)
+    }
+  end
+
+  defp recovered_action_claims(nil), do: MapSet.new()
+
+  defp recovered_action_claims(action_ledger) do
+    reconciliation = ActionLedger.reconcile(action_ledger)
+
+    (reconciliation.pending ++ reconciliation.quarantined ++ reconciliation.needs_input)
+    |> Enum.filter(&(&1.state in [:uncertain, :quarantined, :needs_input]))
+    |> Enum.map(& &1.source["issue_id"])
+    |> Enum.filter(&is_binary/1)
+    |> MapSet.new()
+  end
+
+  defp dispatch_action_intent(issue, attempt, worker_host) do
+    checkpoint = issue_checkpoint(issue)
+
+    %{
+      kind: :task_creation,
+      source: %{
+        issue_id: issue.id,
+        issue_identifier: issue.identifier,
+        repository: issue_repository(issue),
+        revision: checkpoint
+      },
+      target: %{
+        type: "codex_task",
+        worker_host: worker_host
+      },
+      purpose: "orchestrator.dispatch.attempt.#{normalize_retry_attempt(attempt)}",
+      checkpoint: checkpoint,
+      expected_postcondition: "codex.session_observed",
+      policy_fingerprint: ActionLedger.policy_fingerprint("symphony.task-dispatch.v1")
+    }
+  end
+
+  defp issue_checkpoint(%Issue{updated_at: %DateTime{} = updated_at}) do
+    DateTime.to_iso8601(updated_at)
+  end
+
+  defp issue_checkpoint(%Issue{} = issue) do
+    :crypto.hash(
+      :sha256,
+      :erlang.term_to_binary(
+        {issue.id, issue.identifier, issue.state, issue.branch_name},
+        [:deterministic]
+      )
+    )
+    |> Base.encode16(case: :lower)
+  end
+
+  defp issue_repository(%Issue{url: url}) when is_binary(url) do
+    case URI.parse(url) do
+      %URI{host: host, path: path} when is_binary(host) and is_binary(path) ->
+        segments = path |> String.split("/", trim: true) |> Enum.take(2)
+        Enum.join([host | segments], "/")
+
+      _ ->
+        "tracker"
+    end
+  end
+
+  defp issue_repository(_issue), do: "tracker"
+
+  defp observe_running_action(nil, _running_entry, _effect), do: :ok
+
+  defp observe_running_action(action_ledger, running_entry, effect) do
+    case running_entry[:action_id] do
+      action_id when is_binary(action_id) ->
+        case ActionLedger.observe_effect(action_ledger, action_id, effect) do
+          {:ok, _action} ->
+            :ok
+
+          {:error, :terminal_action_immutable} ->
+            :ok
+
+          {:error, reason} ->
+            Logger.warning("Unable to record action effect action_id=#{action_id} reason=#{inspect(reason)}")
+
+            {:error, reason}
+        end
+
+      _ ->
+        :ok
+    end
+  end
+
+  defp complete_running_action_if_session_observed(nil, _running_entry), do: :ok
+
+  defp complete_running_action_if_session_observed(action_ledger, running_entry) do
+    action_id = running_entry[:action_id]
+    session_id = running_entry[:session_id]
+
+    case {action_id, session_id} do
+      {action_id, session_id} when is_binary(action_id) and is_binary(session_id) ->
+        complete_dispatched_action(action_ledger, action_id, session_id)
+
+      _ ->
+        :ok
+    end
+  end
+
+  defp complete_dispatched_action(action_ledger, action_id, session_id) do
+    case ActionLedger.get(action_ledger, action_id) do
+      {:ok, %{state: :dispatched}} ->
+        transition_completed_action(action_ledger, action_id, session_id)
+
+      {:ok, _action} ->
+        :ok
+
+      :error ->
+        {:error, :action_not_found}
+    end
+  end
+
+  defp transition_completed_action(action_ledger, action_id, session_id) do
+    case ActionLedger.transition(action_ledger, action_id, :succeeded, %{
+           "session_id" => session_id,
+           "disposition" => "codex_session_observed"
+         }) do
+      {:ok, _action} ->
+        :ok
+
+      {:error, reason} ->
+        Logger.warning("Unable to complete action action_id=#{action_id} reason=#{inspect(reason)}")
+        {:error, reason}
+    end
+  end
+
+  defp record_running_action_exit(nil, _running_entry, _reason), do: :ok
+
+  defp record_running_action_exit(action_ledger, running_entry, reason) do
+    case running_entry[:action_id] do
+      action_id when is_binary(action_id) ->
+        record_action_exit_state(action_ledger, action_id, running_entry, reason)
+
+      _ ->
+        :ok
+    end
+  end
+
+  defp record_action_exit_state(action_ledger, action_id, running_entry, reason) do
+    case ActionLedger.get(action_ledger, action_id) do
+      {:ok, %{state: :dispatched}} ->
+        next_state = action_exit_state(running_entry, reason)
+
+        ActionLedger.transition(action_ledger, action_id, next_state, %{
+          "disposition" => Atom.to_string(next_state)
+        })
+
+      {:ok, _action} ->
+        :ok
+
+      :error ->
+        {:error, :action_not_found}
+    end
+  end
+
+  defp action_exit_state(running_entry, _reason) do
+    if input_required_blocker?(running_entry), do: :needs_input, else: :retryable_failure
+  end
 end

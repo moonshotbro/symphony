@@ -18,16 +18,45 @@ defmodule SymphonyElixir.AgentRuntimeSupervisor do
 
     orchestrator_name = Keyword.get(opts, :orchestrator_name, SymphonyElixir.Orchestrator)
 
-    children = [
-      Supervisor.child_spec(
-        {Task.Supervisor, name: task_supervisor_name},
-        id: task_supervisor_name
-      ),
-      Supervisor.child_spec(
-        {SymphonyElixir.Orchestrator, name: orchestrator_name, task_supervisor: task_supervisor_name},
-        id: orchestrator_name
-      )
+    configured_ledger = SymphonyElixir.Config.settings!().action_ledger
+    ledger_enabled = Keyword.get(opts, :action_ledger_enabled, configured_ledger.enabled)
+    ledger_name = Keyword.get(opts, :action_ledger_name, SymphonyElixir.ActionLedger)
+
+    ledger_path =
+      Keyword.get_lazy(opts, :action_ledger_path, &SymphonyElixir.Config.local_action_ledger_path/0)
+
+    ledger_children =
+      if ledger_enabled do
+        [
+          Supervisor.child_spec(
+            {SymphonyElixir.ActionLedger, name: ledger_name, path: ledger_path, enabled: true},
+            id: ledger_name
+          )
+        ]
+      else
+        []
+      end
+
+    orchestrator_opts = [
+      name: orchestrator_name,
+      task_supervisor: task_supervisor_name,
+      action_ledger: if(ledger_enabled, do: ledger_name, else: nil)
     ]
+
+    children =
+      [
+        Supervisor.child_spec(
+          {Task.Supervisor, name: task_supervisor_name},
+          id: task_supervisor_name
+        )
+      ] ++
+        ledger_children ++
+        [
+          Supervisor.child_spec(
+            {SymphonyElixir.Orchestrator, orchestrator_opts},
+            id: orchestrator_name
+          )
+        ]
 
     Supervisor.init(children, strategy: :one_for_all)
   end

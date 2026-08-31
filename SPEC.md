@@ -490,6 +490,23 @@ fields locally if they want stricter startup checks.
   - Default: `300000` (5 minutes)
   - If `<= 0`, stall detection is disabled.
 
+#### 5.3.7 `action_ledger` (object, OPTIONAL extension)
+
+Fields:
+
+- `enabled` (boolean)
+  - Default: `false`.
+- `path` (string path)
+  - REQUIRED when enabled.
+  - Relative values resolve from the directory containing the selected `WORKFLOW.md`.
+
+When enabled, the implementation MAY persist privacy-bounded coordination intents and effects
+before performing mutating task coordination. The ledger MUST remain subordinate to the existing
+orchestrator: it does not poll, schedule, claim issues, own concurrency, or replace the retry queue.
+Equivalent intents MUST deduplicate; incomplete dispatches MUST be reconciled before retry; corrupt
+or unavailable storage MUST fail mutating coordination closed. See the reference implementation's
+`elixir/docs/action_ledger.md` for its exact optional schema and transition table.
+
 ### 5.4 Prompt Template Contract
 
 The Markdown body of `WORKFLOW.md` is the per-issue prompt template.
@@ -727,7 +744,8 @@ Distinct terminal reasons are important because retry logic and logs differ.
 - The orchestrator serializes state mutations through one authority to avoid duplicate dispatch.
 - `claimed` and `running` checks are REQUIRED before launching any worker.
 - Reconciliation runs before dispatch on every tick.
-- Restart recovery is tracker-driven and filesystem-driven (without a durable orchestrator DB).
+- Restart recovery is tracker-driven and filesystem-driven. An implementation MAY also enable the
+  optional action ledger from Section 5.3.7; it supplements rather than replaces those sources.
 - Startup terminal cleanup removes stale workspaces for issues already in terminal states.
 
 ## 8. Polling, Scheduling, and Reconciliation
@@ -1689,7 +1707,8 @@ API design notes:
 
 ### 14.3 Partial State Recovery (Restart)
 
-Current design is intentionally in-memory for scheduler state.
+The scheduler state remains intentionally in-memory. The optional action ledger may durably retain
+bounded mutation intent/effect state, but does not persist or replace scheduler ownership.
 Restart recovery means the service can resume useful operation by polling tracker state and reusing
 preserved workspaces. It does not mean retry timers, running sessions, or live worker state survive
 process restart.
@@ -1698,6 +1717,8 @@ After restart:
 
 - No retry timers are restored from prior process memory.
 - No running sessions are assumed recoverable.
+- When the optional action ledger is enabled, incomplete dispatches are reconstructed as uncertain
+  and MUST be inspected before the corresponding issue can be dispatched again.
 - Service recovers by:
   - startup terminal workspace cleanup
   - fresh polling of active issues
