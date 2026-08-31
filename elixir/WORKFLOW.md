@@ -19,6 +19,10 @@ polling:
   interval_ms: 5000
 workspace:
   root: ~/code/symphony-workspaces
+action_ledger:
+  enabled: false
+  # Enable only with a durable path outside disposable workspaces.
+  path: ./state/action-ledger.jsonl
 hooks:
   after_create: |
     git clone --depth 1 https://github.com/openai/symphony .

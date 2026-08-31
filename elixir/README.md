@@ -35,6 +35,11 @@ issue claimed and exposes it as blocked in the runtime state, JSON API, and dash
 entries are in memory only; restarting the orchestrator clears that blocked map, so any still-active
 tracker issue can become a dispatch candidate again after restart.
 
+For unattended deployments, the optional [durable coordination action ledger](docs/action_ledger.md)
+records bounded mutation intent before task dispatch, prevents blind duplicate dispatch after a
+restart, cancels obsolete approval-like effects before execution, and preserves named stalled-goal
+resume conditions. It is disabled by default.
+
 ## How to use it
 
 1. Make sure your codebase is set up to work well with agents: see
@@ -199,6 +204,9 @@ codex:
   reload error until the file is fixed.
 - `server.port` or CLI `--port` enables the optional Phoenix LiveView dashboard and JSON API at
   `/`, `/api/v1/state`, `/api/v1/<issue_identifier>`, and `/api/v1/refresh`.
+- `action_ledger.enabled` defaults to `false`. When enabled, `action_ledger.path` is required and
+  must point to durable local state. Relative paths resolve from the selected `WORKFLOW.md`
+  directory. Corrupt, truncated, unreadable, or unwritable state fails mutating coordination closed.
 
 ### Linear adapter profile
 

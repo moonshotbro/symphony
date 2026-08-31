@@ -92,6 +92,13 @@ defmodule SymphonyElixir.Config do
     Path.expand(settings!().workspace.root, workflow_dir)
   end
 
+  @doc false
+  @spec local_action_ledger_path() :: Path.t()
+  def local_action_ledger_path do
+    workflow_dir = Workflow.workflow_file_path() |> Path.expand() |> Path.dirname()
+    Path.expand(settings!().action_ledger.path, workflow_dir)
+  end
+
   @spec validate!() :: :ok | {:error, term()}
   def validate! do
     WorkflowStore.force_reload()

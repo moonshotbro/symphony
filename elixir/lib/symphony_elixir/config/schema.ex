@@ -270,6 +270,46 @@ defmodule SymphonyElixir.Config.Schema do
     end
   end
 
+  defmodule ActionLedger do
+    @moduledoc false
+    use Ecto.Schema
+    import Ecto.Changeset
+
+    @primary_key false
+    embedded_schema do
+      field(:enabled, :boolean, default: false)
+      field(:path, :string)
+    end
+
+    @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
+    def changeset(schema, attrs) do
+      changeset = cast(schema, attrs, [:enabled, :path], empty_values: [])
+
+      if get_field(changeset, :enabled) do
+        changeset
+        |> validate_required([:path])
+        |> validate_change(:path, &validate_durable_path/2)
+      else
+        changeset
+      end
+    end
+
+    defp validate_durable_path(:path, "$" <> env_name) do
+      valid_name? = String.match?(env_name, ~r/^[A-Za-z_][A-Za-z0-9_]*$/)
+      resolved = if valid_name?, do: System.get_env(env_name)
+
+      if is_binary(resolved) and String.trim(resolved) != "" do
+        []
+      else
+        [path: "environment reference must resolve to a nonblank durable path"]
+      end
+    end
+
+    defp validate_durable_path(:path, path) when is_binary(path) do
+      if String.trim(path) == "", do: [path: "must not be blank"], else: []
+    end
+  end
+
   defmodule Server do
     @moduledoc false
     use Ecto.Schema
@@ -298,6 +338,7 @@ defmodule SymphonyElixir.Config.Schema do
     embeds_one(:codex, Codex, on_replace: :update, defaults_to_struct: true)
     embeds_one(:hooks, Hooks, on_replace: :update, defaults_to_struct: true)
     embeds_one(:observability, Observability, on_replace: :update, defaults_to_struct: true)
+    embeds_one(:action_ledger, ActionLedger, on_replace: :update, defaults_to_struct: true)
     embeds_one(:server, Server, on_replace: :update, defaults_to_struct: true)
   end
 
@@ -392,6 +433,7 @@ defmodule SymphonyElixir.Config.Schema do
     |> cast_embed(:codex, with: &Codex.changeset/2)
     |> cast_embed(:hooks, with: &Hooks.changeset/2)
     |> cast_embed(:observability, with: &Observability.changeset/2)
+    |> cast_embed(:action_ledger, with: &ActionLedger.changeset/2)
     |> cast_embed(:server, with: &Server.changeset/2)
   end
 
@@ -454,13 +496,22 @@ defmodule SymphonyElixir.Config.Schema do
       | root: resolve_path_value(settings.workspace.root, Path.join(System.tmp_dir!(), "symphony_workspaces"))
     }
 
+    action_ledger = %{
+      settings.action_ledger
+      | path:
+          resolve_path_value(
+            settings.action_ledger.path,
+            Path.join(Path.dirname(workspace.root), "symphony-action-ledger.jsonl")
+          )
+    }
+
     codex = %{
       settings.codex
       | approval_policy: normalize_keys(settings.codex.approval_policy),
         turn_sandbox_policy: normalize_optional_map(settings.codex.turn_sandbox_policy)
     }
 
-    %{settings | tracker: tracker, workspace: workspace, codex: codex}
+    %{settings | tracker: tracker, workspace: workspace, action_ledger: action_ledger, codex: codex}
   end
 
   defp normalize_keys(value) when is_map(value) do
@@ -500,6 +551,8 @@ defmodule SymphonyElixir.Config.Schema do
   end
 
   defp resolve_secret_setting(value, _fallback), do: value
+
+  defp resolve_path_value(nil, default), do: default
 
   defp resolve_path_value(value, default) when is_binary(value) do
     case normalize_path_token(value) do

@@ -11,7 +11,7 @@ defmodule SymphonyElixirWeb.Presenter do
 
     case Orchestrator.snapshot(orchestrator, snapshot_timeout_ms) do
       %{} = snapshot ->
-        %{
+        payload = %{
           generated_at: generated_at,
           counts: %{
             running: length(snapshot.running),
@@ -24,6 +24,11 @@ defmodule SymphonyElixirWeb.Presenter do
           codex_totals: snapshot.codex_totals,
           rate_limits: snapshot.rate_limits
         }
+
+        case Map.get(snapshot, :action_ledger) do
+          nil -> payload
+          action_ledger -> Map.put(payload, :action_ledger, action_ledger)
+        end
 
       :timeout ->
         %{generated_at: generated_at, error: %{code: "snapshot_timeout", message: "Snapshot timed out"}}
