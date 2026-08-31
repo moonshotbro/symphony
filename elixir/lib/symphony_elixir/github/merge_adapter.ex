@@ -158,7 +158,7 @@ defmodule SymphonyElixir.GitHub.MergeAdapter do
       idempotency_key: key
     }
 
-    case apply(ActionLedger, :plan, [ledger, ledger_intent]) do
+    case ActionLedger.plan(ledger, ledger_intent) do
       {:ok, action, state} -> {:ok, action, state}
       {:error, reason} -> {:error, {:merge_ledger_plan_failed, reason}}
     end
@@ -332,14 +332,30 @@ defmodule SymphonyElixir.GitHub.MergeAdapter do
   defp recover_merge(fun, opts, intent) do
     case read_pull(fun, opts, intent) do
       {:ok, current} ->
-        {:ok,
-         %{
-           provider: "github",
-           authoritative: true,
-           exists: current["merged"] == true,
-           revision: intent.reviewed_head,
-           disposition: if(current["merged"] == true, do: "provider_postcondition_confirmed", else: "postcondition_absent")
-         }}
+        case verify_reviewed_revisions(current, intent) do
+          :ok ->
+            {:ok,
+             %{
+               provider: "github",
+               authoritative: true,
+               exists: current["merged"] == true,
+               revision: intent.reviewed_head,
+               disposition: if(current["merged"] == true, do: "provider_postcondition_confirmed", else: "postcondition_absent")
+             }}
+
+          {:error, :stale_source} ->
+            # A merged PR at a different head/base is not evidence that this
+            # reviewed action happened.  Mark the inspection non-authoritative
+            # so the ledger quarantines the uncertain action rather than
+            # silently settling it as already satisfied.
+            {:ok,
+             %{
+               provider: "github",
+               authoritative: false,
+               exists: false,
+               disposition: "reviewed_revision_mismatch"
+             }}
+        end
 
       {:error, reason} ->
         {:error, reason}
@@ -377,13 +393,21 @@ defmodule SymphonyElixir.GitHub.MergeAdapter do
   defp valid_text?(value), do: is_binary(value) and String.trim(value) != "" and byte_size(value) <= 512
 
   defp valid_review_evidence?(%ReviewEvidence{} = evidence, intent) do
-    valid_source?(evidence.source) and valid_reviewer?(evidence.reviewer) and
+    valid_source?(evidence.source, intent) and valid_reviewer?(evidence.reviewer) and
       valid_timestamp?(evidence.reviewed_at) and valid_revision_evidence?(evidence, intent) and
       valid_check_evidence?(evidence.checks, intent.required_checks)
   end
 
   defp valid_review_evidence?(_, _intent), do: false
-  defp valid_source?(value), do: valid_text?(value) and String.starts_with?(value, "github:")
+  defp valid_source?(value, intent), do: valid_text?(value) and source_matches_intent?(value, intent)
+
+  defp source_matches_intent?(source, intent) do
+    case Regex.run(~r/^github:([^\s\/]+\/[^\s\/]+)#([1-9][0-9]*)$/, source, capture: :all_but_first) do
+      [repository, number] -> repository == intent.repository and number == Integer.to_string(intent.pull_number)
+      _ -> false
+    end
+  end
+
   defp valid_reviewer?(value), do: valid_text?(value) and Regex.match?(~r/^[A-Za-z0-9_.-]{1,100}$/, value)
   defp valid_revision_evidence?(evidence, intent), do: evidence.head == intent.reviewed_head and evidence.base == intent.reviewed_base
   defp valid_check_evidence?(checks, required) when is_list(checks), do: Enum.all?(checks, &valid_text?/1) and Enum.sort(Enum.uniq(checks)) == Enum.sort(Enum.uniq(required))
