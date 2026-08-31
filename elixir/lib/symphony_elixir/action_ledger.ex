@@ -103,6 +103,7 @@ defmodule SymphonyElixir.ActionLedger do
           required(:checkpoint) => String.t(),
           required(:expected_postcondition) => String.t(),
           required(:policy_fingerprint) => String.t(),
+          optional(:idempotency_key) => String.t(),
           optional(:blocker_classification) => String.t(),
           optional(:resume_condition) => String.t(),
           optional(:valid_until) => String.t()

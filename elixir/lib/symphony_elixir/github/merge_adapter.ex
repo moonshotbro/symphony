@@ -129,6 +129,7 @@ defmodule SymphonyElixir.GitHub.MergeAdapter do
           {:ok, ActionLedger.Action.t(), :new | :existing} | {:error, term()}
   defp plan_action(intent, opts) do
     ledger = ledger_server(opts)
+
     key = intent.intent_key || intent_key(intent)
 
     ledger_intent = %{
