@@ -9,6 +9,7 @@ defmodule SymphonyElixir.Codex.AppServer do
   @initialize_id 1
   @thread_start_id 2
   @turn_start_id 3
+  @thread_read_id 4
   @port_line_bytes 1_048_576
   @max_stream_log_bytes 1_000
   @type session :: %{
@@ -65,6 +66,36 @@ defmodule SymphonyElixir.Codex.AppServer do
           stop_port(port)
           {:error, reason}
       end
+    end
+  end
+
+  @doc """
+  Reads a persisted Codex thread from the App Server running on the same worker
+  host. This is intentionally a fresh, read-only connection: callers must not
+  infer an external effect from telemetry or an in-memory session identifier.
+  """
+  @spec read_thread(String.t(), Path.t(), keyword()) :: {:ok, map()} | {:error, term()}
+  def read_thread(thread_id, workspace, opts \\ []) do
+    if is_binary(thread_id) and is_binary(workspace) do
+      worker_host = Keyword.get(opts, :worker_host)
+      dynamic_tool_binding = DynamicTool.bind()
+
+      with true <- String.trim(thread_id) != "" or {:error, :thread_id_missing},
+           {:ok, expanded_workspace} <- validate_workspace_cwd(workspace, worker_host),
+           {:ok, port} <- start_port(expanded_workspace, worker_host, dynamic_tool_binding) do
+        try do
+          with :ok <- send_initialize(port) do
+            read_thread_from_port(port, thread_id)
+          end
+        after
+          stop_port(port)
+        end
+      else
+        {:error, _reason} = error -> error
+        false -> {:error, :thread_id_missing}
+      end
+    else
+      {:error, :thread_id_invalid}
     end
   end
 
@@ -362,6 +393,28 @@ defmodule SymphonyElixir.Codex.AppServer do
     case await_response(port, @turn_start_id) do
       {:ok, %{"turn" => %{"id" => turn_id}}} -> {:ok, turn_id}
       other -> other
+    end
+  end
+
+  defp read_thread_from_port(port, thread_id) do
+    send_message(port, %{
+      "method" => "thread/read",
+      "id" => @thread_read_id,
+      "params" => %{"threadId" => thread_id, "includeTurns" => true}
+    })
+
+    case await_response(port, @thread_read_id) do
+      {:ok, %{"thread" => %{} = thread}} ->
+        {:ok, thread}
+
+      {:ok, other} ->
+        {:error, {:invalid_thread_read_payload, other}}
+
+      {:error, {:response_error, %{"code" => code}}} when code in [-32_602, -32_001, 404] ->
+        {:error, :thread_not_found}
+
+      {:error, reason} ->
+        {:error, {:thread_read_failed, reason}}
     end
   end
 

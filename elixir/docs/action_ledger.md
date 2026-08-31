@@ -107,6 +107,14 @@ initial ledger write fails, the issue remains blocked and no retry is scheduled.
 Task messaging, automation, fork, and handoff share the typed envelope and adapter boundary, but
 their live effect adapters are deliberately outside this first phase.
 
+For `task_creation` actions whose postcondition is `codex.session_observed`, the native
+`Codex.RecoveryInspector` opens a fresh read-only App Server connection on the recorded worker
+host and calls `thread/read`. It accepts an effect only when the provider returns the exact
+recorded thread ID, deterministic workspace path, turn ID, and `<thread_id>-<turn_id>` session
+correlation. An explicit provider `thread_not_found` result makes the action retryable; a timeout,
+malformed response, missing correlation, host mismatch, cached ID, or telemetry never does. Those
+cases remain held/quarantined rather than being blindly redispatched.
+
 ## Recovery runbook
 
 1. Stop mutation dispatch if the ledger cannot start or append. Read-only inspection of an already

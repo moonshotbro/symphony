@@ -1,0 +1,97 @@
+defmodule SymphonyElixir.Codex.RecoveryInspector do
+  @moduledoc """
+  Reconciles a recovered task-creation action against Codex's persisted App
+  Server thread record. It deliberately fails closed when the durable action
+  lacks the exact thread, turn, workspace, or worker-host correlation needed
+  to make that read authoritative.
+  """
+
+  alias SymphonyElixir.{ActionLedger.Action, Workspace}
+  alias SymphonyElixir.Codex.AppServer
+
+  @spec inspect(Action.t(), keyword()) :: {:ok, map()} | {:error, term()}
+  def inspect(%Action{} = action, opts \\ []) do
+    reader = Keyword.get(opts, :thread_reader, &AppServer.read_thread/3)
+
+    with :ok <- task_creation_action(action),
+         {:ok, correlation} <- correlation(action),
+         {:ok, workspace} <- Workspace.path_for_key(correlation.workspace_key, correlation.worker_host),
+         {:ok, thread} <- reader.(correlation.thread_id, workspace, worker_host: correlation.worker_host),
+         :ok <- strict_match(thread, correlation, workspace) do
+      {:ok,
+       %{
+         provider: "codex",
+         authoritative: true,
+         exists: true,
+         session_id: correlation.session_id,
+         workspace_key: correlation.workspace_key,
+         disposition: "codex_thread_read_exact_match"
+       }}
+    else
+      {:error, :thread_not_found} ->
+        {:ok, %{provider: "codex", authoritative: true, exists: false, disposition: "codex_thread_read_absent"}}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp task_creation_action(%Action{kind: :task_creation, expected_postcondition: "codex.session_observed"}), do: :ok
+  defp task_creation_action(_action), do: {:error, :unsupported_recovery_action}
+
+  defp correlation(%Action{observed_effect: effect}) when is_map(effect) do
+    with {:ok, thread_id} <- required(effect, "thread_id"),
+         {:ok, turn_id} <- required(effect, "turn_id"),
+         {:ok, session_id} <- required(effect, "session_id"),
+         {:ok, workspace_key} <- required(effect, "workspace_key"),
+         {:ok, worker_host} <- optional_host(effect),
+         true <- session_id == "#{thread_id}-#{turn_id}" or {:error, :session_correlation_mismatch} do
+      {:ok,
+       %{
+         thread_id: thread_id,
+         turn_id: turn_id,
+         session_id: session_id,
+         workspace_key: workspace_key,
+         worker_host: worker_host
+       }}
+    end
+  end
+
+  defp correlation(_action), do: {:error, :recovery_correlation_missing}
+
+  defp required(map, key) do
+    case Map.get(map, key) do
+      value when is_binary(value) and value != "" -> {:ok, value}
+      _ -> {:error, {:recovery_correlation_missing, key}}
+    end
+  end
+
+  defp optional_host(map) do
+    case Map.get(map, "worker_host") do
+      value when is_binary(value) and value != "" -> {:ok, value}
+      nil -> {:ok, nil}
+      _ -> {:error, :worker_host_invalid}
+    end
+  end
+
+  defp strict_match(thread, correlation, workspace) when is_map(thread) do
+    thread_id = Map.get(thread, "id") || Map.get(thread, :id)
+    cwd = Map.get(thread, "cwd") || Map.get(thread, :cwd)
+    turns = Map.get(thread, "turns") || Map.get(thread, :turns)
+
+    case {thread_id == correlation.thread_id, cwd == workspace, turns} do
+      {false, _, _} -> {:error, :thread_id_mismatch}
+      {_, false, _} -> {:error, :workspace_mismatch}
+      {_, _, turns} when not is_list(turns) -> {:error, :thread_turns_missing}
+      {_, _, turns} -> match_turn(turns, correlation.turn_id)
+    end
+  end
+
+  defp strict_match(_thread, _correlation, _workspace), do: {:error, :thread_payload_invalid}
+
+  defp match_turn(turns, turn_id) do
+    if Enum.any?(turns, fn turn -> (Map.get(turn, "id") || Map.get(turn, :id)) == turn_id end),
+      do: :ok,
+      else: {:error, :turn_id_mismatch}
+  end
+end
