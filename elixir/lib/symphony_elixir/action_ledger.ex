@@ -12,7 +12,7 @@ defmodule SymphonyElixir.ActionLedger do
   require Logger
 
   @schema "symphony.action-ledger.v1"
-  @kinds ~w(task_creation task_messaging automation fork handoff)a
+  @kinds ~w(task_creation task_messaging automation fork handoff merge)a
   @states ~w(planned preflight_rejected dispatched succeeded already_satisfied uncertain retryable_failure compensated quarantined needs_input terminal_failure)a
   @terminal_states ~w(preflight_rejected succeeded already_satisfied compensated terminal_failure)a
   @source_keys ~w(goal_id task_id issue_id issue_identifier repository revision session_id)
