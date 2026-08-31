@@ -10,6 +10,7 @@ defmodule SymphonyElixir.Orchestrator do
   alias SymphonyElixir.{
     ActionLedger,
     AgentRunner,
+    Codex.RecoveryInspector,
     Config,
     CoordinationAdapter,
     StatusDashboard,
@@ -77,11 +78,11 @@ defmodule SymphonyElixir.Orchestrator do
           tick_token: nil,
           task_supervisor: Keyword.get(opts, :task_supervisor, SymphonyElixir.TaskSupervisor),
           action_ledger: Keyword.get(opts, :action_ledger),
-          action_inspector: Keyword.get(opts, :action_inspector, &default_action_inspector/1),
+          action_inspector: Keyword.get(opts, :action_inspector, &RecoveryInspector.inspect/1),
           claimed:
             recovered_action_claims(
               Keyword.get(opts, :action_ledger),
-              Keyword.get(opts, :action_inspector, &default_action_inspector/1)
+              Keyword.get(opts, :action_inspector, &RecoveryInspector.inspect/1)
             ),
           codex_totals: @empty_codex_totals,
           codex_rate_limits: nil
@@ -1721,6 +1722,8 @@ defmodule SymphonyElixir.Orchestrator do
         last_codex_timestamp: timestamp,
         last_codex_message: summarize_codex_update(update),
         session_id: session_id_for_update(running_entry.session_id, update),
+        thread_id: correlation_value(running_entry, update, :thread_id),
+        turn_id: correlation_value(running_entry, update, :turn_id),
         last_codex_event: event,
         codex_app_server_pid: codex_app_server_pid_for_update(codex_app_server_pid, update),
         codex_input_tokens: codex_input_tokens + token_delta.input_tokens,
@@ -1752,6 +1755,13 @@ defmodule SymphonyElixir.Orchestrator do
     do: session_id
 
   defp session_id_for_update(existing, _update), do: existing
+
+  defp correlation_value(running_entry, update, key) when is_map(update) do
+    case Map.get(update, key) do
+      value when is_binary(value) and value != "" -> value
+      _ -> Map.get(running_entry, key)
+    end
+  end
 
   defp turn_count_for_update(existing_count, existing_session_id, %{
          event: :session_started,
@@ -2223,9 +2233,6 @@ defmodule SymphonyElixir.Orchestrator do
     }
   end
 
-  defp default_action_inspector(_action),
-    do: {:error, :authoritative_provider_inspection_required}
-
   defp recovered_action_claims(nil, _inspector), do: MapSet.new()
 
   defp recovered_action_claims(action_ledger, inspector) do
@@ -2350,20 +2357,23 @@ defmodule SymphonyElixir.Orchestrator do
   defp complete_running_action_if_session_observed(action_ledger, running_entry) do
     action_id = running_entry[:action_id]
     session_id = running_entry[:session_id]
+    thread_id = running_entry[:thread_id]
+    turn_id = running_entry[:turn_id]
 
     case {action_id, session_id} do
-      {action_id, session_id} when is_binary(action_id) and is_binary(session_id) ->
-        complete_dispatched_action(action_ledger, action_id, session_id)
+      {action_id, session_id}
+      when is_binary(action_id) and is_binary(session_id) and is_binary(thread_id) and is_binary(turn_id) ->
+        complete_dispatched_action(action_ledger, action_id, session_id, thread_id, turn_id, running_entry)
 
       _ ->
         :ok
     end
   end
 
-  defp complete_dispatched_action(action_ledger, action_id, session_id) do
+  defp complete_dispatched_action(action_ledger, action_id, session_id, thread_id, turn_id, running_entry) do
     case ActionLedger.get(action_ledger, action_id) do
       {:ok, %{state: :dispatched}} ->
-        transition_completed_action(action_ledger, action_id, session_id)
+        transition_completed_action(action_ledger, action_id, session_id, thread_id, turn_id, running_entry)
 
       {:ok, _action} ->
         :ok
@@ -2373,11 +2383,21 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp transition_completed_action(action_ledger, action_id, session_id) do
-    case ActionLedger.transition(action_ledger, action_id, :succeeded, %{
-           "session_id" => session_id,
-           "disposition" => "codex_session_observed"
-         }) do
+  defp transition_completed_action(action_ledger, action_id, session_id, thread_id, turn_id, running_entry) do
+    effect =
+      %{
+        # Codex exposes thread and turn ids, but no provider-issued session id.
+        # Keep this derived value explicitly local so recovery cannot mistake it
+        # for provider authority after a restart.
+        "session_correlation_id" => session_id,
+        "thread_id" => thread_id,
+        "turn_id" => turn_id,
+        "workspace_key" => Workspace.workspace_key(running_entry.issue),
+        "disposition" => "codex_session_observed",
+        "host_assertion" => host_assertion(running_entry[:worker_host])
+      }
+
+    case ActionLedger.transition(action_ledger, action_id, :succeeded, effect) do
       {:ok, _action} ->
         :ok
 
@@ -2386,6 +2406,11 @@ defmodule SymphonyElixir.Orchestrator do
         {:error, reason}
     end
   end
+
+  defp host_assertion(nil), do: %{"type" => "worker_host", "value" => "local"}
+
+  defp host_assertion(worker_host) when is_binary(worker_host) and worker_host != "",
+    do: %{"type" => "worker_host", "value" => worker_host}
 
   defp record_running_action_exit(nil, _running_entry, _reason), do: :ok
 

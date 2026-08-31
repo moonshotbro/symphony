@@ -277,6 +277,14 @@ defmodule SymphonyElixir.Workspace do
 
   def workspace_key(_identifier), do: "issue"
 
+  @doc "Returns the deterministic workspace path without creating or modifying it."
+  @spec path_for_key(String.t(), worker_host()) :: {:ok, Path.t()} | {:error, term()}
+  def path_for_key(workspace_key, worker_host \\ nil) do
+    if is_binary(workspace_key),
+      do: workspace_path_for_issue(workspace_key, worker_host),
+      else: {:error, :workspace_key_invalid}
+  end
+
   defp safe_identifier(identifier) when is_binary(identifier),
     do: String.replace(identifier, ~r/[^a-zA-Z0-9._-]/, "_")
 

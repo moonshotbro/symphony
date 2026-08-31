@@ -9,8 +9,13 @@ defmodule SymphonyElixir.Codex.AppServer do
   @initialize_id 1
   @thread_start_id 2
   @turn_start_id 3
+  @thread_read_id 4
+  @thread_turns_list_id 5
+  @thread_turns_page_size 100
+  @max_thread_turn_pages 1_000
   @port_line_bytes 1_048_576
   @max_stream_log_bytes 1_000
+  @remote_canonical_marker "__SYMPHONY_REMOTE_CANONICAL_PATHS__"
   @type session :: %{
           port: port(),
           metadata: map(),
@@ -65,6 +70,35 @@ defmodule SymphonyElixir.Codex.AppServer do
           stop_port(port)
           {:error, reason}
       end
+    end
+  end
+
+  @doc """
+  Reads a persisted Codex thread from the App Server running on the same worker
+  host. This is intentionally a fresh, read-only connection: callers must not
+  infer an external effect from telemetry or an in-memory session identifier.
+  """
+  @spec read_thread(String.t(), Path.t(), keyword()) :: {:ok, map()} | {:error, term()}
+  def read_thread(thread_id, workspace, opts \\ []) do
+    if is_binary(thread_id) and is_binary(workspace) do
+      worker_host = Keyword.get(opts, :worker_host)
+      dynamic_tool_binding = DynamicTool.bind()
+
+      with true <- String.trim(thread_id) != "" or {:error, :thread_id_missing},
+           {:ok, expanded_workspace} <- validate_workspace_cwd(workspace, worker_host),
+           {:ok, port} <- start_port(expanded_workspace, worker_host, dynamic_tool_binding) do
+        try do
+          with :ok <- send_initialize(port) do
+            read_thread_from_port(port, thread_id)
+          end
+        after
+          stop_port(port)
+        end
+      else
+        {:error, _reason} = error -> error
+      end
+    else
+      {:error, :thread_id_invalid}
     end
   end
 
@@ -177,15 +211,134 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   defp validate_workspace_cwd(workspace, worker_host)
        when is_binary(workspace) and is_binary(worker_host) do
-    cond do
-      String.trim(workspace) == "" ->
-        {:error, {:invalid_workspace_cwd, :empty_remote_workspace, worker_host}}
+    # A remote worker has no local filesystem we can canonicalise.  Do not
+    # compensate by accepting an arbitrary path: normalise only a strictly
+    # absolute, traversal-free POSIX path, then prove it is below the configured
+    # remote workspace root before the value reaches SSH.
+    with {:ok, lexical_workspace} <- remote_workspace_path(workspace, :workspace),
+         {:ok, lexical_root} <- remote_workspace_path(Config.settings!().workspace.root, :root),
+         {:ok, {canonical_root, canonical_workspace}} <-
+           remote_canonical_paths(worker_host, lexical_root, lexical_workspace) do
+      root_prefix = canonical_root <> "/"
 
-      String.contains?(workspace, ["\n", "\r", <<0>>]) ->
-        {:error, {:invalid_workspace_cwd, :invalid_remote_workspace, worker_host, workspace}}
+      cond do
+        canonical_workspace == canonical_root ->
+          {:error, {:invalid_workspace_cwd, :workspace_root, worker_host, canonical_workspace}}
+
+        String.starts_with?(canonical_workspace <> "/", root_prefix) ->
+          {:ok, canonical_workspace}
+
+        true ->
+          {:error, remote_workspace_outside_error(worker_host, canonical_workspace, canonical_root)}
+      end
+    end
+  end
+
+  defp remote_workspace_outside_error(worker_host, workspace, root) do
+    {:invalid_workspace_cwd, :outside_remote_workspace_root, worker_host, workspace, root}
+  end
+
+  defp remote_workspace_path(path, role) when is_binary(path) do
+    segments = String.split(path, "/", trim: true)
+
+    cond do
+      String.trim(path) == "" ->
+        {:error, {:invalid_remote_workspace, role, :empty}}
+
+      Path.type(path) != :absolute ->
+        {:error, {:invalid_remote_workspace, role, :not_absolute}}
+
+      String.contains?(path, ["\n", "\r", <<0>>]) ->
+        {:error, {:invalid_remote_workspace, role, :invalid_characters}}
+
+      segments == [] ->
+        {:error, {:invalid_remote_workspace, role, :root}}
+
+      Enum.any?(segments, &(&1 in [".", ".."])) ->
+        {:error, {:invalid_remote_workspace, role, :traversal}}
 
       true ->
-        {:ok, workspace}
+        {:ok, "/" <> Enum.join(segments, "/")}
+    end
+  end
+
+  # Lexical checks cannot detect a symlink on a remote worker.  Resolve both
+  # paths on that worker in one fixed-purpose shell script, then compare the
+  # resulting physical paths before opening the App Server protocol.  Paths are
+  # assigned as shell-escaped values and are never interpolated as commands.
+  defp remote_canonical_paths(worker_host, root, workspace)
+       when is_binary(worker_host) and is_binary(root) and is_binary(workspace) do
+    script =
+      [
+        "set -eu",
+        "root=#{shell_escape(root)}",
+        "workspace=#{shell_escape(workspace)}",
+        "cd -- \"$root\"",
+        "canonical_root=$(pwd -P)",
+        "cd -- \"$workspace\"",
+        "canonical_workspace=$(pwd -P)",
+        "printf '%s\\t%s\\t%s\\n' '#{@remote_canonical_marker}' \"$canonical_root\" \"$canonical_workspace\""
+      ]
+      |> Enum.join("\n")
+
+    timeout_ms = Config.settings!().hooks.timeout_ms
+
+    task =
+      Task.async(fn ->
+        SSH.run(worker_host, script, stderr_to_stdout: true)
+      end)
+
+    result =
+      case Task.yield(task, timeout_ms) do
+        {:ok, value} ->
+          value
+
+        nil ->
+          Task.shutdown(task, :brutal_kill)
+          {:error, {:remote_workspace_canonicalize_timeout, timeout_ms}}
+      end
+
+    case result do
+      {:ok, {output, 0}} ->
+        parse_remote_canonical_paths(output, worker_host, root, workspace)
+
+      {:ok, {output, status}} ->
+        {:error, {:invalid_workspace_cwd, :remote_path_unreadable, worker_host, status, output}}
+
+      {:error, reason} ->
+        {:error, {:invalid_workspace_cwd, :remote_canonicalize_failed, worker_host, reason}}
+
+      other ->
+        {:error, {:invalid_workspace_cwd, :remote_canonicalize_failed, worker_host, other}}
+    end
+  end
+
+  defp parse_remote_canonical_paths(output, worker_host, root, workspace) do
+    paths =
+      output
+      |> IO.iodata_to_binary()
+      |> String.split("\n", trim: true)
+      |> Enum.find_value(fn line ->
+        case String.split(line, "\t", parts: 3) do
+          [@remote_canonical_marker, canonical_root, canonical_workspace]
+          when canonical_root != "" and canonical_workspace != "" ->
+            {canonical_root, canonical_workspace}
+
+          _ ->
+            nil
+        end
+      end)
+
+    case paths do
+      {canonical_root, canonical_workspace} ->
+        if Path.type(canonical_root) == :absolute and Path.type(canonical_workspace) == :absolute do
+          {:ok, {canonical_root, canonical_workspace}}
+        else
+          {:error, {:invalid_workspace_cwd, :remote_canonical_output, worker_host, root, workspace, output}}
+        end
+
+      _ ->
+        {:error, {:invalid_workspace_cwd, :remote_canonical_output, worker_host, root, workspace, output}}
     end
   end
 
@@ -364,6 +517,88 @@ defmodule SymphonyElixir.Codex.AppServer do
       other -> other
     end
   end
+
+  defp read_thread_from_port(port, thread_id) do
+    send_message(port, %{
+      "method" => "thread/read",
+      "id" => @thread_read_id,
+      # Full-history hydration is deprecated for paginated threads.  A metadata
+      # read plus persisted turn pages is the current App Server contract.
+      "params" => %{"threadId" => thread_id}
+    })
+
+    case await_response(port, @thread_read_id) do
+      {:ok, %{"thread" => %{} = thread}} ->
+        with {:ok, turns} <- read_thread_turns(port, thread_id) do
+          {:ok, Map.put(thread, "turns", turns)}
+        end
+
+      {:ok, other} ->
+        {:error, {:invalid_thread_read_payload, other}}
+
+      # Codex CLI 0.151.0 reports a persisted-thread miss as JSON-RPC -32600
+      # with the exact semantic message "thread not loaded: <thread id>". Other malformed
+      # request errors must remain fail-closed rather than becoming retry proof.
+      {:error, {:response_error, error}} when is_map(error) ->
+        if thread_not_loaded_error?(error, thread_id),
+          do: {:error, :thread_not_found},
+          else: {:error, {:thread_read_failed, {:response_error, error}}}
+
+      {:error, reason} ->
+        {:error, {:thread_read_failed, reason}}
+    end
+  end
+
+  defp read_thread_turns(port, thread_id), do: read_thread_turns(port, thread_id, nil, [], 0)
+
+  defp read_thread_turns(_port, _thread_id, _cursor, _turns, page_count)
+       when page_count >= @max_thread_turn_pages,
+       do: {:error, :thread_turn_pagination_limit}
+
+  defp read_thread_turns(port, thread_id, cursor, turns, page_count) do
+    send_message(port, %{
+      "method" => "thread/turns/list",
+      "id" => @thread_turns_list_id,
+      "params" => %{
+        "threadId" => thread_id,
+        "cursor" => cursor,
+        "limit" => @thread_turns_page_size,
+        "sortDirection" => "desc",
+        "itemsView" => "notLoaded"
+      }
+    })
+
+    case await_response(port, @thread_turns_list_id) do
+      {:ok, response} -> process_thread_turn_page(port, thread_id, response, turns, page_count)
+      {:error, reason} -> {:error, {:thread_turns_list_failed, reason}}
+    end
+  end
+
+  defp process_thread_turn_page(port, thread_id, %{"data" => page_turns} = response, turns, page_count)
+       when is_list(page_turns) do
+    all_turns = turns ++ page_turns
+
+    case Map.get(response, "nextCursor") do
+      nil ->
+        {:ok, all_turns}
+
+      next_cursor when is_binary(next_cursor) ->
+        read_thread_turns(port, thread_id, next_cursor, all_turns, page_count + 1)
+
+      _ ->
+        {:error, {:invalid_thread_turns_payload, response}}
+    end
+  end
+
+  defp process_thread_turn_page(_port, _thread_id, response, _turns, _page_count),
+    do: {:error, {:invalid_thread_turns_payload, response}}
+
+  defp thread_not_loaded_error?(%{"code" => -32_600, "message" => message}, thread_id)
+       when is_binary(message) and is_binary(thread_id) do
+    String.downcase(String.trim(message)) == "thread not loaded: #{String.downcase(thread_id)}"
+  end
+
+  defp thread_not_loaded_error?(_error, _thread_id), do: false
 
   defp await_turn_completion(port, on_message, tool_executor, auto_approve_requests) do
     receive_loop(
