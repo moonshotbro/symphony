@@ -165,4 +165,158 @@ defmodule SymphonyElixir.ActionLedgerIntegrationTest do
 
     assert env_settings.action_ledger.path == "/var/lib/symphony/env-action-ledger.jsonl"
   end
+
+  test "native blocked path records one stalled-goal decision and keeps it claimed" do
+    suffix = System.unique_integer([:positive])
+    root = Path.join(System.tmp_dir!(), "symphony-ledger-stalled-#{suffix}")
+    ledger_path = Path.join(root, "actions.jsonl")
+    ledger_name = Module.concat(__MODULE__, "StalledLedger#{suffix}")
+    orchestrator_name = Module.concat(__MODULE__, "StalledOrchestrator#{suffix}")
+    issue_id = "issue-stalled-#{suffix}"
+
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [])
+    {:ok, _ledger} = start_supervised({ActionLedger, name: ledger_name, path: ledger_path, enabled: true})
+
+    {:ok, _orchestrator} =
+      start_supervised({Orchestrator, name: orchestrator_name, action_ledger: ledger_name})
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "STALL-#{suffix}",
+      url: "https://linear.app/sysmiq/issue/#{issue_id}",
+      updated_at: ~U[2026-08-31 04:00:00Z]
+    }
+
+    state = :sys.get_state(orchestrator_name)
+    running_entry = %{issue: issue, identifier: issue.identifier, pid: nil, ref: nil, session_id: "session-#{suffix}"}
+
+    blocked = Orchestrator.stop_and_block_issue_for_test(state, issue_id, running_entry, "codex approval required")
+    assert Map.has_key?(blocked.blocked, issue_id)
+    assert MapSet.member?(blocked.claimed, issue_id)
+    assert is_binary(blocked.blocked[issue_id].goal_action_id)
+
+    action_id = blocked.blocked[issue_id].goal_action_id
+    assert {:ok, action} = ActionLedger.get(ledger_name, action_id)
+    assert action.state == :needs_input
+    assert action.blocker_classification == "goal.stalled"
+    assert action.resume_condition =~ "decision.resume."
+    assert action.resume_condition =~ ~r/^decision\.resume\.[0-9a-f]{64}$/
+
+    :sys.replace_state(orchestrator_name, fn current ->
+      %{current | blocked: blocked.blocked, claimed: blocked.claimed}
+    end)
+
+    assert {:error, :resume_condition_mismatch} =
+             Orchestrator.resume_goal(orchestrator_name, action_id, "decision.resume.wrong")
+
+    assert {:ok, %{action_id: ^action_id}} =
+             Orchestrator.resume_goal(orchestrator_name, action_id, action.resume_condition)
+
+    resumed_state = :sys.get_state(orchestrator_name)
+    refute Map.has_key?(resumed_state.blocked, issue_id)
+    refute MapSet.member?(resumed_state.claimed, issue_id)
+
+    on_exit(fn -> File.rm_rf(root) end)
+  end
+
+  test "startup inspects uncertain action and releases a claim only after authoritative absence" do
+    suffix = System.unique_integer([:positive])
+    root = Path.join(System.tmp_dir!(), "symphony-ledger-startup-inspect-#{suffix}")
+    path = Path.join(root, "actions.jsonl")
+    ledger_name = Module.concat(__MODULE__, "StartupLedger#{suffix}")
+    recovered_ledger_name = Module.concat(__MODULE__, "RecoveredStartupLedger#{suffix}")
+    runtime_name = Module.concat(__MODULE__, "RecoveredStartupRuntime#{suffix}")
+    task_supervisor_name = Module.concat(__MODULE__, "RecoveredStartupTasks#{suffix}")
+    orchestrator_name = Module.concat(__MODULE__, "StartupOrchestrator#{suffix}")
+    issue_id = "issue-startup-inspect-#{suffix}"
+
+    intent = %{
+      kind: :task_creation,
+      source: %{issue_id: issue_id, task_id: "task-#{suffix}", revision: "rev-1"},
+      target: %{type: "codex_task", worker_host: "local"},
+      purpose: "startup-inspection",
+      checkpoint: "rev-1",
+      expected_postcondition: "codex.session_observed",
+      policy_fingerprint: ActionLedger.policy_fingerprint("startup-test")
+    }
+
+    {:ok, _first_pid} = start_supervised({ActionLedger, name: ledger_name, path: path, enabled: true})
+    assert {:ok, action, :new} = ActionLedger.plan(ledger_name, intent)
+    assert {:ok, _} = ActionLedger.transition(ledger_name, action.id, :dispatched)
+    assert :ok = stop_supervised(ActionLedger)
+
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [])
+
+    {:ok, _} =
+      SymphonyElixir.AgentRuntimeSupervisor.start_link(
+        name: runtime_name,
+        task_supervisor_name: task_supervisor_name,
+        orchestrator_name: orchestrator_name,
+        action_ledger_enabled: true,
+        action_ledger_name: recovered_ledger_name,
+        action_ledger_path: path,
+        action_inspector: fn _action ->
+          {:ok, %{provider: "codex", authoritative: true, exists: false}}
+        end
+      )
+
+    assert :sys.get_state(orchestrator_name).claimed |> MapSet.member?(issue_id) == false
+    assert {:ok, recovered} = ActionLedger.get(recovered_ledger_name, action.id)
+    assert recovered.state == :planned
+    on_exit(fn -> File.rm_rf(root) end)
+  end
+
+  test "enabled ledger records a normal worker exit without crashing the orchestrator" do
+    suffix = System.unique_integer([:positive])
+    root = Path.join(System.tmp_dir!(), "symphony-ledger-worker-exit-#{suffix}")
+    path = Path.join(root, "actions.jsonl")
+    ledger_name = Module.concat(__MODULE__, "WorkerExitLedger#{suffix}")
+    orchestrator_name = Module.concat(__MODULE__, "WorkerExitOrchestrator#{suffix}")
+    issue_id = "issue-worker-exit-#{suffix}"
+    ref = make_ref()
+
+    intent = %{
+      kind: :task_creation,
+      source: %{issue_id: issue_id, task_id: "task-#{suffix}", revision: "rev-1"},
+      target: %{type: "codex_task", worker_host: "local"},
+      purpose: "worker-exit",
+      checkpoint: "rev-1",
+      expected_postcondition: "codex.session_observed",
+      policy_fingerprint: ActionLedger.policy_fingerprint("worker-exit-test")
+    }
+
+    {:ok, _} = start_supervised({ActionLedger, name: ledger_name, path: path, enabled: true})
+    assert {:ok, action, :new} = ActionLedger.plan(ledger_name, intent)
+    assert {:ok, _} = ActionLedger.transition(ledger_name, action.id, :dispatched)
+
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [])
+    {:ok, _} = start_supervised({Orchestrator, name: orchestrator_name, action_ledger: ledger_name})
+
+    issue = %Issue{id: issue_id, identifier: "EXIT-#{suffix}", url: "https://linear.app/sysmiq/issue/#{issue_id}"}
+
+    :sys.replace_state(orchestrator_name, fn state ->
+      running_entry = %{
+        issue: issue,
+        identifier: issue.identifier,
+        action_id: action.id,
+        ref: ref,
+        session_id: "session-#{suffix}",
+        started_at: DateTime.utc_now()
+      }
+
+      %{state | running: %{issue_id => running_entry}, claimed: MapSet.put(state.claimed, issue_id)}
+    end)
+
+    send(orchestrator_name, {:DOWN, ref, :process, self(), :normal})
+    state = :sys.get_state(orchestrator_name)
+
+    assert Process.alive?(Process.whereis(orchestrator_name))
+    refute Map.has_key?(state.running, issue_id)
+    assert {:ok, exited} = ActionLedger.get(ledger_name, action.id)
+    assert exited.state == :retryable_failure
+    on_exit(fn -> File.rm_rf(root) end)
+  end
 end

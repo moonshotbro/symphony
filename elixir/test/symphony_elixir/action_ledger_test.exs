@@ -556,6 +556,204 @@ defmodule SymphonyElixir.ActionLedgerTest do
     assert {:error, :enotdir} = ActionLedger.resume_goal(ledger, action.id, "decision.ready")
   end
 
+  test "uncertain action requires authoritative session and workspace inspection before retry", %{path: path} do
+    ledger = start_ledger(path)
+    action = plan_with_checkpoint(ledger, "inspect-before-retry")
+    assert {:ok, _} = ActionLedger.transition(ledger, action.id, :dispatched)
+    assert {:ok, _} = ActionLedger.transition(ledger, action.id, :uncertain)
+
+    assert {:ok, quarantined, :quarantined} =
+             ActionLedger.inspect_recovered(ledger, action.id, %{
+               provider: "codex",
+               authoritative: false,
+               exists: true,
+               session_id: "session-1",
+               workspace_key: "workspace-1"
+             })
+
+    assert quarantined.state == :quarantined
+
+    action =
+      plan_action(
+        ledger,
+        intent(%{checkpoint: "inspect-before-retry-session", expected_postcondition: "codex.session_observed"})
+      )
+
+    assert {:ok, _} = ActionLedger.transition(ledger, action.id, :dispatched)
+    assert {:ok, _} = ActionLedger.transition(ledger, action.id, :uncertain)
+
+    assert {:ok, settled, :already_satisfied} =
+             ActionLedger.inspect_recovered(ledger, action.id, %{
+               provider: "codex",
+               authoritative: true,
+               exists: true,
+               session_id: "session-1",
+               workspace_key: "workspace-1"
+             })
+
+    assert settled.state == :already_satisfied
+    assert {:error, :action_not_uncertain} = ActionLedger.inspect_recovered(ledger, action.id, %{})
+
+    incomplete =
+      plan_action(
+        ledger,
+        intent(%{checkpoint: "inspect-incomplete", expected_postcondition: "codex.session_observed"})
+      )
+
+    assert {:ok, _} = ActionLedger.transition(ledger, incomplete.id, :dispatched)
+    assert {:ok, _} = ActionLedger.transition(ledger, incomplete.id, :uncertain)
+
+    assert {:ok, quarantined_incomplete, :quarantined} =
+             ActionLedger.inspect_recovered(ledger, incomplete.id, %{
+               provider: "codex",
+               authoritative: true,
+               exists: true,
+               session_id: "session-only"
+             })
+
+    assert quarantined_incomplete.state == :quarantined
+
+    wrong_provider =
+      plan_action(
+        ledger,
+        intent(%{checkpoint: "inspect-wrong-provider", expected_postcondition: "codex.session_observed"})
+      )
+
+    assert {:ok, _} = ActionLedger.transition(ledger, wrong_provider.id, :dispatched)
+    assert {:ok, _} = ActionLedger.transition(ledger, wrong_provider.id, :uncertain)
+
+    assert {:ok, provider_mismatch, :quarantined} =
+             ActionLedger.inspect_recovered(ledger, wrong_provider.id, %{
+               provider: "linear",
+               authoritative: true,
+               exists: true,
+               session_id: "session-1",
+               workspace_key: "workspace-1"
+             })
+
+    assert provider_mismatch.observed_effect["disposition"] == "provider_mismatch"
+
+    missing_provider = plan_with_checkpoint(ledger, "inspect-missing-provider")
+    assert {:ok, _} = ActionLedger.transition(ledger, missing_provider.id, :dispatched)
+    assert {:ok, _} = ActionLedger.transition(ledger, missing_provider.id, :uncertain)
+
+    assert {:error, {:field_value_invalid, "provider"}} =
+             ActionLedger.inspect_recovered(ledger, missing_provider.id, %{authoritative: true, exists: true})
+
+    assert {:error, :inspection_invalid} = ActionLedger.inspect_recovered(ledger, missing_provider.id, :bad_evidence)
+
+    assert {:error, :inspection_not_authoritative} =
+             ActionLedger.inspect_recovered(ledger, missing_provider.id, %{
+               provider: "codex",
+               authoritative: "unknown",
+               exists: true
+             })
+
+    assert {:error, :action_not_found} =
+             ActionLedger.inspect_recovered(ledger, "act_missing", %{
+               provider: "codex",
+               authoritative: true,
+               exists: false
+             })
+
+    assert {:error, {:field_not_allowed, "unexpected"}} =
+             ActionLedger.inspect_recovered(ledger, missing_provider.id, %{
+               provider: "codex",
+               authoritative: true,
+               exists: true,
+               unexpected: "value"
+             })
+  end
+
+  test "authoritative absence makes an uncertain action retryable, never an implicit dispatch", %{path: path} do
+    ledger = start_ledger(path)
+    action = plan_with_checkpoint(ledger, "inspect-absent")
+    assert {:ok, _} = ActionLedger.transition(ledger, action.id, :dispatched)
+    assert {:ok, _} = ActionLedger.transition(ledger, action.id, :uncertain)
+
+    assert {:ok, retryable, :retryable_failure} =
+             ActionLedger.inspect_recovered(ledger, action.id, %{
+               provider: "codex",
+               authoritative: true,
+               exists: false
+             })
+
+    assert retryable.state == :retryable_failure
+    assert {:ok, planned} = ActionLedger.transition(ledger, action.id, :planned)
+    assert planned.state == :planned
+
+    existing = plan_with_checkpoint(ledger, "inspect-generic-present")
+    assert {:ok, _} = ActionLedger.transition(ledger, existing.id, :dispatched)
+    assert {:ok, _} = ActionLedger.transition(ledger, existing.id, :uncertain)
+
+    assert {:ok, satisfied, :already_satisfied} =
+             ActionLedger.inspect_recovered(ledger, existing.id, %{
+               provider: "linear",
+               authoritative: true,
+               exists: true,
+               disposition: "issue_present"
+             })
+
+    assert satisfied.state == :already_satisfied
+  end
+
+  test "read-only path inspection reports corruption without repairing it", %{root: root, path: path} do
+    assert {:ok, report} = ActionLedger.inspect_storage(path)
+    assert report.schema == "symphony.action-ledger.v1"
+
+    corrupt = Path.join(root, "read-only-corrupt.jsonl")
+    File.write!(corrupt, "not-json\n")
+    assert {:error, :ledger_corrupt} = ActionLedger.inspect_storage(corrupt)
+    assert File.read!(corrupt) == "not-json\n"
+  end
+
+  test "identity-bearing values reject payload-like content", %{path: path} do
+    ledger = start_ledger(path)
+
+    assert {:error, {:field_value_invalid, "issue_id"}} =
+             ActionLedger.plan(ledger, intent(%{source: %{issue_id: "Bearer secret-token"}}))
+
+    assert {:error, {:field_value_invalid, "repository"}} =
+             ActionLedger.plan(ledger, intent(%{source: %{repository: "https://example.com/repo?token=secret"}}))
+
+    assert {:error, {:field_value_invalid, "task_id"}} =
+             ActionLedger.plan(ledger, intent(%{source: %{task_id: "customer invoice contents"}}))
+
+    assert {:error, {:field_value_invalid, "id"}} =
+             ActionLedger.plan(ledger, intent(%{target: %{id: "customer document body"}}))
+
+    assert {:error, {:field_value_invalid, "type"}} =
+             ActionLedger.plan(ledger, intent(%{target: %{type: "customer document body"}}))
+
+    assert {:error, {:checkpoint, :invalid}} =
+             ActionLedger.plan(ledger, intent(%{checkpoint: "customer prompt content"}))
+
+    assert {:ok, action, :new} = ActionLedger.plan(ledger, intent())
+
+    assert {:error, {:field_value_invalid, "thread_id"}} =
+             ActionLedger.transition(ledger, action.id, :dispatched, %{thread_id: "customer prompt content"})
+
+    assert {:error, {:field_value_invalid, "disposition"}} =
+             ActionLedger.transition(ledger, action.id, :dispatched, %{disposition: "Bearer token"})
+  end
+
+  test "default inspection API delegates to the named ledger", %{path: path} do
+    {:ok, _pid} = start_supervised({ActionLedger, name: ActionLedger, path: path, enabled: true})
+    assert {:ok, report} = ActionLedger.inspect_storage(path)
+    assert report.action_count == 0
+
+    action = plan_with_checkpoint(ActionLedger, "default-inspection")
+    assert {:ok, _} = ActionLedger.transition(ActionLedger, action.id, :dispatched)
+    assert {:ok, _} = ActionLedger.transition(ActionLedger, action.id, :uncertain)
+
+    assert {:ok, _retryable, :retryable_failure} =
+             ActionLedger.inspect_recovered(action.id, %{
+               provider: "codex",
+               authoritative: true,
+               exists: false
+             })
+  end
+
   test "adapter error paths never leak an unrecorded effect", %{root: root} do
     nil_ledger_intent = intent()
 
@@ -581,7 +779,7 @@ defmodule SymphonyElixir.ActionLedgerTest do
                precondition: fn -> :unknown end
              )
 
-    assert {:error, {:coordination_effect_invalid, :bad_result}} =
+    assert {:error, {:uncertain_effect, _action_id, {:coordination_effect_invalid, :bad_result}}} =
              CoordinationAdapter.dispatch(
                ledger,
                intent(%{checkpoint: "invalid-effect"}),
@@ -609,6 +807,20 @@ defmodule SymphonyElixir.ActionLedgerTest do
   end
 
   test "adapter reports every durable postcondition failure", %{root: root} do
+    dispatch_path = Path.join([root, "dispatch-write", "ledger.jsonl"])
+    dispatch_ledger = start_ledger(dispatch_path)
+
+    assert {:error, :enotdir} =
+             CoordinationAdapter.dispatch(
+               dispatch_ledger,
+               intent(%{checkpoint: "dispatch-write"}),
+               fn -> {:ok, :never, %{}} end,
+               precondition: fn ->
+                 sabotage_ledger_path(dispatch_path)
+                 :ok
+               end
+             )
+
     obsolete_path = Path.join([root, "obsolete-write", "ledger.jsonl"])
     obsolete_ledger = start_ledger(obsolete_path)
     obsolete = intent(%{checkpoint: "obsolete-write"})
@@ -664,6 +876,132 @@ defmodule SymphonyElixir.ActionLedgerTest do
              )
   end
 
+  test "adapter inspects recovered effects before allowing a retry", %{path: path} do
+    ledger = start_ledger(path)
+    parent = self()
+    existing_intent = intent(%{checkpoint: "adapter-inspect-existing", expected_postcondition: "codex.session_observed"})
+    existing = plan_action(ledger, existing_intent)
+    assert {:ok, _} = ActionLedger.transition(ledger, existing.id, :dispatched)
+    assert {:ok, _} = ActionLedger.transition(ledger, existing.id, :uncertain)
+
+    assert {:already_satisfied, _} =
+             CoordinationAdapter.dispatch(
+               ledger,
+               existing_intent,
+               fn ->
+                 send(parent, :must_not_dispatch)
+                 {:ok, :bad, %{}}
+               end,
+               inspect_recovered: fn _action ->
+                 {:ok,
+                  %{
+                    provider: "codex",
+                    authoritative: true,
+                    exists: true,
+                    session_id: "session-1",
+                    workspace_key: "workspace-1"
+                  }}
+               end
+             )
+
+    refute_received :must_not_dispatch
+
+    retry_intent = intent(%{checkpoint: "adapter-inspect-absent"})
+    retry = plan_action(ledger, retry_intent)
+    assert {:ok, _} = ActionLedger.transition(ledger, retry.id, :dispatched)
+    assert {:ok, _} = ActionLedger.transition(ledger, retry.id, :uncertain)
+
+    assert {:ok, :retried, _} =
+             CoordinationAdapter.dispatch(
+               ledger,
+               retry_intent,
+               fn -> {:ok, :retried, %{"disposition" => "worker_spawned"}} end,
+               inspect_recovered: fn _action -> {:ok, %{provider: "codex", authoritative: true, exists: false}} end
+             )
+
+    dispatched_intent = intent(%{checkpoint: "adapter-still-dispatched"})
+    dispatched = plan_action(ledger, dispatched_intent)
+    assert {:ok, _} = ActionLedger.transition(ledger, dispatched.id, :dispatched)
+
+    assert {:error, {:uncertain_action, action_id}} =
+             CoordinationAdapter.dispatch(ledger, dispatched_intent, fn -> {:ok, :never, %{}} end)
+
+    assert action_id == dispatched.id
+
+    inspector_error_intent = intent(%{checkpoint: "adapter-inspector-error"})
+    inspector_error = plan_action(ledger, inspector_error_intent)
+    assert {:ok, _} = ActionLedger.transition(ledger, inspector_error.id, :dispatched)
+    assert {:ok, _} = ActionLedger.transition(ledger, inspector_error.id, :uncertain)
+
+    assert {:error, {:inspection_failed, :provider_unavailable}} =
+             CoordinationAdapter.dispatch(
+               ledger,
+               inspector_error_intent,
+               fn -> {:ok, :never, %{}} end,
+               inspect_recovered: fn _action -> {:error, :provider_unavailable} end
+             )
+
+    invalid_inspector_intent = intent(%{checkpoint: "adapter-invalid-inspector"})
+    invalid_inspector = plan_action(ledger, invalid_inspector_intent)
+    assert {:ok, _} = ActionLedger.transition(ledger, invalid_inspector.id, :dispatched)
+    assert {:ok, _} = ActionLedger.transition(ledger, invalid_inspector.id, :uncertain)
+
+    assert {:error, {:inspection_result_invalid, :bad_inspection}} =
+             CoordinationAdapter.dispatch(
+               ledger,
+               invalid_inspector_intent,
+               fn -> {:ok, :never, %{}} end,
+               inspect_recovered: fn _action -> :bad_inspection end
+             )
+
+    invalid_evidence_intent = intent(%{checkpoint: "adapter-invalid-evidence"})
+    invalid_evidence = plan_action(ledger, invalid_evidence_intent)
+    assert {:ok, _} = ActionLedger.transition(ledger, invalid_evidence.id, :dispatched)
+    assert {:ok, _} = ActionLedger.transition(ledger, invalid_evidence.id, :uncertain)
+
+    assert {:error, {:inspection_failed, :inspection_not_authoritative}} =
+             CoordinationAdapter.dispatch(
+               ledger,
+               invalid_evidence_intent,
+               fn -> {:ok, :never, %{}} end,
+               inspect_recovered: fn _action ->
+                 {:ok, %{provider: "codex", authoritative: "unknown", exists: true}}
+               end
+             )
+
+    quarantined_intent = intent(%{checkpoint: "adapter-inspect-quarantine"})
+    quarantined = plan_action(ledger, quarantined_intent)
+    assert {:ok, _} = ActionLedger.transition(ledger, quarantined.id, :dispatched)
+    assert {:ok, _} = ActionLedger.transition(ledger, quarantined.id, :uncertain)
+
+    assert {:error, {:uncertain_action_quarantined, quarantined_id}} =
+             CoordinationAdapter.dispatch(
+               ledger,
+               quarantined_intent,
+               fn -> {:ok, :never, %{}} end,
+               inspect_recovered: fn _action ->
+                 {:ok, %{provider: "codex", authoritative: false, exists: true}}
+               end
+             )
+
+    assert quarantined_id == quarantined.id
+
+    invalid_effect_path = Path.join([Path.dirname(path), "invalid-effect-recording", "ledger.jsonl"])
+    invalid_effect_ledger = start_ledger(invalid_effect_path)
+    invalid_effect_intent = intent(%{checkpoint: "invalid-effect-recording"})
+    assert {:ok, _invalid_effect_action, :new} = ActionLedger.plan(invalid_effect_ledger, invalid_effect_intent)
+
+    assert {:error, {:failure_record_failed, :enotdir, {:coordination_effect_invalid, :bad_result}}} =
+             CoordinationAdapter.dispatch(
+               invalid_effect_ledger,
+               invalid_effect_intent,
+               fn ->
+                 sabotage_ledger_path(invalid_effect_path)
+                 :bad_result
+               end
+             )
+  end
+
   defp start_ledger(path, opts \\ []) do
     case start_ledger_result(path, opts) do
       {:ok, pid} -> pid
@@ -695,6 +1033,11 @@ defmodule SymphonyElixir.ActionLedgerTest do
 
   defp plan_with_checkpoint(ledger, checkpoint) do
     assert {:ok, action, :new} = ActionLedger.plan(ledger, intent(%{checkpoint: checkpoint}))
+    action
+  end
+
+  defp plan_action(ledger, action_intent) do
+    assert {:ok, action, :new} = ActionLedger.plan(ledger, action_intent)
     action
   end
 

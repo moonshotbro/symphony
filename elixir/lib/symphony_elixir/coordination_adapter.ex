@@ -38,16 +38,15 @@ defmodule SymphonyElixir.CoordinationAdapter do
         {:already_satisfied, action}
 
       {:ok, action, disposition} ->
-        with {:ok, action} <- prepare(action, disposition, ledger),
-             :ok <- preflight(action, opts),
-             {:ok, _dispatched} <- ActionLedger.transition(ledger, action.id, :dispatched) do
-          execute_effect(ledger, action, effect_fun, opts)
-        else
-          {:error, {:approval_obsolete, reason}} ->
-            reject_obsolete(ledger, action, reason)
+        case prepare(action, disposition, ledger, opts) do
+          {:already_satisfied, satisfied} ->
+            {:already_satisfied, satisfied}
 
           {:error, reason} ->
             {:error, reason}
+
+          {:ok, action} ->
+            dispatch_prepared(ledger, action, effect_fun, opts)
         end
 
       {:error, reason} ->
@@ -55,19 +54,53 @@ defmodule SymphonyElixir.CoordinationAdapter do
     end
   end
 
-  defp prepare(%Action{state: :planned} = action, _disposition, _ledger), do: {:ok, action}
+  defp prepare(%Action{state: :planned} = action, _disposition, _ledger, _opts), do: {:ok, action}
 
-  defp prepare(%Action{state: :retryable_failure} = action, _disposition, ledger) do
+  defp prepare(%Action{state: :retryable_failure} = action, _disposition, ledger, _opts) do
     ActionLedger.transition(ledger, action.id, :planned)
   end
 
-  defp prepare(%Action{state: state} = action, :existing, _ledger)
-       when state in [:dispatched, :uncertain] do
-    {:error, {:uncertain_action, action.id}}
+  defp prepare(%Action{state: :uncertain} = action, :existing, ledger, opts) do
+    case Keyword.get(opts, :inspect_recovered) do
+      inspector when is_function(inspector, 1) ->
+        inspect_uncertain(ledger, action, inspector)
+
+      _ ->
+        {:error, {:uncertain_action, action.id}}
+    end
   end
 
-  defp prepare(%Action{} = action, :existing, _ledger) do
+  defp prepare(%Action{state: :dispatched} = action, :existing, _ledger, _opts), do: {:error, {:uncertain_action, action.id}}
+
+  defp prepare(%Action{} = action, :existing, _ledger, _opts) do
     {:error, {:action_not_dispatchable, action.id, action.state}}
+  end
+
+  defp dispatch_prepared(ledger, action, effect_fun, opts) do
+    with :ok <- preflight(action, opts),
+         {:ok, _dispatched} <- ActionLedger.transition(ledger, action.id, :dispatched) do
+      execute_effect(ledger, action, effect_fun, opts)
+    else
+      {:error, {:approval_obsolete, reason}} -> reject_obsolete(ledger, action, reason)
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp inspect_uncertain(ledger, action, inspector) do
+    case inspector.(action) do
+      {:ok, evidence} -> settle_uncertain(ledger, action, evidence)
+      {:error, reason} -> {:error, {:inspection_failed, reason}}
+      other -> {:error, {:inspection_result_invalid, other}}
+    end
+  end
+
+  defp settle_uncertain(ledger, action, evidence) do
+    case ActionLedger.inspect_recovered(ledger, action.id, evidence) do
+      {:ok, updated, :already_satisfied} -> {:already_satisfied, updated}
+      {:ok, updated, :retryable_failure} -> ActionLedger.transition(ledger, updated.id, :planned)
+      {:ok, _updated, :quarantined} -> {:error, {:uncertain_action_quarantined, action.id}}
+      {:error, reason} -> {:error, {:inspection_failed, reason}}
+    end
   end
 
   defp preflight(%Action{valid_until: valid_until}, opts) do
@@ -117,7 +150,15 @@ defmodule SymphonyElixir.CoordinationAdapter do
         record_failure(ledger, action, reason, disposition)
 
       other ->
-        {:error, {:coordination_effect_invalid, other}}
+        case ActionLedger.transition(ledger, action.id, :uncertain, %{
+               "disposition" => "invalid_effect_result"
+             }) do
+          {:ok, _uncertain} ->
+            {:error, {:uncertain_effect, action.id, {:coordination_effect_invalid, other}}}
+
+          {:error, reason} ->
+            {:error, {:failure_record_failed, reason, {:coordination_effect_invalid, other}}}
+        end
     end
   end
 

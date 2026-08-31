@@ -43,6 +43,12 @@ defmodule SymphonyElixir.AgentRuntimeSupervisor do
       action_ledger: if(ledger_enabled, do: ledger_name, else: nil)
     ]
 
+    orchestrator_opts =
+      case Keyword.get(opts, :action_inspector) do
+        inspector when is_function(inspector, 1) -> Keyword.put(orchestrator_opts, :action_inspector, inspector)
+        _ -> orchestrator_opts
+      end
+
     children =
       [
         Supervisor.child_spec(

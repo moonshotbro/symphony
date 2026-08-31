@@ -43,6 +43,7 @@ defmodule SymphonyElixir.Orchestrator do
       :tick_timer_ref,
       :tick_token,
       :action_ledger,
+      :action_inspector,
       task_supervisor: SymphonyElixir.TaskSupervisor,
       running: %{},
       completed: MapSet.new(),
@@ -76,7 +77,12 @@ defmodule SymphonyElixir.Orchestrator do
           tick_token: nil,
           task_supervisor: Keyword.get(opts, :task_supervisor, SymphonyElixir.TaskSupervisor),
           action_ledger: Keyword.get(opts, :action_ledger),
-          claimed: recovered_action_claims(Keyword.get(opts, :action_ledger)),
+          action_inspector: Keyword.get(opts, :action_inspector, &default_action_inspector/1),
+          claimed:
+            recovered_action_claims(
+              Keyword.get(opts, :action_ledger),
+              Keyword.get(opts, :action_inspector, &default_action_inspector/1)
+            ),
           codex_totals: @empty_codex_totals,
           codex_rate_limits: nil
         }
@@ -150,9 +156,15 @@ defmodule SymphonyElixir.Orchestrator do
         state = record_session_completion_totals(state, running_entry)
         session_id = running_entry_session_id(running_entry)
 
-        record_running_action_exit(state.action_ledger, running_entry, reason)
+        state =
+          case record_running_action_exit(state.action_ledger, running_entry, reason) do
+            :ok ->
+              handle_agent_down(reason, state, issue_id, running_entry, session_id)
 
-        state = handle_agent_down(reason, state, issue_id, running_entry, session_id)
+            {:error, ledger_reason} ->
+              Logger.error("Unable to persist worker exit action issue_id=#{issue_id} reason=#{inspect(ledger_reason)}; blocking retry")
+              block_issue_from_entry(state, issue_id, running_entry, "action ledger unavailable: #{inspect(ledger_reason)}")
+          end
 
         Logger.info("Agent task finished for issue_id=#{issue_id} session_id=#{session_id} reason=#{inspect(reason)}")
 
@@ -173,13 +185,21 @@ defmodule SymphonyElixir.Orchestrator do
           |> maybe_put_runtime_value(:worker_host, runtime_info[:worker_host])
           |> maybe_put_runtime_value(:workspace_path, runtime_info[:workspace_path])
 
-        observe_running_action(state.action_ledger, updated_running_entry, %{
-          "worker_host" => runtime_info[:worker_host],
-          "workspace_key" => Workspace.workspace_key(updated_running_entry.issue)
-        })
+        case observe_running_action(state.action_ledger, updated_running_entry, %{
+               "worker_host" => runtime_info[:worker_host],
+               "workspace_key" => Workspace.workspace_key(updated_running_entry.issue)
+             }) do
+          :ok ->
+            notify_dashboard()
+            {:noreply, %{state | running: Map.put(running, issue_id, updated_running_entry)}}
 
-        notify_dashboard()
-        {:noreply, %{state | running: Map.put(running, issue_id, updated_running_entry)}}
+          {:error, reason} ->
+            Logger.error("Unable to persist worker runtime action issue_id=#{issue_id} reason=#{inspect(reason)}; stopping worker")
+            stop_running_task(updated_running_entry[:pid], updated_running_entry[:ref], state.task_supervisor)
+            blocked = block_issue_from_entry(state, issue_id, updated_running_entry, "action ledger unavailable: #{inspect(reason)}")
+            notify_dashboard()
+            {:noreply, blocked}
+        end
     end
   end
 
@@ -194,18 +214,23 @@ defmodule SymphonyElixir.Orchestrator do
       running_entry ->
         {updated_running_entry, token_delta} = integrate_codex_update(running_entry, update)
 
-        complete_running_action_if_session_observed(
-          state.action_ledger,
-          updated_running_entry
-        )
+        case complete_running_action_if_session_observed(state.action_ledger, updated_running_entry) do
+          :ok ->
+            state =
+              state
+              |> apply_codex_token_delta(token_delta)
+              |> apply_codex_rate_limits(update)
 
-        state =
-          state
-          |> apply_codex_token_delta(token_delta)
-          |> apply_codex_rate_limits(update)
+            notify_dashboard()
+            {:noreply, %{state | running: Map.put(running, issue_id, updated_running_entry)}}
 
-        notify_dashboard()
-        {:noreply, %{state | running: Map.put(running, issue_id, updated_running_entry)}}
+          {:error, reason} ->
+            Logger.error("Unable to persist Codex session action issue_id=#{issue_id} reason=#{inspect(reason)}; stopping worker")
+            stop_running_task(updated_running_entry[:pid], updated_running_entry[:ref], state.task_supervisor)
+            blocked = block_issue_from_entry(state, issue_id, updated_running_entry, "action ledger unavailable: #{inspect(reason)}")
+            notify_dashboard()
+            {:noreply, blocked}
+        end
     end
   end
 
@@ -394,6 +419,13 @@ defmodule SymphonyElixir.Orchestrator do
   @spec reconcile_blocked_issue_states_for_test([Issue.t()], term()) :: term()
   def reconcile_blocked_issue_states_for_test(issues, %State{} = state) when is_list(issues) do
     reconcile_blocked_issue_states(issues, state, active_state_set(), terminal_state_set())
+  end
+
+  @doc false
+  @spec stop_and_block_issue_for_test(term(), String.t(), map(), String.t()) :: term()
+  def stop_and_block_issue_for_test(%State{} = state, issue_id, running_entry, error)
+      when is_binary(issue_id) and is_map(running_entry) and is_binary(error) do
+    stop_and_block_issue(state, issue_id, running_entry, error)
   end
 
   @doc false
@@ -775,10 +807,17 @@ defmodule SymphonyElixir.Orchestrator do
       state.task_supervisor
     )
 
-    block_issue_from_entry(state, issue_id, running_entry, error)
+    case record_stalled_goal_action(state.action_ledger, running_entry, error) do
+      {:ok, action_id} ->
+        block_issue_from_entry(state, issue_id, running_entry, error, action_id)
+
+      {:error, reason} ->
+        Logger.error("Unable to persist stalled-goal decision action issue_id=#{issue_id} reason=#{inspect(reason)}; keeping issue blocked")
+        block_issue_from_entry(state, issue_id, running_entry, "action ledger unavailable: #{inspect(reason)}", nil)
+    end
   end
 
-  defp block_issue_from_entry(%State{} = state, issue_id, running_entry, error) do
+  defp block_issue_from_entry(%State{} = state, issue_id, running_entry, error, goal_action_id \\ nil) do
     blocked_entry = %{
       issue_id: issue_id,
       identifier: Map.get(running_entry, :identifier, issue_id),
@@ -790,7 +829,8 @@ defmodule SymphonyElixir.Orchestrator do
       blocked_at: DateTime.utc_now(),
       last_codex_message: Map.get(running_entry, :last_codex_message),
       last_codex_event: Map.get(running_entry, :last_codex_event),
-      last_codex_timestamp: Map.get(running_entry, :last_codex_timestamp)
+      last_codex_timestamp: Map.get(running_entry, :last_codex_timestamp),
+      goal_action_id: goal_action_id
     }
 
     %{
@@ -982,7 +1022,8 @@ defmodule SymphonyElixir.Orchestrator do
         state.action_ledger,
         intent,
         fn -> start_issue_worker(state, issue, attempt, recipient, worker_host) end,
-        terminal_on_success: false
+        terminal_on_success: false,
+        inspect_recovered: state.action_inspector
       )
 
     handle_worker_dispatch_result(dispatch_result, state, issue, attempt, worker_host)
@@ -1035,6 +1076,17 @@ defmodule SymphonyElixir.Orchestrator do
        ) do
     Logger.warning("Skipping uncertain dispatch pending reconciliation action_id=#{action_id} #{issue_context(issue)}")
 
+    %{state | claimed: MapSet.put(state.claimed, issue.id)}
+  end
+
+  defp handle_worker_dispatch_result(
+         {:error, {:uncertain_effect, action_id, reason}},
+         state,
+         issue,
+         _attempt,
+         _host
+       ) do
+    Logger.warning("Holding issue after uncertain coordination effect action_id=#{action_id} reason=#{inspect(reason)} #{issue_context(issue)}")
     %{state | claimed: MapSet.put(state.claimed, issue.id)}
   end
 
@@ -1473,6 +1525,18 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  @doc "Resume one blocked goal only when its exact durable condition matches."
+  @spec resume_goal(GenServer.server(), String.t(), String.t()) ::
+          {:ok, map()} | {:error, term()} | :unavailable
+  def resume_goal(server \\ __MODULE__, action_id_or_issue_id, condition)
+      when is_binary(action_id_or_issue_id) and is_binary(condition) do
+    if Process.whereis(server) do
+      GenServer.call(server, {:resume_goal, action_id_or_issue_id, condition})
+    else
+      :unavailable
+    end
+  end
+
   @spec snapshot() :: map() | :timeout | :unavailable
   def snapshot, do: snapshot(__MODULE__, 15_000)
 
@@ -1491,6 +1555,32 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   @impl true
+  def handle_call({:resume_goal, action_id_or_issue_id, condition}, _from, state) do
+    blocked_match =
+      Enum.find(state.blocked, fn {issue_id, metadata} ->
+        issue_id == action_id_or_issue_id or metadata[:goal_action_id] == action_id_or_issue_id
+      end)
+
+    case blocked_match do
+      {issue_id, %{goal_action_id: action_id}} when is_binary(action_id) ->
+        case ActionLedger.resume_goal(state.action_ledger, action_id, condition) do
+          {:ok, action} ->
+            updated =
+              state
+              |> then(&%{&1 | blocked: Map.delete(&1.blocked, issue_id), claimed: MapSet.delete(&1.claimed, issue_id)})
+              |> schedule_tick(0)
+
+            {:reply, {:ok, %{issue_id: issue_id, action_id: action.id, state: action.state}}, updated}
+
+          {:error, reason} ->
+            {:reply, {:error, reason}, state}
+        end
+
+      _ ->
+        {:reply, {:error, :goal_action_not_found}, state}
+    end
+  end
+
   def handle_call(:snapshot, _from, state) do
     state = refresh_runtime_config(state)
     now = DateTime.utc_now()
@@ -1550,7 +1640,8 @@ defmodule SymphonyElixir.Orchestrator do
           blocked_at: Map.get(metadata, :blocked_at),
           last_codex_timestamp: Map.get(metadata, :last_codex_timestamp),
           last_codex_message: Map.get(metadata, :last_codex_message),
-          last_codex_event: Map.get(metadata, :last_codex_event)
+          last_codex_event: Map.get(metadata, :last_codex_event),
+          goal_action_id: Map.get(metadata, :goal_action_id)
         }
       end)
 
@@ -2109,17 +2200,51 @@ defmodule SymphonyElixir.Orchestrator do
     }
   end
 
-  defp recovered_action_claims(nil), do: MapSet.new()
+  defp default_action_inspector(_action),
+    do: {:error, :authoritative_provider_inspection_required}
 
-  defp recovered_action_claims(action_ledger) do
+  defp recovered_action_claims(nil, _inspector), do: MapSet.new()
+
+  defp recovered_action_claims(action_ledger, inspector) do
     reconciliation = ActionLedger.reconcile(action_ledger)
 
     (reconciliation.pending ++ reconciliation.quarantined ++ reconciliation.needs_input)
-    |> Enum.filter(&(&1.state in [:uncertain, :quarantined, :needs_input]))
-    |> Enum.map(& &1.source["issue_id"])
-    |> Enum.filter(&is_binary/1)
-    |> MapSet.new()
+    |> Enum.reduce(MapSet.new(), &recovered_action_claim(action_ledger, inspector, &1, &2))
   end
+
+  defp recovered_action_claim(action_ledger, inspector, %{state: :uncertain} = action, claimed) do
+    case inspect_recovered_action(action_ledger, action, inspector) do
+      {:ok, :already_satisfied} -> claimed
+      {:ok, :retryable_failure} -> claimed
+      _ -> maybe_claim_action(claimed, action)
+    end
+  end
+
+  defp recovered_action_claim(_action_ledger, _inspector, action, claimed),
+    do: maybe_claim_action(claimed, action)
+
+  defp maybe_claim_action(claimed, action) do
+    case action.source["issue_id"] do
+      issue_id when is_binary(issue_id) -> MapSet.put(claimed, issue_id)
+      _ -> claimed
+    end
+  end
+
+  defp inspect_recovered_action(action_ledger, action, inspector) do
+    with {:ok, evidence} <- inspector.(action),
+         {:ok, _updated, disposition} <- ActionLedger.inspect_recovered(action_ledger, action.id, evidence) do
+      settle_recovered_action(action_ledger, action, disposition)
+    end
+  end
+
+  defp settle_recovered_action(action_ledger, action, :retryable_failure) do
+    case ActionLedger.transition(action_ledger, action.id, :planned) do
+      {:ok, _planned} -> {:ok, :retryable_failure}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp settle_recovered_action(_action_ledger, _action, disposition), do: {:ok, disposition}
 
   defp dispatch_action_intent(issue, attempt, worker_host) do
     checkpoint = issue_checkpoint(issue)
@@ -2144,7 +2269,10 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp issue_checkpoint(%Issue{updated_at: %DateTime{} = updated_at}) do
-    DateTime.to_iso8601(updated_at)
+    updated_at
+    |> DateTime.to_iso8601()
+    |> then(&:crypto.hash(:sha256, &1))
+    |> Base.encode16(case: :lower)
   end
 
   defp issue_checkpoint(%Issue{} = issue) do
@@ -2253,9 +2381,12 @@ defmodule SymphonyElixir.Orchestrator do
       {:ok, %{state: :dispatched}} ->
         next_state = action_exit_state(running_entry, reason)
 
-        ActionLedger.transition(action_ledger, action_id, next_state, %{
-          "disposition" => Atom.to_string(next_state)
-        })
+        case ActionLedger.transition(action_ledger, action_id, next_state, %{
+               "disposition" => Atom.to_string(next_state)
+             }) do
+          {:ok, _action} -> :ok
+          {:error, reason} -> {:error, reason}
+        end
 
       {:ok, _action} ->
         :ok
@@ -2267,5 +2398,47 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp action_exit_state(running_entry, _reason) do
     if input_required_blocker?(running_entry), do: :needs_input, else: :retryable_failure
+  end
+
+  defp record_stalled_goal_action(nil, _running_entry, _error), do: {:ok, nil}
+
+  defp record_stalled_goal_action(action_ledger, running_entry, error) do
+    issue = Map.get(running_entry, :issue)
+    issue_id = Map.get(issue, :id) || Map.get(running_entry, :identifier)
+    checkpoint = issue_checkpoint(issue)
+
+    intent = %{
+      kind: :task_messaging,
+      source: %{
+        issue_id: issue_id,
+        task_id: issue_id,
+        goal_id: issue_id,
+        repository: issue_repository(issue),
+        revision: checkpoint
+      },
+      target: %{type: "goal_owner", id: issue_id},
+      purpose: "goal.stalled.resume-condition.#{checkpoint}",
+      checkpoint: checkpoint,
+      expected_postcondition: "goal.decision_recorded",
+      policy_fingerprint: ActionLedger.policy_fingerprint("symphony.goal-stall.v1"),
+      blocker_classification: "goal.stalled",
+      resume_condition: "decision.resume.#{checkpoint}"
+    }
+
+    with {:ok, action, disposition} <- ActionLedger.plan(action_ledger, intent),
+         {:ok, action} <- stalled_action_needs_input(action_ledger, action, disposition, error) do
+      {:ok, action.id}
+    end
+  end
+
+  defp stalled_action_needs_input(_ledger, %{state: :needs_input} = action, _disposition, _error), do: {:ok, action}
+
+  defp stalled_action_needs_input(ledger, action, _disposition, error) do
+    ActionLedger.transition(ledger, action.id, :needs_input, %{
+      "disposition" => "goal_stalled",
+      "workspace_key" => String.slice(action.checkpoint, 0, 256)
+    })
+  rescue
+    _ -> {:error, {:stalled_goal_record_failed, error}}
   end
 end

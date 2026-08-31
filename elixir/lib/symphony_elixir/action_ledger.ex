@@ -18,6 +18,10 @@ defmodule SymphonyElixir.ActionLedger do
   @source_keys ~w(goal_id task_id issue_id issue_identifier repository revision session_id)
   @target_keys ~w(type id host project worker_host)
   @effect_keys ~w(thread_id turn_id automation_id fork_thread_id destination_thread_id worktree_id revision session_id worker_host disposition workspace_key)
+  @inspection_keys ~w(provider authoritative exists session_id workspace_key disposition)
+  @identity_keys ~w(goal_id task_id issue_id issue_identifier repository revision session_id)
+  @target_identity_keys ~w(type id host project worker_host)
+  @effect_identity_keys ~w(thread_id turn_id automation_id fork_thread_id destination_thread_id worktree_id revision session_id worker_host workspace_key)
   @forbidden_key_fragments ~w(prompt secret token password body content credential)
   @blocker_classifications ~w(goal.stalled)
 
@@ -139,6 +143,37 @@ defmodule SymphonyElixir.ActionLedger do
   @spec reconcile(GenServer.server()) :: reconciliation()
   def reconcile(server \\ __MODULE__), do: GenServer.call(server, :reconcile)
 
+  @doc """
+  Inspect an uncertain action against authoritative provider evidence.
+
+  Evidence is validated and read before the resulting transition is persisted,
+  preventing a recovered dispatch from being retried blindly.
+  """
+  @spec inspect_recovered(GenServer.server(), String.t(), map()) ::
+          {:ok, Action.t(), :already_satisfied | :retryable_failure | :quarantined}
+          | {:error, term()}
+  def inspect_recovered(server \\ __MODULE__, action_id, evidence) do
+    GenServer.call(server, {:inspect_recovered, action_id, evidence})
+  end
+
+  @doc "Read-only inspection of a ledger path; never repairs or truncates it."
+  @spec inspect_storage(Path.t()) :: {:ok, map()} | {:error, term()}
+  def inspect_storage(path) do
+    with :ok <- validate_path(path),
+         {:ok, actions, order} <- load(path) do
+      action_list = Enum.map(order, &Map.fetch!(actions, &1))
+
+      {:ok,
+       %{
+         schema: @schema,
+         path: path,
+         action_count: length(action_list),
+         actions: action_list,
+         reconciliation: reconcile_actions(action_list)
+       }}
+    end
+  end
+
   @spec enabled?(GenServer.server()) :: boolean()
   def enabled?(server \\ __MODULE__), do: GenServer.call(server, :enabled?)
 
@@ -222,14 +257,26 @@ defmodule SymphonyElixir.ActionLedger do
   def handle_call(:reconcile, _from, state) do
     actions = Enum.map(state.order, &Map.fetch!(state.actions, &1))
 
-    reply = %{
-      pending: Enum.filter(actions, &(&1.state in ~w(planned dispatched uncertain)a)),
-      retryable: Enum.filter(actions, &(&1.state == :retryable_failure)),
-      quarantined: Enum.filter(actions, &(&1.state == :quarantined)),
-      needs_input: Enum.filter(actions, &(&1.state == :needs_input))
-    }
+    reply = reconcile_actions(actions)
 
     {:reply, reply, state}
+  end
+
+  def handle_call({:inspect_recovered, action_id, evidence}, _from, state) do
+    with %Action{state: :uncertain} = action <- Map.get(state.actions, action_id),
+         {:ok, normalized} <- normalize_inspection(evidence),
+         {:ok, next_state, effect} <- settle_inspected_action(action, normalized),
+         :ok <- validate_transition(action.state, next_state),
+         {:ok, normalized_effect} <- normalize_bounded_map(effect, @effect_keys),
+         updated <- update_action(action, next_state, normalized_effect),
+         :ok <- persist(state.path, updated) do
+      emit_transition(updated, action.state)
+      {:reply, {:ok, updated, next_state}, put_action(state, updated)}
+    else
+      nil -> {:reply, {:error, :action_not_found}, state}
+      %Action{} -> {:reply, {:error, :action_not_uncertain}, state}
+      {:error, reason} -> {:reply, {:error, reason}, state}
+    end
   end
 
   def handle_call({:resume_goal, action_id, condition}, _from, state) do
@@ -282,7 +329,7 @@ defmodule SymphonyElixir.ActionLedger do
          {:ok, source} <- normalize_bounded_map(value(intent, :source), @source_keys),
          {:ok, target} <- normalize_bounded_map(value(intent, :target), @target_keys),
          {:ok, purpose} <- bounded_string(value(intent, :purpose), :purpose, 512),
-         {:ok, checkpoint} <- bounded_string(value(intent, :checkpoint), :checkpoint, 256),
+         {:ok, checkpoint} <- checkpoint(value(intent, :checkpoint)),
          {:ok, postcondition} <- postcondition(value(intent, :expected_postcondition)),
          {:ok, policy_fingerprint} <- fingerprint(value(intent, :policy_fingerprint)),
          {:ok, blocker_classification, resume_condition} <- stalled_goal_fields(intent),
@@ -369,9 +416,27 @@ defmodule SymphonyElixir.ActionLedger do
       not is_binary(raw_value) -> {:error, {:field_value_invalid, key}}
       String.trim(raw_value) == "" -> {:error, {:field_value_invalid, key}}
       byte_size(raw_value) > 256 -> {:error, {:field_value_invalid, key}}
-      true -> {:ok, key, raw_value}
+      true -> validate_field_value(key, raw_value)
     end
   end
+
+  # Identifiers and dispositions are deliberately narrower than arbitrary
+  # bounded strings: reject values that could carry credentials or payloads.
+  defp validate_field_value(key, value)
+       when key in @identity_keys or key in @target_identity_keys or key in @effect_identity_keys or
+              key in ["provider", "disposition"] do
+    valid? =
+      case key do
+        "disposition" -> Regex.match?(~r/^[a-z0-9_.:-]{1,128}$/, value)
+        "provider" -> Regex.match?(~r/^[a-z0-9_.:-]{1,64}$/, value)
+        "repository" -> Regex.match?(~r/^[A-Za-z0-9._:\/@-]{1,256}$/, value)
+        _ -> Regex.match?(~r/^[A-Za-z0-9._:@\/#-]{1,256}$/, value)
+      end
+
+    if valid?, do: {:ok, key, value}, else: {:error, {:field_value_invalid, key}}
+  end
+
+  defp validate_field_value(key, value), do: {:ok, key, value}
 
   defp bounded_string(value, field, max_bytes) when is_binary(value) do
     if String.trim(value) == "" or byte_size(value) > max_bytes do
@@ -382,6 +447,15 @@ defmodule SymphonyElixir.ActionLedger do
   end
 
   defp bounded_string(_value, field, _max_bytes), do: {:error, {field, :invalid}}
+
+  defp checkpoint(value) do
+    with {:ok, string} <- bounded_string(value, :checkpoint, 256),
+         true <- Regex.match?(~r/^[A-Za-z0-9._:@\/#-]{1,256}$/, string) do
+      {:ok, string}
+    else
+      _ -> {:error, {:checkpoint, :invalid}}
+    end
+  end
 
   defp postcondition(value) do
     with {:ok, string} <- bounded_string(value, :expected_postcondition, 128),
@@ -489,6 +563,73 @@ defmodule SymphonyElixir.ActionLedger do
   defp put_action(state, action) do
     order = if action.id in state.order, do: state.order, else: state.order ++ [action.id]
     %{state | actions: Map.put(state.actions, action.id, action), order: order}
+  end
+
+  defp reconcile_actions(actions) do
+    %{
+      pending: Enum.filter(actions, &(&1.state in ~w(planned dispatched uncertain)a)),
+      retryable: Enum.filter(actions, &(&1.state == :retryable_failure)),
+      quarantined: Enum.filter(actions, &(&1.state == :quarantined)),
+      needs_input: Enum.filter(actions, &(&1.state == :needs_input))
+    }
+  end
+
+  defp normalize_inspection(evidence) when is_map(evidence) do
+    normalized_input =
+      Map.new(evidence, fn {key, value} ->
+        value =
+          if key in [:authoritative, "authoritative", :exists, "exists"] and is_boolean(value),
+            do: Atom.to_string(value),
+            else: value
+
+        {key, value}
+      end)
+
+    with {:ok, normalized} <- normalize_bounded_map(normalized_input, @inspection_keys),
+         true <- normalized["authoritative"] in ["true", "false"],
+         true <- normalized["exists"] in ["true", "false"] do
+      {:ok, normalized}
+    else
+      false -> {:error, :inspection_not_authoritative}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp normalize_inspection(_evidence), do: {:error, :inspection_invalid}
+
+  defp settle_inspected_action(action, evidence) do
+    with true <- evidence["authoritative"] == "true",
+         provider when is_binary(provider) <- evidence["provider"] do
+      if evidence["exists"] == "true" do
+        settle_existing_effect(action, provider, evidence)
+      else
+        {:ok, :retryable_failure, %{"disposition" => "postcondition_absent"}}
+      end
+    else
+      false -> {:ok, :quarantined, %{"disposition" => "inspection_not_authoritative"}}
+      nil -> {:error, {:field_value_invalid, "provider"}}
+    end
+  end
+
+  defp settle_existing_effect(%Action{expected_postcondition: "codex.session_observed"}, "codex", evidence) do
+    with session_id when is_binary(session_id) <- evidence["session_id"],
+         workspace_key when is_binary(workspace_key) <- evidence["workspace_key"] do
+      {:ok, :already_satisfied,
+       %{
+         "session_id" => session_id,
+         "workspace_key" => workspace_key,
+         "disposition" => "provider_postcondition_confirmed"
+       }}
+    else
+      _ -> {:ok, :quarantined, %{"disposition" => "postcondition_evidence_incomplete"}}
+    end
+  end
+
+  defp settle_existing_effect(%Action{expected_postcondition: "codex.session_observed"}, _provider, _evidence),
+    do: {:ok, :quarantined, %{"disposition" => "provider_mismatch"}}
+
+  defp settle_existing_effect(_action, _provider, evidence) do
+    {:ok, :already_satisfied, %{"disposition" => evidence["disposition"] || "provider_postcondition_confirmed"}}
   end
 
   defp persist(path, action) do

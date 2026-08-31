@@ -64,6 +64,14 @@ Its issue remains claimed, so the ordinary scheduler cannot blindly dispatch a d
 reconciler returns ordered `pending`, `retryable`, `quarantined`, and `needs_input` lists for the
 existing orchestrator to inspect.
 
+An uncertain action is not retryable by implication. The caller must first call
+`ActionLedger.inspect_recovered/3` with an authoritative provider result. For a
+`codex.session_observed` postcondition, the result must confirm provider authority, existence,
+session identity, and workspace identity. Confirmed effects become `already_satisfied`; an
+authoritative absence becomes `retryable_failure`; incomplete or non-authoritative evidence becomes
+`quarantined`. The adapter accepts an `inspect_recovered` callback and performs this inspection
+before it can move an uncertain action back to `planned`.
+
 ## Obsolete approvals and stalled goals
 
 The coordination adapter checks `valid_until` and an optional live precondition immediately before
@@ -74,7 +82,9 @@ presentation or execution.
 A durable decision request uses `blocker_classification: goal.stalled` and a precise
 `resume_condition`. Identical requests deduplicate. `resume_goal/3` moves only that action from
 `needs_input` to `planned`, and only when the supplied condition matches exactly. Other action lanes
-remain schedulable.
+remain schedulable. The native orchestrator records this action when it moves a worker into its
+blocked/input-required state, using the issue revision as the checkpoint and a deterministic named
+resume condition. If that write fails, the issue remains blocked and no retry is scheduled.
 
 ## Native integration map
 
@@ -108,8 +118,15 @@ their live effect adapters are deliberately outside this first phase.
 6. Repair corrupt storage from a known-good backup or operator-audited prefix; do not truncate and
    continue silently.
 
+For a stopped or unavailable process, `ActionLedger.inspect_storage(path)` is a read-only recovery
+API. It reports parsed actions and reconciliation state, or returns the corruption/read failure
+without modifying the file. It must be used before any operator repair; no recovery command may
+silently truncate or continue from a partial ledger.
+
 ## Privacy boundary
 
 The ledger rejects unknown fields, non-string values, oversized values, and keys containing prompt,
-secret, token, password, body, content, or credential. It stores hashes instead of purpose text and
-never stores issue descriptions, prompts, document content, customer payloads, or credentials.
+secret, token, password, body, content, or credential. Issue identifiers, repositories, and
+dispositions also pass strict payload-safe allowlists; invalid values are rejected before append
+and are never redacted into an apparently valid identity. It stores hashes instead of purpose text
+and never stores issue descriptions, prompts, document content, customer payloads, or credentials.
