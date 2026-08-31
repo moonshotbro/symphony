@@ -172,6 +172,8 @@ defmodule SymphonyElixir.ActionLedgerIntegrationTest do
     ledger_path = Path.join(root, "actions.jsonl")
     ledger_name = Module.concat(__MODULE__, "StalledLedger#{suffix}")
     orchestrator_name = Module.concat(__MODULE__, "StalledOrchestrator#{suffix}")
+    recovered_ledger_name = Module.concat(__MODULE__, "RecoveredStalledLedger#{suffix}")
+    recovered_orchestrator_name = Module.concat(__MODULE__, "RecoveredStalledOrchestrator#{suffix}")
     issue_id = "issue-stalled-#{suffix}"
 
     write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
@@ -203,19 +205,43 @@ defmodule SymphonyElixir.ActionLedgerIntegrationTest do
     assert action.resume_condition =~ "decision.resume."
     assert action.resume_condition =~ ~r/^decision\.resume\.[0-9a-f]{64}$/
 
-    :sys.replace_state(orchestrator_name, fn current ->
-      %{current | blocked: blocked.blocked, claimed: blocked.claimed}
-    end)
+    assert :ok = stop_supervised(Orchestrator)
+    assert :ok = stop_supervised(ActionLedger)
+
+    {:ok, _recovered_ledger} =
+      start_supervised({ActionLedger, name: recovered_ledger_name, path: ledger_path, enabled: true})
+
+    {:ok, _recovered_orchestrator} =
+      start_supervised({Orchestrator, name: recovered_orchestrator_name, action_ledger: recovered_ledger_name})
+
+    recovered_state = :sys.get_state(recovered_orchestrator_name)
+    assert MapSet.member?(recovered_state.claimed, issue_id)
+    refute Map.has_key?(recovered_state.blocked, issue_id)
 
     assert {:error, :resume_condition_mismatch} =
-             Orchestrator.resume_goal(orchestrator_name, action_id, "decision.resume.wrong")
+             Orchestrator.resume_goal(recovered_orchestrator_name, action_id, "decision.resume.wrong")
 
     assert {:ok, %{action_id: ^action_id}} =
-             Orchestrator.resume_goal(orchestrator_name, action_id, action.resume_condition)
+             Orchestrator.resume_goal(recovered_orchestrator_name, action_id, action.resume_condition)
 
-    resumed_state = :sys.get_state(orchestrator_name)
+    resumed_state = :sys.get_state(recovered_orchestrator_name)
     refute Map.has_key?(resumed_state.blocked, issue_id)
     refute MapSet.member?(resumed_state.claimed, issue_id)
+    assert is_reference(resumed_state.tick_token)
+    assert is_integer(resumed_state.next_poll_due_at_ms)
+    assert {:ok, resumed_action} = ActionLedger.get(recovered_ledger_name, action_id)
+    assert resumed_action.state == :already_satisfied
+
+    assert :ok = stop_supervised(Orchestrator)
+    assert :ok = stop_supervised(ActionLedger)
+
+    {:ok, _final_ledger} =
+      start_supervised({ActionLedger, name: ledger_name, path: ledger_path, enabled: true})
+
+    {:ok, _final_orchestrator} =
+      start_supervised({Orchestrator, name: orchestrator_name, action_ledger: ledger_name})
+
+    refute :sys.get_state(orchestrator_name).claimed |> MapSet.member?(issue_id)
 
     on_exit(fn -> File.rm_rf(root) end)
   end

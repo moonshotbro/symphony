@@ -1556,13 +1556,8 @@ defmodule SymphonyElixir.Orchestrator do
 
   @impl true
   def handle_call({:resume_goal, action_id_or_issue_id, condition}, _from, state) do
-    blocked_match =
-      Enum.find(state.blocked, fn {issue_id, metadata} ->
-        issue_id == action_id_or_issue_id or metadata[:goal_action_id] == action_id_or_issue_id
-      end)
-
-    case blocked_match do
-      {issue_id, %{goal_action_id: action_id}} when is_binary(action_id) ->
+    case find_goal_action(state, action_id_or_issue_id) do
+      {issue_id, action_id} when is_binary(issue_id) and is_binary(action_id) ->
         case ActionLedger.resume_goal(state.action_ledger, action_id, condition) do
           {:ok, action} ->
             updated =
@@ -1674,6 +1669,34 @@ defmodule SymphonyElixir.Orchestrator do
        requested_at: DateTime.utc_now(),
        operations: ["poll", "reconcile"]
      }, state}
+  end
+
+  defp find_goal_action(state, action_id_or_issue_id) do
+    case Enum.find(state.blocked, fn {issue_id, metadata} ->
+           issue_id == action_id_or_issue_id or metadata[:goal_action_id] == action_id_or_issue_id
+         end) do
+      {issue_id, %{goal_action_id: action_id}} when is_binary(action_id) ->
+        {issue_id, action_id}
+
+      nil ->
+        find_recovered_goal_action(state.action_ledger, action_id_or_issue_id)
+    end
+  end
+
+  defp find_recovered_goal_action(nil, _action_id_or_issue_id), do: nil
+
+  defp find_recovered_goal_action(action_ledger, action_id_or_issue_id) do
+    action_ledger
+    |> ActionLedger.reconcile()
+    |> Map.fetch!(:needs_input)
+    |> Enum.find(fn action ->
+      action.blocker_classification == "goal.stalled" and
+        (action.id == action_id_or_issue_id or action.source["issue_id"] == action_id_or_issue_id)
+    end)
+    |> case do
+      nil -> nil
+      action -> {action.source["issue_id"], action.id}
+    end
   end
 
   defp blocked_issue_state(%{issue: %Issue{state: state}}), do: state

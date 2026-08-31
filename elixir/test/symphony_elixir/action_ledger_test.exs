@@ -292,12 +292,12 @@ defmodule SymphonyElixir.ActionLedgerTest do
                "decision.customer_contract_selected"
              )
 
-    assert resumed.state == :planned
+    assert resumed.state == :already_satisfied
 
     other = plan_with_checkpoint(ledger, "unrelated-lane")
     assert other.state == :planned
     assert %{pending: pending} = ActionLedger.reconcile(ledger)
-    assert Enum.map(pending, & &1.id) == [action.id, other.id]
+    assert Enum.map(pending, & &1.id) == [other.id]
   end
 
   test "expired or failed approval preconditions cancel before presentation or execution", %{path: path} do
@@ -404,7 +404,7 @@ defmodule SymphonyElixir.ActionLedgerTest do
 
     assert {:ok, _waiting} = ActionLedger.transition(stalled.id, :needs_input)
     assert {:ok, resumed} = ActionLedger.resume_goal(stalled.id, "decision.ready")
-    assert resumed.state == :planned
+    assert resumed.state == :already_satisfied
 
     disabled_path = Path.rootname(path) <> "-disabled.jsonl"
     disabled = start_ledger(disabled_path, enabled: false)

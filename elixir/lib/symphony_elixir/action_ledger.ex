@@ -31,7 +31,7 @@ defmodule SymphonyElixir.ActionLedger do
     uncertain: ~w(succeeded already_satisfied retryable_failure compensated quarantined needs_input terminal_failure)a,
     retryable_failure: ~w(planned quarantined needs_input terminal_failure)a,
     quarantined: ~w(planned needs_input terminal_failure)a,
-    needs_input: ~w(planned quarantined terminal_failure)a
+    needs_input: ~w(planned already_satisfied quarantined terminal_failure)a
   }
 
   defmodule Action do
@@ -283,7 +283,7 @@ defmodule SymphonyElixir.ActionLedger do
     with %Action{state: :needs_input, blocker_classification: "goal.stalled"} = action <-
            Map.get(state.actions, action_id),
          true <- action.resume_condition == condition,
-         updated <- update_action(action, :planned, %{"disposition" => "goal_resumed"}),
+         updated <- update_action(action, :already_satisfied, %{"disposition" => "goal_resumed"}),
          :ok <- persist(state.path, updated) do
       emit_transition(updated, action.state)
       {:reply, {:ok, updated}, put_action(state, updated)}
