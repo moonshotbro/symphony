@@ -7,7 +7,10 @@ defmodule SymphonyElixir.GitHub.AgentTool do
 
   @github_api_tool "github_api"
   @github_merge_tool "github_merge"
-  @allowed_methods ["GET", "POST", "PATCH", "PUT", "DELETE"]
+  # Generic REST access is deliberately read-only.  All mutations, including
+  # merges, must use a typed adapter with ledger, scope, and expected-head
+  # guards; otherwise this tool would provide a policy bypass.
+  @allowed_methods ["GET"]
   @github_api_description """
   Execute a GitHub REST API request using Symphony's configured auth.
   """
@@ -19,7 +22,7 @@ defmodule SymphonyElixir.GitHub.AgentTool do
       "method" => %{
         "type" => "string",
         "enum" => @allowed_methods,
-        "description" => "GitHub REST method."
+        "description" => "Read-only GitHub REST method. Mutations use typed governed tools."
       },
       "path" => %{
         "type" => "string",
@@ -234,7 +237,7 @@ defmodule SymphonyElixir.GitHub.AgentTool do
   end
 
   defp tool_error_payload(:invalid_method) do
-    %{"error" => %{"message" => "`github_api.method` must be GET, POST, PATCH, PUT, or DELETE."}}
+    %{"error" => %{"message" => "`github_api.method` must be GET. Mutations use typed governed tools."}}
   end
 
   defp tool_error_payload(:invalid_path) do

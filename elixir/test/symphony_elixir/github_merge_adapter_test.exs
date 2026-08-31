@@ -56,12 +56,42 @@ defmodule SymphonyElixir.GitHub.MergeAdapterTest do
              )
   end
 
+  test "accepts supported ledger server references and falls back safely for invalid references" do
+    ledger_path = Path.join(System.tmp_dir!(), "merge-global-ledger-#{System.unique_integer()}.jsonl")
+    {:ok, global_ledger} = ActionLedger.start_link(name: ActionLedger, path: ledger_path)
+
+    on_exit(fn ->
+      if Process.alive?(global_ledger), do: GenServer.stop(global_ledger)
+      File.rm(ledger_path)
+    end)
+
+    for ledger_reference <- [ActionLedger, {ActionLedger, node()}, 42] do
+      result =
+        MergeAdapter.merge(intent(),
+          ledger: ledger_reference,
+          tracker_settings: settings(),
+          request_fun: fn _method, _path, _params, _body, _opts -> {:ok, %{status: 404}} end
+        )
+
+      assert match?({:error, _}, result)
+    end
+  end
+
   test "requires privacy-bounded evidence for the exact reviewed head" do
     assert {:error, :invalid_review_evidence} =
              MergeAdapter.validate_intent(%{intent() | review_evidence: nil})
 
     stale = %ReviewEvidence{evidence() | head: String.duplicate("c", 40)}
     assert {:error, :invalid_review_evidence} = MergeAdapter.validate_intent(%{intent() | review_evidence: stale})
+  end
+
+  test "binds review evidence to the exact repository and pull request" do
+    assert :ok = MergeAdapter.validate_intent(intent())
+
+    for source <- ["github:evil/repo#7", "github:octo/repo#8", "github:octo/repo", "github:octo/repo#0"] do
+      evidence = %{evidence() | source: source}
+      assert {:error, :invalid_review_evidence} = MergeAdapter.validate_intent(%{intent() | review_evidence: evidence})
+    end
   end
 
   test "rejects invalid review timestamp and check evidence" do
@@ -335,6 +365,33 @@ defmodule SymphonyElixir.GitHub.MergeAdapterTest do
     assert {:ok, %{actions: [action]}} = ActionLedger.inspect_storage(path)
     assert action.state == :already_satisfied
     assert action.observed_effect["disposition"] == "provider_postcondition_confirmed"
+  end
+
+  test "does not settle a lost merge when GitHub reports a different merged revision" do
+    {ledger, path} = start_ledger()
+    on_exit(fn -> stop_ledger(ledger, path) end)
+    reads = Agent.start_link(fn -> 0 end) |> elem(1)
+    different_head = String.duplicate("c", 40)
+
+    request = fn method, _path, _params, _body, _opts ->
+      case method do
+        "GET" ->
+          case Agent.get_and_update(reads, fn count -> {count, count + 1} end) do
+            0 -> {:ok, %{status: 200, body: %{"head" => %{"sha" => @head}, "base" => %{"sha" => @base}, "merged" => false}}}
+            _ -> {:ok, %{status: 200, body: %{"head" => %{"sha" => different_head}, "base" => %{"sha" => @base}, "merged" => true}}}
+          end
+
+        "PUT" ->
+          {:error, {:github_api_request, :timeout}}
+      end
+    end
+
+    assert {:error, {:github_api_request, :timeout}} =
+             MergeAdapter.merge(intent(), ledger: ledger, tracker_settings: settings(), request_fun: request)
+
+    assert {:ok, %{actions: [action]}} = ActionLedger.inspect_storage(path)
+    assert action.state == :quarantined
+    assert action.observed_effect["disposition"] == "inspection_not_authoritative"
   end
 
   defp intent, do: %Intent{repository: "octo/repo", pull_number: 7, reviewed_head: @head, reviewed_base: @base, required_checks: [], purpose: "Reviewed merge", review_evidence: evidence()}
