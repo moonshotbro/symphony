@@ -64,7 +64,7 @@ defmodule SymphonyElixir.GitHub.AdapterTest do
     assert {:ok, ["42"]} = GitHubAdapter.fetch_issues_by_ids(["42"])
     assert_receive {:github_ids_called, ["42"]}
 
-    assert [%{"name" => "github_api"}] = GitHubAdapter.agent_tool_specs()
+    assert Enum.map(GitHubAdapter.agent_tool_specs(), & &1["name"]) == ["github_api", "github_merge"]
 
     assert GitHubAdapter.execute_agent_tool(
              "github_api",
@@ -304,7 +304,7 @@ defmodule SymphonyElixir.GitHub.AdapterTest do
   test "github_api reports unsupported tools, malformed calls, and client failures" do
     unsupported = GitHubAgentTool.execute("not_github_api", %{}, [])
     assert unsupported["success"] == false
-    assert Jason.decode!(unsupported["output"])["error"]["supportedTools"] == ["github_api"]
+    assert Jason.decode!(unsupported["output"])["error"]["supportedTools"] == ["github_api", "github_merge"]
 
     Enum.each(
       [
@@ -392,7 +392,7 @@ defmodule SymphonyElixir.GitHub.AdapterTest do
              token_env
            ]
 
-    assert [%{"name" => "github_api"}] = binding.tool_specs
+    assert Enum.map(binding.tool_specs, & &1["name"]) == ["github_api", "github_merge"]
     assert :ok = Config.validate!()
   end
 

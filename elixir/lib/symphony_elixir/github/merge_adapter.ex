@@ -12,9 +12,32 @@ defmodule SymphonyElixir.GitHub.MergeAdapter do
   alias SymphonyElixir.ActionLedger
   alias SymphonyElixir.GitHub.Client
 
+  defmodule ReviewEvidence do
+    @moduledoc "Privacy-bounded evidence for the exact reviewed pull-request head."
+    @enforce_keys [:source, :reviewer, :reviewed_at, :head, :base, :checks]
+    defstruct [:source, :reviewer, :reviewed_at, :head, :base, :checks]
+
+    @type t :: %__MODULE__{
+            source: String.t(),
+            reviewer: String.t(),
+            reviewed_at: String.t(),
+            head: String.t(),
+            base: String.t(),
+            checks: [String.t()]
+          }
+  end
+
   defmodule Intent do
     @moduledoc "Reviewed merge request; all revision fields are immutable."
-    @enforce_keys [:repository, :pull_number, :reviewed_head, :reviewed_base, :required_checks, :purpose]
+    @enforce_keys [
+      :repository,
+      :pull_number,
+      :reviewed_head,
+      :reviewed_base,
+      :required_checks,
+      :purpose,
+      :review_evidence
+    ]
     defstruct [
       :repository,
       :pull_number,
@@ -22,6 +45,7 @@ defmodule SymphonyElixir.GitHub.MergeAdapter do
       :reviewed_base,
       :required_checks,
       :purpose,
+      :review_evidence,
       merge_method: "squash",
       intent_key: nil
     ]
@@ -33,6 +57,7 @@ defmodule SymphonyElixir.GitHub.MergeAdapter do
             reviewed_base: String.t(),
             required_checks: [String.t()],
             purpose: String.t(),
+            review_evidence: ReviewEvidence.t(),
             merge_method: String.t(),
             intent_key: String.t() | nil
           }
@@ -47,6 +72,7 @@ defmodule SymphonyElixir.GitHub.MergeAdapter do
   @spec merge(Intent.t(), keyword()) :: result()
   def merge(%Intent{} = intent, opts \\ []) do
     with :ok <- validate_intent(intent),
+         :ok <- validate_configured_repository(intent, opts),
          {:ok, action, plan_state} <- plan_action(intent, opts),
          {:ok, result} <- execute_if_needed(action, plan_state, intent, opts) do
       result
@@ -55,45 +81,65 @@ defmodule SymphonyElixir.GitHub.MergeAdapter do
 
   @spec validate_intent(Intent.t()) :: :ok | {:error, term()}
   def validate_intent(%Intent{} = intent) do
-    cond do
-      not valid_repo?(intent.repository) ->
-        {:error, :invalid_repository}
-
-      not is_integer(intent.pull_number) or intent.pull_number < 1 ->
-        {:error, :invalid_pull_number}
-
-      not valid_sha?(intent.reviewed_head) ->
-        {:error, :invalid_reviewed_head}
-
-      not valid_sha?(intent.reviewed_base) ->
-        {:error, :invalid_reviewed_base}
-
-      not is_list(intent.required_checks) or not Enum.all?(intent.required_checks, &valid_text?/1) ->
-        {:error, :invalid_required_checks}
-
-      not valid_text?(intent.purpose) ->
-        {:error, :invalid_purpose}
-
-      intent.merge_method not in @merge_methods ->
-        {:error, :invalid_merge_method}
-
-      intent.intent_key != nil and not valid_text?(intent.intent_key) ->
-        {:error, :invalid_intent_key}
-
-      true ->
-        :ok
+    with :ok <- validate_repository(intent.repository),
+         :ok <- validate_pull_number(intent.pull_number),
+         :ok <- validate_sha(intent.reviewed_head, :invalid_reviewed_head),
+         :ok <- validate_sha(intent.reviewed_base, :invalid_reviewed_base),
+         :ok <- validate_required_checks(intent.required_checks),
+         :ok <- validate_purpose(intent.purpose),
+         :ok <- validate_evidence(intent.review_evidence, intent),
+         :ok <- validate_merge_method(intent.merge_method) do
+      validate_intent_key(intent.intent_key)
     end
   end
 
+  defp validate_repository(value), do: if(valid_repo?(value), do: :ok, else: {:error, :invalid_repository})
+  defp validate_pull_number(value), do: if(is_integer(value) and value > 0, do: :ok, else: {:error, :invalid_pull_number})
+  defp validate_sha(value, error), do: if(valid_sha?(value), do: :ok, else: {:error, error})
+  defp validate_required_checks(value), do: if(is_list(value) and Enum.all?(value, &valid_text?/1), do: :ok, else: {:error, :invalid_required_checks})
+  defp validate_purpose(value), do: if(valid_text?(value), do: :ok, else: {:error, :invalid_purpose})
+  defp validate_evidence(value, intent), do: if(valid_review_evidence?(value, intent), do: :ok, else: {:error, :invalid_review_evidence})
+  defp validate_merge_method(value), do: if(value in @merge_methods, do: :ok, else: {:error, :invalid_merge_method})
+  defp validate_intent_key(nil), do: :ok
+  defp validate_intent_key(value), do: if(valid_text?(value), do: :ok, else: {:error, :invalid_intent_key})
+
+  @spec review_fingerprint(ReviewEvidence.t()) :: String.t()
+  def review_fingerprint(%ReviewEvidence{} = evidence) do
+    ActionLedger.policy_fingerprint({
+      evidence.source,
+      evidence.reviewer,
+      evidence.reviewed_at,
+      evidence.head,
+      evidence.base,
+      evidence.checks
+    })
+  end
+
+  defp validate_configured_repository(intent, opts) do
+    tracker_settings = Keyword.get(opts, :tracker_settings)
+
+    case Client.configured_repository(tracker_settings) do
+      {:ok, repository} when repository == intent.repository -> :ok
+      {:ok, _repository} -> {:error, :repository_scope_mismatch}
+      {:error, reason} -> {:error, {:repository_scope_unavailable, reason}}
+    end
+  end
+
+  @spec plan_action(Intent.t(), keyword()) ::
+          {:ok, ActionLedger.Action.t(), :new | :existing} | {:error, term()}
   defp plan_action(intent, opts) do
-    ledger = Keyword.get(opts, :ledger, ActionLedger)
+    ledger = ledger_server(opts)
     key = intent.intent_key || intent_key(intent)
 
     ledger_intent = %{
       kind: :merge,
       source: %{
         "repository" => intent.repository,
-        "revision" => intent.reviewed_head
+        "revision" => intent.reviewed_head,
+        "review_source" => intent.review_evidence.source,
+        "reviewer" => intent.review_evidence.reviewer,
+        "review_fingerprint" => review_fingerprint(intent.review_evidence),
+        "review_checks" => Jason.encode!(intent.review_evidence.checks)
       },
       target: %{
         "type" => "github_pull_request",
@@ -112,9 +158,19 @@ defmodule SymphonyElixir.GitHub.MergeAdapter do
       idempotency_key: key
     }
 
-    case ActionLedger.plan(ledger, ledger_intent) do
+    case apply(ActionLedger, :plan, [ledger, ledger_intent]) do
       {:ok, action, state} -> {:ok, action, state}
       {:error, reason} -> {:error, {:merge_ledger_plan_failed, reason}}
+    end
+  end
+
+  @spec ledger_server(keyword()) :: GenServer.server()
+  defp ledger_server(opts) do
+    case Keyword.get(opts, :ledger, ActionLedger) do
+      ledger when is_pid(ledger) -> ledger
+      ledger when is_atom(ledger) -> ledger
+      {name, node} when is_atom(name) and is_atom(node) -> {name, node}
+      _invalid -> ActionLedger
     end
   end
 
@@ -151,16 +207,44 @@ defmodule SymphonyElixir.GitHub.MergeAdapter do
   defp submit_reviewed_merge(action, intent, request_fun, request_opts, telemetry, router, opts) do
     with {:ok, checks} <- read_checks(request_fun, request_opts, intent),
          :ok <- verify_checks(checks, intent.required_checks),
-         {:ok, _} <- transition(action, :dispatched, %{"disposition" => "expected_head_merge_submitted"}, opts),
-         {:ok, response} <- submit_merge(request_fun, request_opts, intent),
-         {:ok, outcome} <- verify_merge_response(response, intent) do
-      transition!(action, :succeeded, %{"revision" => intent.reviewed_head, "disposition" => outcome}, opts)
-      emit(telemetry, :merged, intent)
-      {:ok, {:ok, :merged, %{pull_number: intent.pull_number, disposition: outcome}}}
+         {:ok, _} <- transition(action, :dispatched, %{"disposition" => "expected_head_merge_submitted"}, opts) do
+      submit_merge(request_fun, request_opts, intent)
+      |> handle_submit_result(action, intent, telemetry, router, request_fun, request_opts, opts)
     else
-      {:error, {:checks_failed, _} = reason} = error -> fail(action, :needs_input, reason, opts, error)
-      {:error, {:github_api_status, 409}} = error -> stale(action, intent, router, error, opts)
-      {:error, reason} = error -> fail(action, :terminal_failure, reason, opts, error)
+      {:error, {:checks_failed, _} = reason} = error ->
+        fail(action, :needs_input, reason, opts, error)
+
+      {:error, {:github_api_status, 409}} = error ->
+        stale(action, intent, router, error, opts)
+
+      {:error, reason} = error ->
+        fail(action, :terminal_failure, reason, opts, error)
+    end
+  end
+
+  defp handle_submit_result({:ok, response}, action, intent, telemetry, _router, _request_fun, _request_opts, opts),
+    do: complete_merge_response(action, intent, response, telemetry, opts)
+
+  defp handle_submit_result({:error, {:github_api_status, 409} = reason}, action, intent, _telemetry, router, _request_fun, _request_opts, opts),
+    do: stale(action, intent, router, {:error, reason}, opts)
+
+  defp handle_submit_result({:error, reason}, action, intent, _telemetry, _router, request_fun, request_opts, opts) do
+    if uncertain_provider_error?(reason) do
+      reconcile_uncertain(action, intent, request_fun, request_opts, reason, opts)
+    else
+      fail(action, :terminal_failure, reason, opts, {:error, reason})
+    end
+  end
+
+  defp complete_merge_response(action, intent, response, telemetry, opts) do
+    case verify_merge_response(response, intent) do
+      {:ok, outcome} ->
+        transition!(action, :succeeded, %{"revision" => intent.reviewed_head, "disposition" => outcome}, opts)
+        emit(telemetry, :merged, intent)
+        {:ok, {:ok, :merged, %{pull_number: intent.pull_number, disposition: outcome}}}
+
+      {:error, reason} ->
+        fail(action, :terminal_failure, reason, opts, {:error, reason})
     end
   end
 
@@ -214,6 +298,54 @@ defmodule SymphonyElixir.GitHub.MergeAdapter do
   defp verify_merge_response(%{"message" => message}, _intent) when is_binary(message), do: {:error, {:merge_rejected, message}}
   defp verify_merge_response(_, _intent), do: {:error, :merge_postcondition_unverified}
 
+  defp uncertain_provider_error?({:github_api_request, _}), do: true
+  defp uncertain_provider_error?({:github_api_status, status}) when status >= 500, do: true
+  defp uncertain_provider_error?(_), do: false
+
+  defp reconcile_uncertain(action, intent, request_fun, request_opts, reason, opts) do
+    _ = transition(action, :uncertain, %{"disposition" => "postcondition_reconciliation_required"}, opts)
+    recovery_fun = Keyword.get(opts, :recovery_fun, fn -> recover_merge(request_fun, request_opts, intent) end)
+
+    case recovery_fun.() do
+      {:ok, evidence} ->
+        inspected = ActionLedger.inspect_recovered(Keyword.get(opts, :ledger, ActionLedger), action.id, evidence)
+
+        case inspected do
+          {:ok, _updated, :already_satisfied} ->
+            {:ok, {:ok, :already_satisfied, %{pull_number: intent.pull_number, disposition: "recovered_after_uncertain_merge"}}}
+
+          {:ok, _updated, :retryable_failure} ->
+            {:ok, {:error, reason}}
+
+          {:ok, _updated, :quarantined} ->
+            {:ok, {:error, reason}}
+
+          {:error, _reason} ->
+            {:ok, {:error, reason}}
+        end
+
+      {:error, _reason} ->
+        {:ok, {:error, reason}}
+    end
+  end
+
+  defp recover_merge(fun, opts, intent) do
+    case read_pull(fun, opts, intent) do
+      {:ok, current} ->
+        {:ok,
+         %{
+           provider: "github",
+           authoritative: true,
+           exists: current["merged"] == true,
+           revision: intent.reviewed_head,
+           disposition: if(current["merged"] == true, do: "provider_postcondition_confirmed", else: "postcondition_absent")
+         }}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
   defp stale(action, _intent, router, _error, opts) do
     _ = router.(:stale_source)
     fail(action, :needs_input, :stale_source, opts, :stale_source, %{"disposition" => "fresh_review_required"})
@@ -233,7 +365,8 @@ defmodule SymphonyElixir.GitHub.MergeAdapter do
   defp transition!(action, state, effect, opts), do: _ = transition(action, state, effect, opts)
 
   defp emit(fun, outcome, intent) do
-    fun.([:symphony, :github, :merge], %{count: 1}, %{outcome: outcome, repository: intent.repository, pull_number: intent.pull_number})
+    metadata = %{outcome: outcome, repository: intent.repository, pull_number: intent.pull_number}
+    fun.([:symphony, :github, :merge], %{count: 1}, metadata)
   rescue
     _ -> :ok
   end
@@ -242,6 +375,21 @@ defmodule SymphonyElixir.GitHub.MergeAdapter do
   defp valid_repo?(repo), do: is_binary(repo) and String.match?(repo, ~r/^[^\s\/]+\/[^\s\/]+$/)
   defp valid_sha?(sha), do: is_binary(sha) and String.match?(sha, ~r/^[0-9a-fA-F]{40}$/)
   defp valid_text?(value), do: is_binary(value) and String.trim(value) != "" and byte_size(value) <= 512
+
+  defp valid_review_evidence?(%ReviewEvidence{} = evidence, intent) do
+    valid_source?(evidence.source) and valid_reviewer?(evidence.reviewer) and
+      valid_timestamp?(evidence.reviewed_at) and valid_revision_evidence?(evidence, intent) and
+      valid_check_evidence?(evidence.checks, intent.required_checks)
+  end
+
+  defp valid_review_evidence?(_, _intent), do: false
+  defp valid_source?(value), do: valid_text?(value) and String.starts_with?(value, "github:")
+  defp valid_reviewer?(value), do: valid_text?(value) and Regex.match?(~r/^[A-Za-z0-9_.-]{1,100}$/, value)
+  defp valid_revision_evidence?(evidence, intent), do: evidence.head == intent.reviewed_head and evidence.base == intent.reviewed_base
+  defp valid_check_evidence?(checks, required) when is_list(checks), do: Enum.all?(checks, &valid_text?/1) and Enum.sort(Enum.uniq(checks)) == Enum.sort(Enum.uniq(required))
+  defp valid_check_evidence?(_, _), do: false
+  defp valid_timestamp?(value) when is_binary(value), do: match?({:ok, _, 0}, DateTime.from_iso8601(value))
+  defp valid_timestamp?(_value), do: false
 
   defp repo_path(repo) do
     repo |> String.split("/", parts: 2) |> Enum.map_join("/", fn segment -> URI.encode(segment, &URI.char_unreserved?/1) end)
