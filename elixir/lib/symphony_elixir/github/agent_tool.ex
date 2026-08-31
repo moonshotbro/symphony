@@ -3,9 +3,10 @@ defmodule SymphonyElixir.GitHub.AgentTool do
   Provider-native GitHub REST tool exposed to Codex app-server turns.
   """
 
-  alias SymphonyElixir.GitHub.Client
+  alias SymphonyElixir.GitHub.{Client, MergeAdapter}
 
   @github_api_tool "github_api"
+  @github_merge_tool "github_merge"
   @allowed_methods ["GET", "POST", "PATCH", "PUT", "DELETE"]
   @github_api_description """
   Execute a GitHub REST API request using Symphony's configured auth.
@@ -34,11 +35,39 @@ defmodule SymphonyElixir.GitHub.AgentTool do
       }
     }
   }
+  @github_merge_input_schema %{
+    "type" => "object",
+    "additionalProperties" => false,
+    "required" => ["repository", "pull_number", "reviewed_head", "reviewed_base", "required_checks", "purpose", "review_evidence"],
+    "properties" => %{
+      "repository" => %{"type" => "string"},
+      "pull_number" => %{"type" => "integer", "minimum" => 1},
+      "reviewed_head" => %{"type" => "string"},
+      "reviewed_base" => %{"type" => "string"},
+      "required_checks" => %{"type" => "array", "items" => %{"type" => "string"}},
+      "purpose" => %{"type" => "string"},
+      "merge_method" => %{"type" => "string", "enum" => ["merge", "squash", "rebase"]},
+      "review_evidence" => %{
+        "type" => "object",
+        "additionalProperties" => false,
+        "required" => ["source", "reviewer", "reviewed_at", "head", "base", "checks"],
+        "properties" => %{
+          "source" => %{"type" => "string"},
+          "reviewer" => %{"type" => "string"},
+          "reviewed_at" => %{"type" => "string"},
+          "head" => %{"type" => "string"},
+          "base" => %{"type" => "string"},
+          "checks" => %{"type" => "array", "items" => %{"type" => "string"}}
+        }
+      }
+    }
+  }
 
   @spec execute(String.t() | nil, term(), keyword()) :: map()
   def execute(tool, arguments, opts) do
     case tool do
       @github_api_tool -> execute_github_api(arguments, opts)
+      @github_merge_tool -> execute_github_merge(arguments, opts)
       other -> unsupported_tool_response(other)
     end
   end
@@ -50,9 +79,77 @@ defmodule SymphonyElixir.GitHub.AgentTool do
         "name" => @github_api_tool,
         "description" => @github_api_description,
         "inputSchema" => @github_api_input_schema
+      },
+      %{
+        "name" => @github_merge_tool,
+        "description" => "Merge a reviewed GitHub pull request through Symphony's durable expected-head guard. GitHub branch protection remains authoritative.",
+        "inputSchema" => @github_merge_input_schema
       }
     ]
   end
+
+  defp execute_github_merge(arguments, opts) do
+    case merge_intent(arguments) do
+      {:ok, intent} ->
+        merge_opts = Keyword.take(opts, [:tracker_settings, :ledger, :request_fun, :recovery_fun, :telemetry_fun, :review_router])
+
+        case MergeAdapter.merge(intent, merge_opts) do
+          {:ok, outcome, details} -> dynamic_tool_response(true, encode_payload(%{"outcome" => outcome, "details" => details}))
+          {:error, reason} -> failure_response(tool_error_payload({:github_merge, reason}))
+        end
+
+      {:error, reason} ->
+        failure_response(tool_error_payload({:github_merge, reason}))
+    end
+  end
+
+  defp merge_intent(arguments) when is_map(arguments) do
+    with {:ok, evidence} <- merge_evidence(Map.get(arguments, "review_evidence")),
+         {:ok, pull_number} <- positive_integer(Map.get(arguments, "pull_number")),
+         {:ok, required_checks} <- text_list(Map.get(arguments, "required_checks")),
+         {:ok, merge_method} <- optional_merge_method(Map.get(arguments, "merge_method")) do
+      {:ok,
+       %MergeAdapter.Intent{
+         repository: Map.get(arguments, "repository"),
+         pull_number: pull_number,
+         reviewed_head: Map.get(arguments, "reviewed_head"),
+         reviewed_base: Map.get(arguments, "reviewed_base"),
+         required_checks: required_checks,
+         purpose: Map.get(arguments, "purpose"),
+         merge_method: merge_method,
+         review_evidence: evidence
+       }}
+    end
+  end
+
+  defp merge_intent(_arguments), do: {:error, :invalid_arguments}
+
+  defp merge_evidence(%{} = evidence) do
+    with {:ok, checks} <- text_list(Map.get(evidence, "checks")) do
+      {:ok,
+       %MergeAdapter.ReviewEvidence{
+         source: Map.get(evidence, "source"),
+         reviewer: Map.get(evidence, "reviewer"),
+         reviewed_at: Map.get(evidence, "reviewed_at"),
+         head: Map.get(evidence, "head"),
+         base: Map.get(evidence, "base"),
+         checks: checks
+       }}
+    end
+  end
+
+  defp merge_evidence(_evidence), do: {:error, :invalid_review_evidence}
+  defp positive_integer(value) when is_integer(value) and value > 0, do: {:ok, value}
+  defp positive_integer(_value), do: {:error, :invalid_pull_number}
+
+  defp text_list(values) when is_list(values) do
+    if Enum.all?(values, &is_binary/1), do: {:ok, values}, else: {:error, :invalid_required_checks}
+  end
+
+  defp text_list(_values), do: {:error, :invalid_required_checks}
+  defp optional_merge_method(nil), do: {:ok, "squash"}
+  defp optional_merge_method(value) when value in ["merge", "squash", "rebase"], do: {:ok, value}
+  defp optional_merge_method(_value), do: {:error, :invalid_merge_method}
 
   defp execute_github_api(arguments, opts) do
     github_client = Keyword.get(opts, :github_client, &Client.request/5)
@@ -163,6 +260,10 @@ defmodule SymphonyElixir.GitHub.AgentTool do
         "reason" => inspect(reason)
       }
     }
+  end
+
+  defp tool_error_payload({:github_merge, reason}) do
+    %{"error" => %{"message" => "GitHub merge was not completed.", "reason" => inspect(reason)}}
   end
 
   defp tool_error_payload(reason) do

@@ -22,7 +22,7 @@ This directory contains the current Elixir/OTP implementation of Symphony, based
 5. Keeps Codex working on the issue until the work is done
 
 During app-server sessions, the selected tracker adapter may advertise provider-native tools. The
-Linear serves `linear_graphql`, GitHub Issues serves `github_api`, Jira Cloud serves
+Linear serves `linear_graphql`, GitHub Issues serves `github_api` and the guarded `github_merge`, Jira Cloud serves
 `jira_rest`, Asana serves `asana_api`, and GitLab serves `gitlab_api`. Symphony executes those
 tools with configured host-side auth and removes declared tracker-token environment variables from
 the Codex child, so the agent does not need a second tracker login.
@@ -263,6 +263,12 @@ codex:
   `body`; Symphony executes it host-side with the session-bound token, removes configured tracker
   credentials and provider authentication aliases from the Codex child, and leaves raw tool access
   limited by that token's GitHub permissions.
+- `github_merge` is the explicit production boundary for reviewed merges. It requires an exact
+  reviewed head and base, configured-repository equality, privacy-bounded review evidence, and
+  durable action-ledger planning before calling GitHub's expected-head merge endpoint. GitHub
+  branch protection and mergeability remain authoritative. Transport and 5xx outcomes are held as
+  uncertain and reconciled against GitHub before an effect is retried; definitive rejections remain
+  terminal failures.
 
 ### Jira Cloud adapter
 

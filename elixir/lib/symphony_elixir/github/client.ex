@@ -17,6 +17,22 @@ defmodule SymphonyElixir.GitHub.Client do
     with {:ok, _settings} <- settings(tracker_settings), do: :ok
   end
 
+  @doc "Returns the configured repository without performing a network request or reading credentials."
+  @spec configured_repository(map() | nil) :: {:ok, String.t()} | {:error, term()}
+  def configured_repository(tracker_settings) when is_map(tracker_settings) do
+    provider = provider_settings(tracker_settings)
+    configured = provider["repo"] || provider[:repo] || tracker_settings["repo"] || tracker_settings[:repo]
+    repo = resolve_setting(configured, System.get_env("GITHUB_REPO"))
+
+    cond do
+      not present_string?(repo) -> {:error, :missing_github_repo}
+      not valid_repo?(repo) -> {:error, :invalid_github_repo}
+      true -> {:ok, repo}
+    end
+  end
+
+  def configured_repository(nil), do: {:error, :missing_github_repo}
+
   @spec secret_environment_names(map()) :: [String.t()]
   def secret_environment_names(tracker_settings) do
     provider = provider_settings(tracker_settings)

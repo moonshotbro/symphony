@@ -25,8 +25,8 @@ Each persisted JSON line is a complete `symphony.action-ledger.v1` action snapsh
 | `id` | string | `act_` plus the first 32 hex characters of the idempotency key |
 | `idempotency_key` | 64-character hex | Hash of the complete normalized intent |
 | `lineage_key` | 64-character hex | Hash of action kind and bounded source identity |
-| `kind` | enum | `task_creation`, `task_messaging`, `automation`, `fork`, or `handoff` |
-| `source` | bounded object | Goal/task/issue/repository/revision/session correlation only |
+| `kind` | enum | `task_creation`, `task_messaging`, `automation`, `fork`, `handoff`, or `merge` |
+| `source` | bounded object | Goal/task/issue/repository/revision/session and privacy-bounded review correlation |
 | `target` | bounded object | Type, ID, host, project, or worker host only |
 | `purpose_hash` | 64-character hex | Hash of the purpose; the purpose body is never stored |
 | `checkpoint` | string | Exact source revision or workflow checkpoint |
@@ -105,7 +105,10 @@ initial ledger write fails, the issue remains blocked and no retry is scheduled.
   session correlation, checkpoint hash, policy fingerprint, and blocker tokens only.
 
 Task messaging, automation, fork, and handoff share the typed envelope and adapter boundary, but
-their live effect adapters are deliberately outside this first phase.
+their live effect adapters are deliberately outside this first phase. The GitHub adapter provides
+the first live mutation boundary as `github_merge`; its review source, reviewer, exact check list,
+and derived fingerprint are persisted as bounded source metadata without prompts, credentials, or
+review body content.
 
 ## Recovery runbook
 
