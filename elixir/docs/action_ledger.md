@@ -54,7 +54,7 @@ altered envelope fails startup closed.
 | `uncertain` | `succeeded`, `already_satisfied`, `retryable_failure`, `compensated`, `quarantined`, `needs_input`, `terminal_failure` |
 | `retryable_failure` | `planned`, `quarantined`, `needs_input`, `terminal_failure` |
 | `quarantined` | `planned`, `needs_input`, `terminal_failure` |
-| `needs_input` | `planned`, `quarantined`, `terminal_failure` |
+| `needs_input` | `planned`, `already_satisfied`, `quarantined`, `terminal_failure` |
 
 `preflight_rejected`, `succeeded`, `already_satisfied`, `compensated`, and `terminal_failure` are
 immutable. Corrections are new actions linked through `supersedes`.
@@ -80,11 +80,14 @@ it records `dispatched`. A failed check transitions the action to `preflight_rej
 presentation or execution.
 
 A durable decision request uses `blocker_classification: goal.stalled` and a precise
-`resume_condition`. Identical requests deduplicate. `resume_goal/3` moves only that action from
-`needs_input` to `planned`, and only when the supplied condition matches exactly. Other action lanes
-remain schedulable. The native orchestrator records this action when it moves a worker into its
-blocked/input-required state, using the issue revision as the checkpoint and a deterministic named
-resume condition. If that write fails, the issue remains blocked and no retry is scheduled.
+`resume_condition`. Identical requests deduplicate. When the supplied condition matches exactly,
+`resume_goal/3` moves that durable decision request from `needs_input` to terminal
+`already_satisfied`; it does not turn the decision request itself into another dispatch. The native
+orchestrator separately releases the matching issue claim and schedules its existing poll loop, so
+the underlying issue can continue through the ordinary scheduler. Other action lanes remain
+schedulable. The orchestrator can resolve the persisted stalled-goal action directly after restart,
+using the issue revision as the checkpoint and a deterministic named resume condition. If the
+initial ledger write fails, the issue remains blocked and no retry is scheduled.
 
 ## Native integration map
 
