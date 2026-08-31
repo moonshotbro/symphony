@@ -142,5 +142,27 @@ defmodule SymphonyElixir.ActionLedgerIntegrationTest do
 
     assert settings.action_ledger.enabled
     assert settings.action_ledger.path == "/var/lib/symphony/action-ledger.jsonl"
+
+    env_name = "SYMPHONY_TEST_MISSING_LEDGER_PATH"
+    previous = System.get_env(env_name)
+    System.delete_env(env_name)
+
+    on_exit(fn -> restore_env(env_name, previous) end)
+
+    assert {:error, {:invalid_workflow_config, env_message}} =
+             Schema.parse(%{
+               "action_ledger" => %{"enabled" => true, "path" => "$#{env_name}"}
+             })
+
+    assert env_message =~ "environment reference must resolve"
+
+    System.put_env(env_name, "/var/lib/symphony/env-action-ledger.jsonl")
+
+    assert {:ok, env_settings} =
+             Schema.parse(%{
+               "action_ledger" => %{"enabled" => true, "path" => "$#{env_name}"}
+             })
+
+    assert env_settings.action_ledger.path == "/var/lib/symphony/env-action-ledger.jsonl"
   end
 end

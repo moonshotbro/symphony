@@ -286,10 +286,27 @@ defmodule SymphonyElixir.Config.Schema do
       changeset = cast(schema, attrs, [:enabled, :path], empty_values: [])
 
       if get_field(changeset, :enabled) do
-        validate_required(changeset, [:path])
+        changeset
+        |> validate_required([:path])
+        |> validate_change(:path, &validate_durable_path/2)
       else
         changeset
       end
+    end
+
+    defp validate_durable_path(:path, "$" <> env_name) do
+      valid_name? = String.match?(env_name, ~r/^[A-Za-z_][A-Za-z0-9_]*$/)
+      resolved = if valid_name?, do: System.get_env(env_name)
+
+      if is_binary(resolved) and String.trim(resolved) != "" do
+        []
+      else
+        [path: "environment reference must resolve to a nonblank durable path"]
+      end
+    end
+
+    defp validate_durable_path(:path, path) when is_binary(path) do
+      if String.trim(path) == "", do: [path: "must not be blank"], else: []
     end
   end
 
