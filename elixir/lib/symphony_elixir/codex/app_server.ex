@@ -15,6 +15,7 @@ defmodule SymphonyElixir.Codex.AppServer do
   @max_thread_turn_pages 1_000
   @port_line_bytes 1_048_576
   @max_stream_log_bytes 1_000
+  @remote_canonical_marker "__SYMPHONY_REMOTE_CANONICAL_PATHS__"
   @type session :: %{
           port: port(),
           metadata: map(),
@@ -214,8 +215,10 @@ defmodule SymphonyElixir.Codex.AppServer do
     # compensate by accepting an arbitrary path: normalise only a strictly
     # absolute, traversal-free POSIX path, then prove it is below the configured
     # remote workspace root before the value reaches SSH.
-    with {:ok, canonical_workspace} <- remote_workspace_path(workspace, :workspace),
-         {:ok, canonical_root} <- remote_workspace_path(Config.settings!().workspace.root, :root) do
+    with {:ok, lexical_workspace} <- remote_workspace_path(workspace, :workspace),
+         {:ok, lexical_root} <- remote_workspace_path(Config.settings!().workspace.root, :root),
+         {:ok, {canonical_root, canonical_workspace}} <-
+           remote_canonical_paths(worker_host, lexical_root, lexical_workspace) do
       root_prefix = canonical_root <> "/"
 
       cond do
@@ -256,6 +259,86 @@ defmodule SymphonyElixir.Codex.AppServer do
 
       true ->
         {:ok, "/" <> Enum.join(segments, "/")}
+    end
+  end
+
+  # Lexical checks cannot detect a symlink on a remote worker.  Resolve both
+  # paths on that worker in one fixed-purpose shell script, then compare the
+  # resulting physical paths before opening the App Server protocol.  Paths are
+  # assigned as shell-escaped values and are never interpolated as commands.
+  defp remote_canonical_paths(worker_host, root, workspace)
+       when is_binary(worker_host) and is_binary(root) and is_binary(workspace) do
+    script =
+      [
+        "set -eu",
+        "root=#{shell_escape(root)}",
+        "workspace=#{shell_escape(workspace)}",
+        "cd -- \"$root\"",
+        "canonical_root=$(pwd -P)",
+        "cd -- \"$workspace\"",
+        "canonical_workspace=$(pwd -P)",
+        "printf '%s\\t%s\\t%s\\n' '#{@remote_canonical_marker}' \"$canonical_root\" \"$canonical_workspace\""
+      ]
+      |> Enum.join("\n")
+
+    timeout_ms = Config.settings!().hooks.timeout_ms
+
+    task =
+      Task.async(fn ->
+        SSH.run(worker_host, script, stderr_to_stdout: true)
+      end)
+
+    result =
+      case Task.yield(task, timeout_ms) do
+        {:ok, value} ->
+          value
+
+        nil ->
+          Task.shutdown(task, :brutal_kill)
+          {:error, {:remote_workspace_canonicalize_timeout, timeout_ms}}
+      end
+
+    case result do
+      {:ok, {output, 0}} ->
+        parse_remote_canonical_paths(output, worker_host, root, workspace)
+
+      {:ok, {output, status}} ->
+        {:error, {:invalid_workspace_cwd, :remote_path_unreadable, worker_host, status, output}}
+
+      {:error, reason} ->
+        {:error, {:invalid_workspace_cwd, :remote_canonicalize_failed, worker_host, reason}}
+
+      other ->
+        {:error, {:invalid_workspace_cwd, :remote_canonicalize_failed, worker_host, other}}
+    end
+  end
+
+  defp parse_remote_canonical_paths(output, worker_host, root, workspace) do
+    paths =
+      output
+      |> IO.iodata_to_binary()
+      |> String.split("\n", trim: true)
+      |> Enum.find_value(fn line ->
+        case String.split(line, "\t", parts: 3) do
+          [@remote_canonical_marker, canonical_root, canonical_workspace]
+          when canonical_root != "" and canonical_workspace != "" ->
+            {canonical_root, canonical_workspace}
+
+          _ ->
+            nil
+        end
+      end)
+
+    case paths do
+      {canonical_root, canonical_workspace} ->
+        if Path.type(canonical_root) == :absolute and Path.type(canonical_workspace) == :absolute do
+          {:ok, {canonical_root, canonical_workspace}}
+        else
+          {:error, {:invalid_workspace_cwd, :remote_canonical_output, worker_host, root, workspace, output}}
+        end
+
+      _ ->
+        {:error, {:invalid_workspace_cwd, :remote_canonical_output, worker_host, root, workspace, output}}
     end
   end
 

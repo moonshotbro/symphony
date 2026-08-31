@@ -1605,6 +1605,13 @@ defmodule SymphonyElixir.AppServerTest do
       count=0
       printf 'ARGV:%s\\n' "$*" >> "$trace_file"
 
+      case "$*" in
+        *SYMPHONY_REMOTE_CANONICAL_PATHS*)
+          printf '%s\\t%s\\t%s\\n' '__SYMPHONY_REMOTE_CANONICAL_PATHS__' '/remote/workspaces' '/remote/workspaces/MT-REMOTE'
+          exit 0
+          ;;
+      esac
+
       while IFS= read -r line; do
         count=$((count + 1))
         printf 'JSON:%s\\n' "$line" >> "$trace_file"
@@ -1658,7 +1665,7 @@ defmodule SymphonyElixir.AppServerTest do
       trace = File.read!(trace_file)
       lines = String.split(trace, "\n", trim: true)
 
-      assert argv_line = Enum.find(lines, &String.starts_with?(&1, "ARGV:"))
+      assert argv_line = Enum.find(lines, &(String.starts_with?(&1, "ARGV:") and String.contains?(&1, "exec ")))
       assert argv_line =~ "-T -p 2200 worker-01 bash -lc"
       assert argv_line =~ "cd "
       assert argv_line =~ remote_workspace
@@ -1705,6 +1712,100 @@ defmodule SymphonyElixir.AppServerTest do
              end)
     after
       File.rm_rf(test_root)
+    end
+  end
+
+  test "remote app server refuses a symlink escape before starting the protocol" do
+    test_root = Path.join(System.tmp_dir!(), "symphony-elixir-remote-canonical-#{System.unique_integer([:positive])}")
+    previous_path = System.get_env("PATH")
+    previous_mode = System.get_env("SYMP_TEST_REMOTE_CANONICAL_MODE")
+
+    on_exit(fn ->
+      restore_env("PATH", previous_path)
+      restore_env("SYMP_TEST_REMOTE_CANONICAL_MODE", previous_mode)
+    end)
+
+    try do
+      trace_file = Path.join(test_root, "ssh.trace")
+      fake_ssh = Path.join(test_root, "ssh")
+      File.mkdir_p!(test_root)
+      System.put_env("SYMP_TEST_SSH_TRACE", trace_file)
+      System.put_env("SYMP_TEST_REMOTE_CANONICAL_MODE", "outside")
+      System.put_env("PATH", test_root <> ":" <> (previous_path || ""))
+
+      File.write!(fake_ssh, """
+      #!/bin/sh
+      printf 'ARGV:%s\\n' "$*" >> "${SYMP_TEST_SSH_TRACE}"
+      case "$*" in
+        *SYMPHONY_REMOTE_CANONICAL_PATHS*)
+          case "${SYMP_TEST_REMOTE_CANONICAL_MODE}" in
+            outside) printf '%s\\t%s\\t%s\\n' '__SYMPHONY_REMOTE_CANONICAL_PATHS__' '/remote/workspaces' '/outside/escaped' ;;
+            missing) exit 1 ;;
+            malformed) printf '%s\\n' 'not-a-canonical-path-result' ;;
+          esac
+          exit 0
+          ;;
+        *) printf '%s\\n' '{"id":1,"result":{}}' ;;
+      esac
+      """)
+
+      File.chmod!(fake_ssh, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: "/remote/workspaces",
+        codex_command: "fake-remote-codex app-server"
+      )
+
+      assert {:error, {:invalid_workspace_cwd, :outside_remote_workspace_root, "worker-01", "/outside/escaped", "/remote/workspaces"}} =
+               AppServer.read_thread("00000000-0000-0000-0000-000000000000", "/remote/workspaces/link", worker_host: "worker-01")
+
+      trace = File.read!(trace_file)
+      assert trace =~ "SYMPHONY_REMOTE_CANONICAL_PATHS"
+      refute trace =~ "JSON:"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "remote app server rejects missing or malformed canonical path output" do
+    for mode <- ["missing", "malformed"] do
+      test_root = Path.join(System.tmp_dir!(), "symphony-elixir-remote-canonical-#{mode}-#{System.unique_integer([:positive])}")
+      previous_path = System.get_env("PATH")
+      previous_mode = System.get_env("SYMP_TEST_REMOTE_CANONICAL_MODE")
+
+      try do
+        fake_ssh = Path.join(test_root, "ssh")
+        File.mkdir_p!(test_root)
+        System.put_env("SYMP_TEST_REMOTE_CANONICAL_MODE", mode)
+        System.put_env("PATH", test_root <> ":" <> (previous_path || ""))
+
+        File.write!(fake_ssh, """
+        #!/bin/sh
+        case "$*" in
+          *SYMPHONY_REMOTE_CANONICAL_PATHS*)
+            if [ "${SYMP_TEST_REMOTE_CANONICAL_MODE}" = "missing" ]; then exit 1; fi
+            printf '%s\\n' 'malformed'
+            exit 0
+            ;;
+          *) exit 0 ;;
+        esac
+        """)
+
+        File.chmod!(fake_ssh, 0o755)
+
+        write_workflow_file!(Workflow.workflow_file_path(), workspace_root: "/remote/workspaces")
+
+        result =
+          AppServer.read_thread("00000000-0000-0000-0000-000000000000", "/remote/workspaces/work", worker_host: "worker-01")
+
+        assert {:error, error} = result
+        assert elem(error, 0) == :invalid_workspace_cwd
+        assert elem(error, 1) in [:remote_path_unreadable, :remote_canonicalize_failed, :remote_canonical_output]
+      after
+        restore_env("PATH", previous_path)
+        restore_env("SYMP_TEST_REMOTE_CANONICAL_MODE", previous_mode)
+        File.rm_rf(test_root)
+      end
     end
   end
 end

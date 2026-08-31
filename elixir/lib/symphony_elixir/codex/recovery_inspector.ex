@@ -95,8 +95,19 @@ defmodule SymphonyElixir.Codex.RecoveryInspector do
   defp strict_match(_thread, _correlation, _workspace), do: {:error, :thread_payload_invalid}
 
   defp match_turn(turns, turn_id) do
-    if Enum.any?(turns, fn turn -> (Map.get(turn, "id") || Map.get(turn, :id)) == turn_id end),
-      do: :ok,
-      else: {:error, :turn_id_mismatch}
+    Enum.reduce_while(turns, :not_found, fn
+      turn, _acc when is_map(turn) ->
+        if (Map.get(turn, "id") || Map.get(turn, :id)) == turn_id,
+          do: {:halt, :found},
+          else: {:cont, :not_found}
+
+      _malformed_turn, _acc ->
+        {:halt, {:error, :thread_turn_payload_invalid}}
+    end)
+    |> case do
+      :found -> :ok
+      :not_found -> {:error, :turn_id_mismatch}
+      {:error, _reason} = error -> error
+    end
   end
 end

@@ -56,6 +56,21 @@ defmodule SymphonyElixir.RecoveryInspectorTest do
              )
   end
 
+  test "fails closed with a typed error when a persisted turn item is not a map" do
+    root = Path.join(System.tmp_dir!(), "symphony-recovery-malformed-turn-#{System.unique_integer([:positive])}")
+    workspace_root = Path.join(root, "workspaces")
+    File.mkdir_p!(Path.join(workspace_root, "GH-38"))
+    on_exit(fn -> File.rm_rf(root) end)
+    write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root)
+
+    assert {:error, :thread_turn_payload_invalid} =
+             RecoveryInspector.inspect(correlation_action(),
+               thread_reader: fn _, workspace, _ ->
+                 {:ok, %{"id" => "thread-1", "cwd" => workspace, "turns" => ["malformed"]}}
+               end
+             )
+  end
+
   test "fails closed for unsupported actions, missing effects, remote host assertions, and bad provider identity" do
     root = Path.join(System.tmp_dir!(), "symphony-recovery-branches-#{System.unique_integer([:positive])}")
     workspace_root = Path.join(root, "workspaces")
