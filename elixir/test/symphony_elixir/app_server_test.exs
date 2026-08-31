@@ -76,6 +76,74 @@ defmodule SymphonyElixir.AppServerTest do
     end
   end
 
+  test "control connection reads and forks one stored thread through fixed protocol methods" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-control-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-CONTROL")
+      codex_binary = Path.join(test_root, "fake-codex")
+      trace_file = Path.join(test_root, "control.trace")
+      previous_trace = System.get_env("SYMP_TEST_CODEX_CONTROL_TRACE")
+
+      on_exit(fn ->
+        if is_binary(previous_trace) do
+          System.put_env("SYMP_TEST_CODEX_CONTROL_TRACE", previous_trace)
+        else
+          System.delete_env("SYMP_TEST_CODEX_CONTROL_TRACE")
+        end
+      end)
+
+      System.put_env("SYMP_TEST_CODEX_CONTROL_TRACE", trace_file)
+      File.mkdir_p!(workspace)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      trace_file="${SYMP_TEST_CODEX_CONTROL_TRACE}"
+      while IFS= read -r line; do
+        printf 'JSON:%s\\n' "$line" >> "$trace_file"
+        method=$(printf '%s' "$line" | sed -n 's/.*"method":"\\([^"]*\\)".*/\\1/p')
+        id=$(printf '%s' "$line" | sed -n 's/.*"id":\\([0-9]*\\).*/\\1/p')
+        case "$method" in
+          initialize) printf '%s\\n' '{"id":1,"result":{}}' ;;
+          thread/read) printf '%s\\n' '{"id":10,"result":{"thread":{"id":"thread-source","sessionId":"session-root"}}}' ;;
+          thread/fork) printf '%s\\n' '{"id":11,"result":{"thread":{"id":"thread-child","sessionId":"session-root","forkedFromId":"thread-source"}}}' ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server"
+      )
+
+      assert {:ok, {:ok, source, fork}} =
+               AppServer.with_control_connection(workspace, fn connection ->
+                 with {:ok, source} <- AppServer.read_stored_thread(connection, "thread-source"),
+                      {:ok, fork} <- AppServer.fork_stored_thread(connection, "thread-source") do
+                   {:ok, source, fork}
+                 end
+               end)
+
+      assert source["id"] == "thread-source"
+      assert fork["id"] == "thread-child"
+      assert fork["forkedFromId"] == "thread-source"
+
+      trace = File.read!(trace_file)
+      assert trace =~ ~s("method":"thread/read")
+      assert trace =~ ~s("method":"thread/fork")
+      refute trace =~ ~s("method":"turn/start")
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
   test "turn timeout resets on stream updates and fires after silence" do
     test_root =
       Path.join(

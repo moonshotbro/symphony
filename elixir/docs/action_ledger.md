@@ -104,8 +104,21 @@ initial ledger write fails, the issue remains blocked and no retry is scheduled.
 - every transition emits `[:symphony, :action_ledger, :transition]` with action, state, issue/task/
   session correlation, checkpoint hash, policy fingerprint, and blocker tokens only.
 
-Task messaging, automation, fork, and handoff share the typed envelope and adapter boundary, but
-their live effect adapters are deliberately outside this first phase.
+The native Codex App Server supports a durable stored-thread fork. Its adapter
+records intent, reads the exact source thread, forks it, validates the returned
+source/child identities, and stores only bounded identifiers. On restart it
+reads a recorded child id again; when a crash occurred before that child id was
+recorded, it quarantines rather than searching for a plausible fork or creating
+another one.
+
+The installed first-party Codex App Tools MCP server exposes task messaging,
+automation, fork, and handoff only through a live desktop-host pipe plus
+executor thread metadata. Symphony does not own that host binding. Until a
+separately reviewed provider can establish and inspect it, task messaging,
+automation, and handoff are each persisted as a `preflight_rejected`
+`provider_capability_unsupported` action. They do not run, retry, or claim
+success. The pipe path, prompts, payloads, and credentials are never retained
+in ledger records or telemetry.
 
 ## Recovery runbook
 

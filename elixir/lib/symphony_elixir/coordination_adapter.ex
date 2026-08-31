@@ -81,8 +81,14 @@ defmodule SymphonyElixir.CoordinationAdapter do
          {:ok, _dispatched} <- ActionLedger.transition(ledger, action.id, :dispatched) do
       execute_effect(ledger, action, effect_fun, opts)
     else
-      {:error, {:approval_obsolete, reason}} -> reject_obsolete(ledger, action, reason)
-      {:error, reason} -> {:error, reason}
+      {:error, {:provider_capability_unsupported, capability}} ->
+        reject_unsupported(ledger, action, capability)
+
+      {:error, {:approval_obsolete, reason}} ->
+        reject_obsolete(ledger, action, reason)
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 
@@ -123,6 +129,7 @@ defmodule SymphonyElixir.CoordinationAdapter do
   defp run_precondition(fun) when is_function(fun, 0) do
     case fun.() do
       :ok -> :ok
+      {:error, {:provider_capability_unsupported, _capability}} = error -> error
       {:error, reason} -> {:error, {:approval_obsolete, reason}}
       other -> {:error, {:approval_obsolete, {:invalid_precondition_result, other}}}
     end
@@ -134,6 +141,18 @@ defmodule SymphonyElixir.CoordinationAdapter do
          }) do
       {:ok, _rejected} -> {:error, {:approval_obsolete, reason}}
       {:error, transition_reason} -> {:error, {:failure_record_failed, transition_reason, reason}}
+    end
+  end
+
+  defp reject_unsupported(ledger, action, capability) do
+    case ActionLedger.transition(ledger, action.id, :preflight_rejected, %{
+           "disposition" => "provider_capability_unsupported"
+         }) do
+      {:ok, _rejected} ->
+        {:error, {:provider_capability_unsupported, capability}}
+
+      {:error, transition_reason} ->
+        {:error, {:failure_record_failed, transition_reason, {:provider_capability_unsupported, capability}}}
     end
   end
 

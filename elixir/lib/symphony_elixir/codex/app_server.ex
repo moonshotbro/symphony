@@ -24,6 +24,15 @@ defmodule SymphonyElixir.Codex.AppServer do
           dynamic_tool_binding: map()
         }
 
+  @type control_connection :: %{
+          port: port(),
+          metadata: map(),
+          workspace: Path.t()
+        }
+
+  @control_thread_read_id 10
+  @control_thread_fork_id 11
+
   @spec run(Path.t(), String.t(), map(), keyword()) :: {:ok, map()} | {:error, term()}
   def run(workspace, prompt, issue, opts \\ []) do
     with {:ok, session} <- start_session(workspace, opts) do
@@ -65,6 +74,66 @@ defmodule SymphonyElixir.Codex.AppServer do
           stop_port(port)
           {:error, reason}
       end
+    end
+  end
+
+  @doc """
+  Runs a narrow control operation against the local Codex App Server.
+
+  This is deliberately not a generic JSON-RPC escape hatch. It only backs the
+  typed stored-thread read and fork operations below, so a workflow manifest
+  cannot turn it into arbitrary provider command execution.
+  """
+  @spec with_control_connection(Path.t(), (control_connection() -> term())) ::
+          {:ok, term()} | {:error, term()}
+  def with_control_connection(workspace, operation) when is_function(operation, 1) do
+    dynamic_tool_binding = DynamicTool.bind()
+
+    with {:ok, expanded_workspace} <- validate_workspace_cwd(workspace, nil),
+         {:ok, port} <- start_port(expanded_workspace, nil, dynamic_tool_binding),
+         :ok <- send_initialize(port) do
+      connection = %{port: port, metadata: port_metadata(port, nil), workspace: expanded_workspace}
+
+      try do
+        {:ok, operation.(connection)}
+      after
+        stop_port(port)
+      end
+    end
+  end
+
+  @doc "Read one persisted thread without loading or resuming it."
+  @spec read_stored_thread(control_connection(), String.t()) :: {:ok, map()} | {:error, term()}
+  def read_stored_thread(%{port: port}, thread_id) when is_binary(thread_id) do
+    with :ok <- valid_thread_id(thread_id),
+         {:ok, %{"thread" => %{"id" => ^thread_id} = thread}} <-
+           control_request(port, @control_thread_read_id, "thread/read", %{
+             "threadId" => thread_id,
+             "includeTurns" => false
+           }) do
+      {:ok, thread}
+    else
+      {:ok, other} -> {:error, {:invalid_thread_read_response, other}}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  @doc "Fork one persisted thread using the supported App Server operation."
+  @spec fork_stored_thread(control_connection(), String.t(), keyword()) :: {:ok, map()} | {:error, term()}
+  def fork_stored_thread(%{port: port}, thread_id, opts \\ []) when is_binary(thread_id) and is_list(opts) do
+    last_turn_id = Keyword.get(opts, :last_turn_id)
+
+    with :ok <- valid_thread_id(thread_id),
+         :ok <- valid_optional_turn_id(last_turn_id),
+         {:ok, %{"thread" => %{"id" => fork_thread_id, "forkedFromId" => ^thread_id} = thread}} <-
+           control_request(port, @control_thread_fork_id, "thread/fork", fork_params(thread_id, last_turn_id)),
+         :ok <- valid_thread_id(fork_thread_id),
+         false <- fork_thread_id == thread_id do
+      {:ok, thread}
+    else
+      true -> {:error, :fork_identity_reused_source}
+      {:ok, other} -> {:error, {:invalid_thread_fork_response, other}}
+      {:error, reason} -> {:error, reason}
     end
   end
 
@@ -1030,6 +1099,35 @@ defmodule SymphonyElixir.Codex.AppServer do
   defp send_message(port, message) do
     line = Jason.encode!(message) <> "\n"
     Port.command(port, line)
+  end
+
+  defp control_request(port, request_id, method, params)
+       when is_port(port) and is_integer(request_id) and is_binary(method) and is_map(params) do
+    send_message(port, %{"id" => request_id, "method" => method, "params" => params})
+    await_response(port, request_id)
+  end
+
+  defp fork_params(thread_id, nil), do: %{"threadId" => thread_id}
+  defp fork_params(thread_id, last_turn_id), do: %{"threadId" => thread_id, "lastTurnId" => last_turn_id}
+
+  defp valid_thread_id(value) when is_binary(value) do
+    if valid_provider_identifier?(value), do: :ok, else: {:error, :invalid_thread_id}
+  end
+
+  defp valid_thread_id(_value), do: {:error, :invalid_thread_id}
+
+  defp valid_optional_turn_id(nil), do: :ok
+
+  defp valid_optional_turn_id(value) when is_binary(value) do
+    if valid_provider_identifier?(value), do: :ok, else: {:error, :invalid_turn_id}
+  end
+
+  defp valid_optional_turn_id(_value), do: {:error, :invalid_turn_id}
+
+  defp valid_provider_identifier?(value) do
+    byte_size(value) in 1..512 and
+      String.trim(value) == value and
+      not String.contains?(value, ["\n", "\r", <<0>>])
   end
 
   defp needs_input?("mcpServer/elicitation/request", payload) when is_map(payload), do: true

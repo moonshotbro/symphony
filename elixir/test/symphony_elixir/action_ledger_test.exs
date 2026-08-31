@@ -114,6 +114,120 @@ defmodule SymphonyElixir.ActionLedgerTest do
     assert pending.id == action.id
   end
 
+  test "authoritative fork inspection binds both source and child identities", %{path: path} do
+    ledger = start_ledger(path)
+
+    fork =
+      intent(%{
+        kind: :fork,
+        target: %{type: "codex_thread", id: "thread-source"},
+        expected_postcondition: "codex.thread_forked"
+      })
+
+    assert {:ok, action, :new} = ActionLedger.plan(ledger, fork)
+    assert {:ok, _} = ActionLedger.transition(ledger, action.id, :dispatched)
+    GenServer.stop(ledger)
+
+    recovered = start_ledger(path)
+
+    assert {:ok, settled, :already_satisfied} =
+             ActionLedger.inspect_recovered(recovered, action.id, %{
+               provider: "codex",
+               authoritative: true,
+               exists: true,
+               thread_id: "thread-source",
+               fork_thread_id: "thread-child",
+               session_id: "session-root"
+             })
+
+    assert settled.observed_effect["fork_thread_id"] == "thread-child"
+    assert settled.observed_effect["thread_id"] == "thread-source"
+
+    invalid_path = Path.rootname(path) <> "-invalid-fork.jsonl"
+    invalid = start_ledger(invalid_path)
+    assert {:ok, invalid_action, :new} = ActionLedger.plan(invalid, fork)
+    assert {:ok, _} = ActionLedger.transition(invalid, invalid_action.id, :dispatched)
+    GenServer.stop(invalid)
+    invalid = start_ledger(invalid_path)
+
+    assert {:ok, quarantined, :quarantined} =
+             ActionLedger.inspect_recovered(invalid, invalid_action.id, %{
+               provider: "codex",
+               authoritative: true,
+               exists: true,
+               thread_id: "wrong-source",
+               fork_thread_id: "thread-child"
+             })
+
+    assert quarantined.observed_effect["disposition"] == "postcondition_evidence_mismatch"
+
+    incomplete_path = Path.rootname(path) <> "-incomplete-fork.jsonl"
+    incomplete = start_ledger(incomplete_path)
+    assert {:ok, incomplete_action, :new} = ActionLedger.plan(incomplete, fork)
+    assert {:ok, _} = ActionLedger.transition(incomplete, incomplete_action.id, :dispatched)
+    GenServer.stop(incomplete)
+    incomplete = start_ledger(incomplete_path)
+
+    assert {:ok, incomplete, :quarantined} =
+             ActionLedger.inspect_recovered(incomplete, incomplete_action.id, %{
+               provider: "codex",
+               authoritative: true,
+               exists: true,
+               thread_id: "thread-source"
+             })
+
+    assert incomplete.observed_effect["disposition"] == "postcondition_evidence_incomplete"
+
+    provider_path = Path.rootname(path) <> "-wrong-fork-provider.jsonl"
+    provider = start_ledger(provider_path)
+    assert {:ok, provider_action, :new} = ActionLedger.plan(provider, fork)
+    assert {:ok, _} = ActionLedger.transition(provider, provider_action.id, :dispatched)
+    GenServer.stop(provider)
+    provider = start_ledger(provider_path)
+
+    assert {:ok, provider, :quarantined} =
+             ActionLedger.inspect_recovered(provider, provider_action.id, %{
+               provider: "desktop",
+               authoritative: true,
+               exists: true,
+               thread_id: "thread-source",
+               fork_thread_id: "thread-child"
+             })
+
+    assert provider.observed_effect["disposition"] == "provider_mismatch"
+  end
+
+  test "known unsupported provider effect is persisted as preflight rejection", %{path: path} do
+    ledger = start_ledger(path)
+    unsupported = intent(%{kind: :automation, expected_postcondition: "desktop.automation_updated"})
+
+    assert {:error, {:provider_capability_unsupported, :automation}} =
+             CoordinationAdapter.dispatch(
+               ledger,
+               unsupported,
+               fn -> flunk("unsupported provider effect must not execute") end,
+               precondition: fn -> {:error, {:provider_capability_unsupported, :automation}} end
+             )
+
+    assert {:ok, action, :existing} = ActionLedger.plan(ledger, unsupported)
+    assert action.state == :preflight_rejected
+    assert action.observed_effect["disposition"] == "provider_capability_unsupported"
+
+    failure_path = Path.join([Path.dirname(path), "unsupported-write", "ledger.jsonl"])
+    failure_ledger = start_ledger(failure_path)
+
+    assert {:error, {:failure_record_failed, :enotdir, {:provider_capability_unsupported, :automation}}} =
+             CoordinationAdapter.dispatch(
+               failure_ledger,
+               %{unsupported | checkpoint: "unsupported-write-failure"},
+               fn -> flunk("unsupported provider effect must not execute") end,
+               precondition: fn ->
+                 sabotage_ledger_path(failure_path)
+                 {:error, {:provider_capability_unsupported, :automation}}
+               end
+             )
+  end
+
   test "successful adapter dispatch is replay-safe and records only bounded effects", %{path: path} do
     ledger = start_ledger(path)
     parent = self()

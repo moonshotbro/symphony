@@ -18,7 +18,7 @@ defmodule SymphonyElixir.ActionLedger do
   @source_keys ~w(goal_id task_id issue_id issue_identifier repository revision session_id)
   @target_keys ~w(type id host project worker_host)
   @effect_keys ~w(thread_id turn_id automation_id fork_thread_id destination_thread_id worktree_id revision session_id worker_host disposition workspace_key)
-  @inspection_keys ~w(provider authoritative exists session_id workspace_key disposition)
+  @inspection_keys ~w(provider authoritative exists thread_id fork_thread_id session_id workspace_key disposition)
   @identity_keys ~w(goal_id task_id issue_id issue_identifier repository revision session_id)
   @target_identity_keys ~w(type id host project worker_host)
   @effect_identity_keys ~w(thread_id turn_id automation_id fork_thread_id destination_thread_id worktree_id revision session_id worker_host workspace_key)
@@ -626,6 +626,33 @@ defmodule SymphonyElixir.ActionLedger do
   end
 
   defp settle_existing_effect(%Action{expected_postcondition: "codex.session_observed"}, _provider, _evidence),
+    do: {:ok, :quarantined, %{"disposition" => "provider_mismatch"}}
+
+  defp settle_existing_effect(
+         %Action{kind: :fork, expected_postcondition: "codex.thread_forked", target: target},
+         "codex",
+         evidence
+       ) do
+    with source_thread_id when is_binary(source_thread_id) <- evidence["thread_id"],
+         fork_thread_id when is_binary(fork_thread_id) <- evidence["fork_thread_id"],
+         true <- target["id"] == source_thread_id,
+         false <- fork_thread_id == source_thread_id do
+      {:ok, :already_satisfied,
+       %{
+         "thread_id" => source_thread_id,
+         "fork_thread_id" => fork_thread_id,
+         "session_id" => evidence["session_id"],
+         "disposition" => "provider_postcondition_confirmed"
+       }
+       |> Enum.reject(fn {_key, value} -> is_nil(value) end)
+       |> Map.new()}
+    else
+      false -> {:ok, :quarantined, %{"disposition" => "postcondition_evidence_mismatch"}}
+      _ -> {:ok, :quarantined, %{"disposition" => "postcondition_evidence_incomplete"}}
+    end
+  end
+
+  defp settle_existing_effect(%Action{expected_postcondition: "codex.thread_forked"}, _provider, _evidence),
     do: {:ok, :quarantined, %{"disposition" => "provider_mismatch"}}
 
   defp settle_existing_effect(_action, _provider, evidence) do
