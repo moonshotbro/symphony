@@ -487,6 +487,15 @@ defmodule SymphonyElixir.ActionLedgerTest do
     File.write!(invalid_timestamp, Jason.encode!(raw) <> "\n")
     assert {:error, {:ledger_corrupt, _child}} = start_ledger_result(invalid_timestamp)
 
+    nonbinary_timestamp = Path.join(root, "nonbinary-timestamp.jsonl")
+    timestamp_ledger = start_ledger(nonbinary_timestamp)
+    assert {:ok, _action, :new} = ActionLedger.plan(timestamp_ledger, intent())
+    GenServer.stop(timestamp_ledger)
+    [timestamp_line] = nonbinary_timestamp |> File.read!() |> String.split("\n", trim: true)
+    timestamp_raw = timestamp_line |> Jason.decode!() |> Map.put("updated_at", 123)
+    File.write!(nonbinary_timestamp, Jason.encode!(timestamp_raw) <> "\n")
+    assert {:error, {:ledger_corrupt, _child}} = start_ledger_result(nonbinary_timestamp)
+
     invalid_replay = Path.join(root, "invalid-replay.jsonl")
     replay_ledger = start_ledger(invalid_replay)
     assert {:ok, replay_action, :new} = ActionLedger.plan(replay_ledger, intent())
@@ -498,6 +507,53 @@ defmodule SymphonyElixir.ActionLedgerTest do
     [planned_line, _terminal_line] = invalid_replay |> File.read!() |> String.split("\n", trim: true)
     File.write!(invalid_replay, File.read!(invalid_replay) <> planned_line <> "\n")
     assert {:error, {:ledger_corrupt, _child}} = start_ledger_result(invalid_replay)
+
+    assert {:error, {:ledger_path_invalid, _child}} = start_ledger_result(nil)
+  end
+
+  test "restart retains non-dispatched actions and fails closed if recovery cannot append", %{
+    root: root
+  } do
+    planned_path = Path.join(root, "planned-restart.jsonl")
+    planned_ledger = start_ledger(planned_path)
+    assert {:ok, planned, :new} = ActionLedger.plan(planned_ledger, intent())
+    GenServer.stop(planned_ledger)
+    recovered_planned = start_ledger(planned_path)
+    assert {:ok, %{state: :planned, id: planned_id}} = ActionLedger.get(recovered_planned, planned.id)
+    assert planned_id == planned.id
+
+    recovery_path = Path.join(root, "recovery-write-failure.jsonl")
+    recovery_ledger = start_ledger(recovery_path)
+
+    assert {:ok, dispatched, :new} =
+             ActionLedger.plan(recovery_ledger, intent(%{checkpoint: "recovery-write-failure"}))
+
+    assert {:ok, _} = ActionLedger.transition(recovery_ledger, dispatched.id, :dispatched)
+    GenServer.stop(recovery_ledger)
+    File.chmod!(recovery_path, 0o444)
+
+    assert {:error, {{:ledger_recovery_write_failed, :eacces}, _child}} =
+             start_ledger_result(recovery_path)
+  end
+
+  test "stalled-goal resume fails closed when its durable transition cannot be written", %{
+    root: root
+  } do
+    path = Path.join([root, "resume-write-failure", "ledger.jsonl"])
+    ledger = start_ledger(path)
+
+    stalled =
+      intent(%{
+        checkpoint: "resume-write-failure",
+        kind: :task_messaging,
+        blocker_classification: "goal.stalled",
+        resume_condition: "decision.ready"
+      })
+
+    assert {:ok, action, :new} = ActionLedger.plan(ledger, stalled)
+    assert {:ok, _} = ActionLedger.transition(ledger, action.id, :needs_input)
+    sabotage_ledger_path(path)
+    assert {:error, :enotdir} = ActionLedger.resume_goal(ledger, action.id, "decision.ready")
   end
 
   test "adapter error paths never leak an unrecorded effect", %{root: root} do
@@ -550,6 +606,62 @@ defmodule SymphonyElixir.ActionLedgerTest do
              )
 
     assert satisfied.state == :already_satisfied
+  end
+
+  test "adapter reports every durable postcondition failure", %{root: root} do
+    obsolete_path = Path.join([root, "obsolete-write", "ledger.jsonl"])
+    obsolete_ledger = start_ledger(obsolete_path)
+    obsolete = intent(%{checkpoint: "obsolete-write"})
+    assert {:ok, _action, :new} = ActionLedger.plan(obsolete_ledger, obsolete)
+    sabotage_ledger_path(obsolete_path)
+
+    assert {:error, {:failure_record_failed, :enotdir, :expired}} =
+             CoordinationAdapter.dispatch(
+               obsolete_ledger,
+               obsolete,
+               fn -> {:ok, :never, %{}} end,
+               now: ~U[2026-08-31 00:00:01Z],
+               precondition: fn -> {:error, :expired} end
+             )
+
+    success_path = Path.join([root, "success-write", "ledger.jsonl"])
+    success_ledger = start_ledger(success_path)
+
+    assert {:error, {:postcondition_record_failed, :enotdir}, :effect_result} =
+             CoordinationAdapter.dispatch(
+               success_ledger,
+               intent(%{checkpoint: "success-write"}),
+               fn ->
+                 sabotage_ledger_path(success_path)
+                 {:ok, :effect_result, %{"disposition" => "ran"}}
+               end
+             )
+
+    satisfied_path = Path.join([root, "satisfied-write", "ledger.jsonl"])
+    satisfied_ledger = start_ledger(satisfied_path)
+
+    assert {:error, {:postcondition_record_failed, :enotdir}} =
+             CoordinationAdapter.dispatch(
+               satisfied_ledger,
+               intent(%{checkpoint: "satisfied-write"}),
+               fn ->
+                 sabotage_ledger_path(satisfied_path)
+                 {:already_satisfied, %{"disposition" => "exists"}}
+               end
+             )
+
+    failure_path = Path.join([root, "failure-write", "ledger.jsonl"])
+    failure_ledger = start_ledger(failure_path)
+
+    assert {:error, {:failure_record_failed, :enotdir, :provider_failed}} =
+             CoordinationAdapter.dispatch(
+               failure_ledger,
+               intent(%{checkpoint: "failure-write"}),
+               fn ->
+                 sabotage_ledger_path(failure_path)
+                 {:error, :provider_failed, :retryable_failure}
+               end
+             )
   end
 
   defp start_ledger(path, opts \\ []) do
@@ -613,5 +725,12 @@ defmodule SymphonyElixir.ActionLedgerTest do
   defp reach_state(ledger, action, :needs_input) do
     {:ok, action} = ActionLedger.transition(ledger, action.id, :needs_input)
     action
+  end
+
+  defp sabotage_ledger_path(path) do
+    state_dir = Path.dirname(path)
+    backup_dir = state_dir <> "-backup"
+    File.rename!(state_dir, backup_dir)
+    File.write!(state_dir, "occupied")
   end
 end

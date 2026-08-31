@@ -493,9 +493,8 @@ defmodule SymphonyElixir.ActionLedger do
 
   defp persist(path, action) do
     with :ok <- File.mkdir_p(Path.dirname(path)),
-         {:ok, encoded} <- Jason.encode(encode_action(action)),
-         :ok <- File.write(path, encoded <> "\n", [:append, :sync]) do
-      :ok
+         {:ok, encoded} <- Jason.encode(encode_action(action)) do
+      File.write(path, encoded <> "\n", [:append, :sync])
     end
   end
 
