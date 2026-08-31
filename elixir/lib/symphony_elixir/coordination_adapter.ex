@@ -11,6 +11,12 @@ defmodule SymphonyElixir.CoordinationAdapter do
   alias SymphonyElixir.ActionLedger
   alias SymphonyElixir.ActionLedger.Action
 
+  # The legacy unledgered path exists only for older unit tests that exercise
+  # the orchestrator in isolation. It is compiled out of releases and must be
+  # explicitly enabled by the test support fixture; production can never use
+  # it as an accidental ledger opt-out.
+  @test_environment Mix.env() == :test
+
   @type dispatch_result(result) ::
           {:ok, result, Action.t() | nil}
           | {:already_satisfied, Action.t()}
@@ -23,15 +29,20 @@ defmodule SymphonyElixir.CoordinationAdapter do
 
   @spec dispatch(GenServer.server() | nil, ActionLedger.intent(), (-> term()), keyword()) ::
           dispatch_result(term())
-  def dispatch(nil, _intent, effect_fun, _opts) when is_function(effect_fun, 0) do
-    case effect_fun.() do
-      {:ok, result, _effect} -> {:ok, result, nil}
-      {:error, reason, _disposition} -> {:error, reason}
-      other -> {:error, {:coordination_effect_invalid, other}}
+  # A missing ledger is never an implicit opt-out for a mutating effect. A
+  # legacy disabled runtime must not bypass intent persistence, idempotency,
+  # preflight, and recovery by invoking the callback directly.
+  def dispatch(nil, _intent, effect_fun, _opts) do
+    if @test_environment and
+         Application.get_env(:symphony_elixir, :test_allow_unledgered_coordination_effects, false) do
+      dispatch_unledgered_for_test(effect_fun)
+    else
+      {:error, :action_ledger_required}
     end
   end
 
-  def dispatch(ledger, intent, effect_fun, opts) when is_function(effect_fun, 0) do
+  def dispatch(ledger, intent, effect_fun, opts)
+      when not is_nil(ledger) and is_function(effect_fun, 0) do
     case ActionLedger.plan(ledger, intent) do
       {:ok, %Action{state: state} = action, :existing}
       when state in [:succeeded, :already_satisfied] ->
@@ -53,6 +64,16 @@ defmodule SymphonyElixir.CoordinationAdapter do
         {:error, reason}
     end
   end
+
+  defp dispatch_unledgered_for_test(effect_fun) when is_function(effect_fun, 0) do
+    case effect_fun.() do
+      {:ok, result, _effect} -> {:ok, result, nil}
+      {:error, reason, _disposition} -> {:error, reason}
+      other -> {:error, {:coordination_effect_invalid, other}}
+    end
+  end
+
+  defp dispatch_unledgered_for_test(_effect_fun), do: {:error, :action_ledger_required}
 
   defp prepare(%Action{state: :planned} = action, _disposition, _ledger, _opts), do: {:ok, action}
 

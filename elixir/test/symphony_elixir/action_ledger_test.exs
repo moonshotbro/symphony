@@ -871,12 +871,17 @@ defmodule SymphonyElixir.ActionLedgerTest do
   test "adapter error paths never leak an unrecorded effect", %{root: root} do
     nil_ledger_intent = intent()
 
-    assert {:error, :known_failure} =
+    ref = make_ref()
+
+    assert {:error, :action_ledger_required} =
              CoordinationAdapter.dispatch(nil, nil_ledger_intent, fn ->
-               {:error, :known_failure, :retryable_failure}
+               send(self(), {:unexpected_effect, ref})
+               {:ok, :never, %{}}
              end)
 
-    assert {:error, {:coordination_effect_invalid, :bad_result}} =
+    refute_received {:unexpected_effect, ^ref}
+
+    assert {:error, :action_ledger_required} =
              CoordinationAdapter.dispatch(nil, nil_ledger_intent, fn -> :bad_result end)
 
     ledger_path = Path.join([root, "adapter-errors", "ledger.jsonl"])
@@ -918,6 +923,46 @@ defmodule SymphonyElixir.ActionLedgerTest do
              )
 
     assert satisfied.state == :already_satisfied
+  end
+
+  test "a disabled ledger rejects coordination before invoking the effect", %{path: path} do
+    ledger = start_ledger(path, enabled: false)
+    ref = make_ref()
+
+    assert {:error, :action_ledger_disabled} =
+             CoordinationAdapter.dispatch(ledger, intent(), fn ->
+               send(self(), {:unexpected_effect, ref})
+               {:ok, :never, %{}}
+             end)
+
+    refute_received {:unexpected_effect, ^ref}
+  end
+
+  test "test-only unledgered compatibility is explicit and preserves result validation" do
+    previous = Application.get_env(:symphony_elixir, :test_allow_unledgered_coordination_effects)
+    Application.put_env(:symphony_elixir, :test_allow_unledgered_coordination_effects, true)
+
+    on_exit(fn ->
+      if is_nil(previous) do
+        Application.delete_env(:symphony_elixir, :test_allow_unledgered_coordination_effects)
+      else
+        Application.put_env(:symphony_elixir, :test_allow_unledgered_coordination_effects, previous)
+      end
+    end)
+
+    assert {:ok, :result, nil} =
+             CoordinationAdapter.dispatch(nil, intent(), fn -> {:ok, :result, %{}} end)
+
+    assert {:error, :known_failure} =
+             CoordinationAdapter.dispatch(nil, intent(), fn ->
+               {:error, :known_failure, :retryable_failure}
+             end)
+
+    assert {:error, {:coordination_effect_invalid, :bad_result}} =
+             CoordinationAdapter.dispatch(nil, intent(), fn -> :bad_result end)
+
+    assert {:error, :action_ledger_required} =
+             CoordinationAdapter.dispatch(nil, intent(), :not_a_function)
   end
 
   test "adapter reports every durable postcondition failure", %{root: root} do

@@ -1,8 +1,13 @@
 # Durable coordination action ledger
 
-The optional action ledger is Symphony's fail-closed boundary for mutating coordination. It extends
-the existing orchestrator; it does not poll trackers, schedule work, own claims, or replace the
-retry queue. It is disabled by default.
+The action ledger is Symphony's fail-closed boundary for mutating coordination. It extends the
+existing orchestrator; it does not poll trackers, schedule work, own claims, or replace the retry
+queue. A production runtime must provide a durable ledger; a missing or disabled ledger rejects
+every mutating coordination effect before its callback can run.
+
+The only exception is the test fixture's compile-time test build, which may explicitly enable a
+test-only unledgered compatibility path for isolated legacy orchestrator tests. That fixture is not
+available in release builds and is never enabled by production configuration.
 
 ## Configuration
 
@@ -14,7 +19,9 @@ action_ledger:
 
 An enabled ledger requires an explicit durable path. A relative path resolves from the directory
 containing `WORKFLOW.md`. Startup fails when the file is unreadable, malformed, truncated, or
-cannot be recovered. With the feature disabled, the runtime and dispatch path remain unchanged.
+cannot be recovered. With the ledger disabled or unavailable, the runtime may continue to expose
+read-only state, but mutating dispatch fails closed with `action_ledger_required` or
+`action_ledger_disabled`; no worker, message, automation, fork, or handoff effect is invoked.
 
 ## Action envelope
 
