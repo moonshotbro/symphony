@@ -45,6 +45,7 @@ defmodule SymphonyElixir.Orchestrator do
       :tick_token,
       :action_ledger,
       :action_inspector,
+      :worker_starter,
       task_supervisor: SymphonyElixir.TaskSupervisor,
       running: %{},
       completed: MapSet.new(),
@@ -79,6 +80,7 @@ defmodule SymphonyElixir.Orchestrator do
           task_supervisor: Keyword.get(opts, :task_supervisor, SymphonyElixir.TaskSupervisor),
           action_ledger: Keyword.get(opts, :action_ledger),
           action_inspector: Keyword.get(opts, :action_inspector, &RecoveryInspector.inspect/1),
+          worker_starter: Keyword.get(opts, :worker_starter, &default_worker_starter/5),
           claimed:
             recovered_action_claims(
               Keyword.get(opts, :action_ledger),
@@ -1031,11 +1033,15 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp start_issue_worker(state, issue, attempt, recipient, worker_host) do
+    state.worker_starter.(state.task_supervisor, issue, attempt, recipient, worker_host)
+  end
+
+  defp default_worker_starter(task_supervisor, issue, attempt, recipient, worker_host) do
     task_fun = fn ->
       AgentRunner.run(issue, recipient, attempt: attempt, worker_host: worker_host)
     end
 
-    case Task.Supervisor.start_child(state.task_supervisor, task_fun) do
+    case Task.Supervisor.start_child(task_supervisor, task_fun) do
       {:ok, pid} ->
         {:ok, pid,
          %{

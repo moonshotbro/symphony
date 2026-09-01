@@ -18,7 +18,7 @@ defmodule SymphonyElixir.ActionLedger do
   @source_keys ~w(goal_id task_id issue_id issue_identifier repository revision session_id review_source reviewer review_fingerprint review_checks)
   @target_keys ~w(type id host project worker_host)
   @effect_keys ~w(thread_id turn_id automation_id fork_thread_id destination_thread_id worktree_id revision session_id session_correlation_id worker_host host_assertion disposition workspace_key)
-  @inspection_keys ~w(provider authoritative exists session_id workspace_key revision disposition)
+  @inspection_keys ~w(provider authoritative exists session_id session_correlation_id workspace_key revision disposition)
   @identity_keys ~w(goal_id task_id issue_id issue_identifier repository revision session_id)
   @target_identity_keys ~w(type id host project worker_host)
   @effect_identity_keys ~w(thread_id turn_id automation_id fork_thread_id destination_thread_id worktree_id revision session_id session_correlation_id worker_host workspace_key)
