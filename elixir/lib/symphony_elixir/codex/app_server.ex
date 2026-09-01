@@ -4,7 +4,7 @@ defmodule SymphonyElixir.Codex.AppServer do
   """
 
   require Logger
-  alias SymphonyElixir.{Codex.DynamicTool, Config, PathSafety, SSH}
+  alias SymphonyElixir.{Codex.DynamicTool, Codex.TaskLaunchContract, Config, PathSafety, SSH}
 
   @initialize_id 1
   @thread_start_id 2
@@ -45,13 +45,14 @@ defmodule SymphonyElixir.Codex.AppServer do
     worker_host = Keyword.get(opts, :worker_host)
     dynamic_tool_binding = DynamicTool.bind()
 
-    with {:ok, expanded_workspace} <- validate_workspace_cwd(workspace, worker_host),
+    with :ok <- validate_launch_contract(Keyword.get(opts, :task_contract)),
+         {:ok, expanded_workspace} <- validate_workspace_cwd(workspace, worker_host),
          {:ok, port} <- start_port(expanded_workspace, worker_host, dynamic_tool_binding) do
       metadata = port_metadata(port, worker_host)
 
       with {:ok, session_policies} <- session_policies(expanded_workspace, worker_host),
            {:ok, thread_id} <-
-             do_start_session(port, expanded_workspace, session_policies, dynamic_tool_binding) do
+             do_start_session(port, expanded_workspace, session_policies, dynamic_tool_binding, Keyword.get(opts, :task_contract)) do
         {:ok,
          %{
            port: port,
@@ -457,9 +458,9 @@ defmodule SymphonyElixir.Codex.AppServer do
     Config.codex_runtime_settings(workspace, remote: true)
   end
 
-  defp do_start_session(port, workspace, session_policies, dynamic_tool_binding) do
+  defp do_start_session(port, workspace, session_policies, dynamic_tool_binding, contract) do
     case send_initialize(port) do
-      :ok -> start_thread(port, workspace, session_policies, dynamic_tool_binding)
+      :ok -> start_thread(port, workspace, session_policies, dynamic_tool_binding, contract)
       {:error, reason} -> {:error, reason}
     end
   end
@@ -468,7 +469,8 @@ defmodule SymphonyElixir.Codex.AppServer do
          port,
          workspace,
          %{approval_policy: approval_policy, thread_sandbox: thread_sandbox},
-         dynamic_tool_binding
+         dynamic_tool_binding,
+         _contract
        ) do
     send_message(port, %{
       "method" => "thread/start",
@@ -492,6 +494,17 @@ defmodule SymphonyElixir.Codex.AppServer do
         other
     end
   end
+
+  defp validate_launch_contract(nil), do: :ok
+
+  defp validate_launch_contract(contract) when is_map(contract) do
+    case TaskLaunchContract.compile(contract) do
+      {:ok, _compiled} -> :ok
+      {:error, errors} -> {:error, {:invalid_task_launch_contract, errors}}
+    end
+  end
+
+  defp validate_launch_contract(_), do: {:error, :invalid_task_launch_contract}
 
   defp start_turn(port, thread_id, prompt, issue, workspace, approval_policy, turn_sandbox_policy) do
     send_message(port, %{

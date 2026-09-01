@@ -286,10 +286,10 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
           project["saved_project_id"] == project["native_project_id"] ->
             {:error, [:project_namespaces_must_be_distinct]}
 
-          not Regex.match?(~r/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/, project["saved_project_id"]) ->
+          not uuid?(project["saved_project_id"]) ->
             {:error, [:invalid_saved_project_id]}
 
-          not Regex.match?(~r/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/, project["native_project_id"]) ->
+          not uuid?(project["native_project_id"]) ->
             {:error, [:invalid_native_project_id]}
 
           project["repository"] == "" ->
@@ -404,6 +404,8 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
   defp blank?(_), do: false
   defp absolute_root?(root) when is_binary(root), do: Path.type(root) == :absolute
   defp absolute_root?(_), do: false
+  defp uuid?(value) when is_binary(value), do: Regex.match?(~r/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/, value)
+  defp uuid?(_), do: false
   defp stringify_keys(map), do: Map.new(map, fn {key, value} -> {to_string(key), value} end)
   defp safe_key(key) when is_atom(key), do: Atom.to_string(key)
   defp safe_key(key) when is_binary(key), do: key

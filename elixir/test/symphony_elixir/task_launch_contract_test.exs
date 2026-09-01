@@ -70,6 +70,10 @@ defmodule SymphonyElixir.Codex.TaskLaunchContractTest do
     assert {:error, errors} = TaskLaunchContract.compile(%{valid_attrs() | dependencies: %{}, evidence: 1})
     assert :invalid_dependencies in errors
     assert :invalid_evidence in errors
+
+    assert {:error, [:ambiguous_contract_keys]} = TaskLaunchContract.compile(Map.put(valid_attrs(), self(), "bad"))
+    assert {:error, _} = TaskLaunchContract.compile(put_in(valid_attrs(), [:project, :saved_project_id], 42))
+    assert {:error, _} = TaskLaunchContract.compile(put_in(valid_attrs(), [:project, :root], {:bad, :root}))
   end
 
   defp valid_attrs do
