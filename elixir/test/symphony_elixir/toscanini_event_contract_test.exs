@@ -8,7 +8,7 @@ defmodule SymphonyElixir.Toscanini.EventContractTest do
     %{
       specversion: "1.0",
       id: id,
-      source: "urn:test",
+      source: "urn:sysmiq:worker:w1",
       type: "sysmiq.work.#{name}.v1",
       subject: "github:moonshotbro/symphony#51",
       dataschema: "urn:sysmiq:test:1",
@@ -21,7 +21,7 @@ defmodule SymphonyElixir.Toscanini.EventContractTest do
         causation_id: from,
         sender: %{kind: "worker", id: "w1", role: "implementation"},
         recipient: %{kind: "role", id: "programme", role: "programme"},
-        authority_ref: %{repository: "moonshotbro/symphony", issue: 51},
+        authority_ref: %{repository: "moonshotbro/symphony", issue: 51, expected_revision: "abc1234"},
         identity: %{programme: "p1", repo: "moonshotbro/symphony", issue: 51, pr: nil, role: "implementation", task: "t1", attempt: 0, fence: 1, idempotency: "i-#{id}", exact_revision: "abc1234"},
         lifecycle: %{state: name},
         evidence: %{refs: []},

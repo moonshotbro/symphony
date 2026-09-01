@@ -267,25 +267,37 @@ defmodule SymphonyElixir.Toscanini.EventContract do
     if e.id == data.message_id and e.correlation_id == data.correlation_id and
          e.causation_id == data.causation_id and
          authority_matches?(e.subject, data.authority_ref) and
-         identity_authority_matches?(data.identity, data.authority_ref), do: :ok, else: {:error, :identity_mismatch}
+         identity_authority_matches?(data.identity, data.authority_ref) and source_matches?(e.source, data.sender), do: :ok, else: {:error, :identity_mismatch}
   end
 
   defp authority_subject(%{repository: repo, issue: issue}), do: "github:#{repo}##{issue}"
   defp authority_subject(_), do: nil
   defp authority_matches?(_subject, authority) when not is_map(authority), do: false
   defp authority_matches?(subject, authority), do: subject == authority_subject(authority) or subject == "github:" <> to_string(authority[:repository]) <> "#" <> to_string(authority[:issue])
-  defp identity_authority_matches?(%{repo: repo, issue: issue}, %{repository: repo, issue: issue}), do: true
+
+  defp identity_authority_matches?(%{repo: repo, issue: issue, pr: pr, exact_revision: revision}, %{repository: repo, issue: issue} = authority),
+    do: pr == Map.get(authority, :pr) and revision == Map.get(authority, :expected_revision)
+
   defp identity_authority_matches?(_, _), do: false
+  defp source_matches?(source, %{kind: kind, id: id}), do: source == "urn:sysmiq:#{kind}:#{id}"
+  defp source_matches?(_, _), do: false
 
   defp evidence_valid?(%{refs: refs}) when is_list(refs) and length(refs) <= 32 do
     Enum.all?(refs, fn ref ->
       is_map(ref) and object_keys?(ref, ["url", "digest", "kind"]) and
-        reference_url?(ref[:url]) and (is_nil(ref[:digest]) or digest?(ref[:digest])) and
+        reference_url?(ref[:url]) and evidence_target?(ref[:url], ref[:kind]) and (is_nil(ref[:digest]) or digest?(ref[:digest])) and
         (is_nil(ref[:kind]) or ref[:kind] in ["github_issue", "github_pr", "commit", "check", "review"]) and bounded?(ref)
     end)
   end
 
   defp evidence_valid?(_), do: false
+
+  defp evidence_target?(url, kind) do
+    path = URI.parse(url).path || ""
+    kind in ["github_issue", "github_pr"] and String.starts_with?(path, "/moonshotbro/sysmiq-symphony/")
+  rescue
+    _ -> false
+  end
 
   defp reference_url?(url) when is_binary(url) do
     uri = URI.parse(url)
@@ -357,8 +369,9 @@ defmodule SymphonyElixir.Toscanini.EventContract do
   defp unsafe_value?(value) when is_binary(value) do
     down = String.downcase(value)
 
-    String.contains?(value, ["/Users/", "/home/", "BEGIN "]) or
-      String.contains?(down, ["bearer ", "token=", "password=", "secret="])
+    String.contains?(value, ["/Users/", "/home/", "/tmp/", "~/", "BEGIN ", "file://", "\\\\"]) or
+      String.match?(value, ~r{(?i)^[A-Z]:[\\/]}) or String.match?(value, ~r{(?i)^[^/\s:]+@[^:]+:.+}) or
+      String.contains?(down, ["bearer ", "authorization:", "token=", "password=", "secret=", "api_key=", "private_key"])
   end
 
   defp unsafe_value?(_), do: false
