@@ -102,6 +102,8 @@ defmodule SymphonyElixir.Toscanini.EventContract do
          :ok <- validate_privacy(envelope.data) do
       :ok
     end
+  rescue
+    _ -> {:error, :malformed_envelope}
   end
 
   def validate(_), do: {:error, :malformed_envelope}
@@ -246,7 +248,7 @@ defmodule SymphonyElixir.Toscanini.EventContract do
          object_keys?(data.identity, ["programme", "repo", "issue", "pr", "role", "task", "attempt", "fence", "idempotency", "exact_revision"]) and
          object_keys?(data.lifecycle, ["state", "terminal_reason", "blocking_reason", "requested_action"]) and
          object_keys?(data.delivery, ["idempotency_key", "sequence"]) and
-         object_keys?(data.evidence, ["refs"]) and evidence_valid?(data.evidence) and
+         object_keys?(data.evidence, ["refs"]) and evidence_valid?(data.evidence, data.identity, data.authority_ref) and
          object_keys?(data.privacy, ["classification", "retention", "redacted"]), do: validate_types(data), else: {:error, :malformed_data}
   end
 
@@ -275,26 +277,33 @@ defmodule SymphonyElixir.Toscanini.EventContract do
   defp authority_matches?(_subject, authority) when not is_map(authority), do: false
   defp authority_matches?(subject, authority), do: subject == authority_subject(authority) or subject == "github:" <> to_string(authority[:repository]) <> "#" <> to_string(authority[:issue])
 
-  defp identity_authority_matches?(%{repo: repo, issue: issue, pr: pr, exact_revision: revision}, %{repository: repo, issue: issue} = authority),
-    do: pr == Map.get(authority, :pr) and revision == Map.get(authority, :expected_revision)
+  defp identity_authority_matches?(identity, authority), do: authority_valid?(authority, identity)
 
-  defp identity_authority_matches?(_, _), do: false
   defp source_matches?(source, %{kind: kind, id: id}), do: source == "urn:sysmiq:#{kind}:#{id}"
   defp source_matches?(_, _), do: false
 
-  defp evidence_valid?(%{refs: refs}) when is_list(refs) and length(refs) <= 32 do
+  defp evidence_valid?(%{refs: refs}, identity, authority) when is_list(refs) do
+    if not proper_list?(refs) or length(refs) > 32, do: false, else: evidence_entries_valid?(refs, identity, authority)
+  end
+
+  defp evidence_valid?(_, _, _), do: false
+
+  defp evidence_entries_valid?(refs, identity, authority) do
     Enum.all?(refs, fn ref ->
       is_map(ref) and object_keys?(ref, ["url", "digest", "kind"]) and
-        reference_url?(ref[:url]) and evidence_target?(ref[:url], ref[:kind]) and (is_nil(ref[:digest]) or digest?(ref[:digest])) and
-        (is_nil(ref[:kind]) or ref[:kind] in ["github_issue", "github_pr", "commit", "check", "review"]) and bounded?(ref)
+        reference_url?(ref[:url]) and evidence_target?(ref[:url], ref[:kind], identity, authority) and (is_nil(ref[:digest]) or digest?(ref[:digest])) and
+        (is_nil(ref[:kind]) or ref[:kind] in ["issue", "pull_request", "commit", "check", "review"]) and bounded?(ref)
     end)
   end
 
-  defp evidence_valid?(_), do: false
-
-  defp evidence_target?(url, kind) do
+  defp evidence_target?(url, kind, identity, _authority) do
     path = URI.parse(url).path || ""
-    kind in ["github_issue", "github_pr"] and String.starts_with?(path, "/moonshotbro/sysmiq-symphony/")
+    prefix = "/" <> identity.repo <> "/"
+
+    (kind == "issue" and path == prefix <> "issues/" <> to_string(identity.issue)) or
+      (kind == "pull_request" and identity.pr != nil and path == prefix <> "pull/" <> to_string(identity.pr)) or
+      (kind == "commit" and path == prefix <> "commit/" <> identity.exact_revision) or
+      (kind in ["check", "review"] and identity.pr != nil and path == prefix <> "pull/" <> to_string(identity.pr))
   rescue
     _ -> false
   end
@@ -316,8 +325,12 @@ defmodule SymphonyElixir.Toscanini.EventContract do
   defp bounded?(_, depth) when depth > @limits.depth, do: false
   defp bounded?(value, _depth) when is_binary(value), do: byte_size(value) <= @limits.string
   defp bounded?(value, depth) when is_map(value), do: map_size(value) <= @limits.entries and Enum.all?(value, fn {k, v} -> bounded?(k, depth + 1) and bounded?(v, depth + 1) end)
-  defp bounded?(value, depth) when is_list(value), do: length(value) <= @limits.list and Enum.all?(value, &bounded?(&1, depth + 1))
+  defp bounded?(value, depth) when is_list(value), do: proper_list?(value) and length(value) <= @limits.list and Enum.all?(value, &bounded?(&1, depth + 1))
   defp bounded?(_, _), do: true
+  defp proper_list?(value), do: proper_list?(value, 0)
+  defp proper_list?([], _), do: true
+  defp proper_list?([_ | tail], depth) when depth <= @limits.list, do: proper_list?(tail, depth + 1)
+  defp proper_list?(_, _), do: false
 
   defp validate_types(data) do
     privacy = data.privacy
@@ -346,7 +359,7 @@ defmodule SymphonyElixir.Toscanini.EventContract do
 
   defp authority_valid?(a, i),
     do:
-      is_map(a) and is_binary(a.repository) and a.repository == i.repo and a.issue == i.issue and
+      is_map(a) and object_keys?(a, ["repository", "issue", "pr", "url", "expected_revision"]) and is_binary(a.repository) and a.repository == i.repo and is_integer(a.issue) and a.issue == i.issue and
         (is_nil(Map.get(a, :pr)) or Map.get(a, :pr) == i.pr) and
         (is_nil(Map.get(a, :expected_revision)) or Map.get(a, :expected_revision) == i.exact_revision)
 
