@@ -27,6 +27,8 @@ defmodule SymphonyElixir.RecoveryInspectorTest do
              )
 
     assert evidence.authoritative and evidence.exists
+    assert evidence.session_id == "thread-1-turn-1"
+    assert evidence.session_correlation_id == evidence.session_id
     assert evidence.disposition == "codex_thread_read_exact_match"
   end
 

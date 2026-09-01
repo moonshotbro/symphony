@@ -23,6 +23,9 @@ defmodule SymphonyElixir.Codex.RecoveryInspector do
          provider: "codex",
          authoritative: true,
          exists: true,
+         # ActionLedger's postcondition contract names this derived correlation
+         # `session_id`; retain the explicit name below for audit readability.
+         session_id: correlation.session_correlation_id,
          session_correlation_id: correlation.session_correlation_id,
          workspace_key: correlation.workspace_key,
          disposition: "codex_thread_read_exact_match"

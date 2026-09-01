@@ -2,6 +2,7 @@ defmodule SymphonyElixir.ActionLedgerIntegrationTest do
   use SymphonyElixir.TestSupport
 
   alias SymphonyElixir.ActionLedger
+  alias SymphonyElixir.Codex.RecoveryInspector
   alias SymphonyElixir.Config.Schema
 
   test "action ledger is disabled by default and preserves the existing runtime shape" do
@@ -123,6 +124,127 @@ defmodule SymphonyElixir.ActionLedgerIntegrationTest do
              snapshot.action_ledger.unresolved
 
     assert action_id == action.id
+  end
+
+  test "exact logged correlation settles legacy action then dispatches one revised issue through the poll loop" do
+    suffix = System.unique_integer([:positive])
+    root = Path.join(System.tmp_dir!(), "symphony-ledger-exact-recovery-#{suffix}")
+    ledger_path = Path.join(root, "actions.jsonl")
+    first_ledger = Module.concat(__MODULE__, "ExactFirstLedger#{suffix}")
+    recovered_ledger = Module.concat(__MODULE__, "ExactRecoveredLedger#{suffix}")
+    orchestrator = Module.concat(__MODULE__, "ExactRecoveryOrchestrator#{suffix}")
+    task_supervisor = Module.concat(__MODULE__, "ExactRecoveryTasks#{suffix}")
+    issue_id = "issue-exact-recovery-#{suffix}"
+    parent = self()
+
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory", poll_interval_ms: 60_000)
+
+    stale_intent = %{
+      kind: :task_creation,
+      source: %{issue_id: issue_id, issue_identifier: "REC-#{suffix}", repository: "github.example/sysmiq/repo", revision: "stale"},
+      target: %{type: "codex_task", worker_host: "local"},
+      purpose: "orchestrator.dispatch.attempt.0",
+      checkpoint: "stale",
+      expected_postcondition: "codex.session_observed",
+      policy_fingerprint: ActionLedger.policy_fingerprint("exact-recovery-test")
+    }
+
+    {:ok, first_pid} = ActionLedger.start_link(name: first_ledger, path: ledger_path, enabled: true)
+    assert {:ok, stale_action, :new} = ActionLedger.plan(first_ledger, stale_intent)
+    assert {:ok, _} = ActionLedger.transition(first_ledger, stale_action.id, :dispatched)
+    GenServer.stop(first_pid)
+
+    {:ok, _recovered_pid} = ActionLedger.start_link(name: recovered_ledger, path: ledger_path, enabled: true)
+
+    assert {:ok, _} =
+             ActionLedger.observe_effect(recovered_ledger, stale_action.id, %{
+               "thread_id" => "thread-#{suffix}",
+               "turn_id" => "turn-#{suffix}",
+               "session_correlation_id" => "thread-#{suffix}-turn-#{suffix}",
+               "workspace_key" => "REC-#{suffix}",
+               "host_assertion" => %{"type" => "worker_host", "value" => "local"}
+             })
+
+    File.mkdir_p!(Path.join(root, "workspaces/REC-#{suffix}"))
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      poll_interval_ms: 60_000,
+      workspace_root: Path.join(root, "workspaces")
+    )
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "REC-#{suffix}",
+      title: "Revised recovery candidate",
+      url: "https://github.example/sysmiq/repo/issues/#{suffix}",
+      state: "Todo",
+      dispatchable: true,
+      updated_at: ~U[2026-09-01 00:00:00Z]
+    }
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+    {:ok, _tasks} = Task.Supervisor.start_link(name: task_supervisor)
+
+    thread_id = "thread-#{suffix}"
+    turn_id = "turn-#{suffix}"
+    session_id = "#{thread_id}-#{turn_id}"
+
+    inspector = fn action ->
+      RecoveryInspector.inspect(action,
+        thread_reader: fn actual_thread_id, workspace, _opts ->
+          if actual_thread_id == thread_id do
+            {:ok, %{"id" => thread_id, "cwd" => workspace, "turns" => [%{"id" => turn_id}]}}
+          else
+            {:error, :thread_not_found}
+          end
+        end
+      )
+    end
+
+    starter = fn supervisor, started_issue, _attempt, _recipient, _host ->
+      send(parent, {:worker_started, started_issue.id})
+
+      with {:ok, pid} <- Task.Supervisor.start_child(supervisor, fn -> Process.sleep(:infinity) end) do
+        {:ok, pid, %{"worker_host" => nil, "workspace_key" => Workspace.workspace_key(started_issue)}}
+      end
+    end
+
+    assert {:ok, exact_action} = ActionLedger.get(recovered_ledger, stale_action.id)
+    assert {:ok, %{session_id: ^session_id}} = inspector.(exact_action)
+
+    {:ok, _runtime} =
+      Orchestrator.start_link(
+        name: orchestrator,
+        action_ledger: recovered_ledger,
+        action_inspector: inspector,
+        task_supervisor: task_supervisor,
+        worker_starter: starter
+      )
+
+    recovered_state = :sys.get_state(orchestrator)
+    refute MapSet.member?(recovered_state.claimed, issue_id)
+    assert {:ok, settled} = ActionLedger.get(recovered_ledger, stale_action.id)
+    assert settled.state == :already_satisfied
+    send(orchestrator, :run_poll_cycle)
+    assert_receive {:worker_started, ^issue_id}, 1_000
+
+    send(orchestrator, :run_poll_cycle)
+    refute_receive {:worker_started, ^issue_id}, 100
+
+    on_exit(fn ->
+      for name <- [orchestrator, recovered_ledger, task_supervisor] do
+        if pid = Process.whereis(name) do
+          try do
+            GenServer.stop(pid)
+          catch
+            :exit, _reason -> :ok
+          end
+        end
+      end
+
+      File.rm_rf(root)
+    end)
   end
 
   test "configuration requires an explicit durable path when enabling the ledger" do
