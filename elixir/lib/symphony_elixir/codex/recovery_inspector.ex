@@ -98,13 +98,18 @@ defmodule SymphonyElixir.Codex.RecoveryInspector do
 
   defp unique_legacy_zero_turn(_threads, _workspace), do: {:error, :legacy_thread_list_invalid}
 
-  defp legacy_zero_turn?(thread, workspace) when is_map(thread) do
+  defp legacy_zero_turn?(%{"id" => thread_id} = thread, workspace)
+       when is_binary(thread_id) and thread_id != "" do
     status = thread["status"]
     turns = thread["turns"]
 
     thread["cwd"] == workspace and
       status in ["notLoaded", %{"type" => "notLoaded"}] and
-      match?([%{"status" => "interrupted", "items" => []}], turns) and
+      match?(
+        [%{"id" => turn_id, "status" => "interrupted", "itemsView" => "full", "items" => []}]
+        when is_binary(turn_id) and turn_id != "",
+        turns
+      ) and
       zero_usage?(thread) and Enum.all?(turns, &zero_usage?/1)
   end
 
@@ -112,8 +117,7 @@ defmodule SymphonyElixir.Codex.RecoveryInspector do
 
   defp zero_usage?(record) when is_map(record) do
     case record["usage"] || record["tokenUsage"] do
-      nil -> true
-      usage when is_map(usage) -> Enum.all?(Map.values(usage), &(&1 in [0, nil]))
+      usage when is_map(usage) and map_size(usage) > 0 -> Enum.all?(Map.values(usage), &(&1 == 0))
       _ -> false
     end
   end

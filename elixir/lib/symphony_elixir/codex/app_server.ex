@@ -647,7 +647,7 @@ defmodule SymphonyElixir.Codex.AppServer do
         "cursor" => cursor,
         "limit" => @thread_turns_page_size,
         "sortDirection" => "desc",
-        "itemsView" => "notLoaded"
+        "itemsView" => "full"
       }
     })
 

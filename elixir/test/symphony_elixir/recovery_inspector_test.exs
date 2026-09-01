@@ -163,7 +163,16 @@ defmodule SymphonyElixir.RecoveryInspectorTest do
     candidate = %{
       "id" => "thread-legacy",
       "status" => %{"type" => "notLoaded"},
-      "turns" => [%{"id" => "turn-legacy", "status" => "interrupted", "items" => [], "usage" => %{"totalTokens" => 0}}]
+      "usage" => %{"totalTokens" => 0},
+      "turns" => [
+        %{
+          "id" => "turn-legacy",
+          "status" => "interrupted",
+          "itemsView" => "full",
+          "items" => [],
+          "usage" => %{"totalTokens" => 0}
+        }
+      ]
     }
 
     assert {:ok, evidence} =
@@ -206,12 +215,65 @@ defmodule SymphonyElixir.RecoveryInspectorTest do
                thread_lister: fn actual_workspace, worker_host: nil -> {:ok, [Map.put(non_zero, "cwd", actual_workspace)]} end
              )
 
-    non_zero_usage = put_in(candidate, ["turns", Access.at(0), "usage", "totalTokens"], 1)
+    unloaded_items = put_in(candidate, ["turns", Access.at(0), "itemsView"], "notLoaded")
 
     assert {:error, :legacy_zero_turn_not_found} =
              RecoveryInspector.inspect(legacy_action(),
                thread_lister: fn actual_workspace, worker_host: nil ->
-                 {:ok, [Map.put(non_zero_usage, "cwd", actual_workspace)]}
+                 {:ok, [Map.put(unloaded_items, "cwd", actual_workspace)]}
+               end
+             )
+
+    missing_thread_usage = Map.delete(candidate, "usage")
+
+    assert {:error, :legacy_zero_turn_not_found} =
+             RecoveryInspector.inspect(legacy_action(),
+               thread_lister: fn actual_workspace, worker_host: nil ->
+                 {:ok, [Map.put(missing_thread_usage, "cwd", actual_workspace)]}
+               end
+             )
+
+    missing_turn_usage = update_in(candidate, ["turns", Access.at(0)], &Map.delete(&1, "usage"))
+
+    assert {:error, :legacy_zero_turn_not_found} =
+             RecoveryInspector.inspect(legacy_action(),
+               thread_lister: fn actual_workspace, worker_host: nil ->
+                 {:ok, [Map.put(missing_turn_usage, "cwd", actual_workspace)]}
+               end
+             )
+
+    assert {:error, :legacy_zero_turn_not_found} =
+             RecoveryInspector.inspect(legacy_action(),
+               thread_lister: fn actual_workspace, worker_host: nil ->
+                 empty_usage = put_in(candidate, ["turns", Access.at(0), "usage"], %{})
+                 {:ok, [Map.merge(empty_usage, %{"cwd" => actual_workspace, "usage" => %{}})]}
+               end
+             )
+
+    nonzero_usage = put_in(candidate, ["turns", Access.at(0), "usage", "totalTokens"], 1)
+
+    assert {:error, :legacy_zero_turn_not_found} =
+             RecoveryInspector.inspect(legacy_action(),
+               thread_lister: fn actual_workspace, worker_host: nil ->
+                 {:ok, [Map.put(nonzero_usage, "cwd", actual_workspace)]}
+               end
+             )
+
+    missing_thread_id = Map.delete(candidate, "id")
+
+    assert {:error, :legacy_zero_turn_not_found} =
+             RecoveryInspector.inspect(legacy_action(),
+               thread_lister: fn actual_workspace, worker_host: nil ->
+                 {:ok, [Map.put(missing_thread_id, "cwd", actual_workspace)]}
+               end
+             )
+
+    missing_turn_id = update_in(candidate, ["turns", Access.at(0)], &Map.delete(&1, "id"))
+
+    assert {:error, :legacy_zero_turn_not_found} =
+             RecoveryInspector.inspect(legacy_action(),
+               thread_lister: fn actual_workspace, worker_host: nil ->
+                 {:ok, [Map.put(missing_turn_id, "cwd", actual_workspace)]}
                end
              )
 
@@ -250,7 +312,7 @@ defmodule SymphonyElixir.RecoveryInspectorTest do
     assert {:error, :legacy_zero_turn_not_found} =
              RecoveryInspector.inspect(legacy_action(),
                thread_lister: fn actual_workspace, worker_host: nil ->
-                 {:ok, [:invalid, Map.merge(candidate, %{"cwd" => actual_workspace, "usage" => 1})]}
+                 {:ok, [:invalid, Map.merge(candidate, %{"cwd" => actual_workspace, "status" => "active"})]}
                end
              )
   end
