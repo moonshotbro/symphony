@@ -1620,6 +1620,43 @@ defmodule SymphonyElixir.AppServerTest do
     end
   end
 
+  test "null start project identity is never accepted as project-bound success" do
+    root = Path.join(System.tmp_dir!(), "symphony-null-project-wire-#{System.unique_integer([:positive])}")
+    workspace = Path.join(root, "workspaces/SYS-50")
+    binary = Path.join(root, "fake-codex")
+    File.mkdir_p!(workspace)
+
+    try do
+      File.write!(binary, """
+      #!/bin/sh
+      count=0
+      while IFS= read -r _line; do
+        count=$((count + 1))
+        case "$count" in
+          1) printf '%s\\n' '{"id":1,"result":{}}' ;;
+          2) ;;
+          3) printf '%s\\n' '{"id":2,"result":{"model":"gpt-5.6-terra","reasoningEffort":"medium","thread":{"id":"bound-thread","sessionId":"bound-session","projectId":null,"cwd":"WORKSPACE","ephemeral":false,"instructionSources":["project"]}}}' | sed "s|WORKSPACE|$PWD|" ;;
+          *) exit 19 ;;
+        esac
+      done
+      """)
+
+      File.chmod!(binary, 0o755)
+      write_workflow_file!(Workflow.workflow_file_path(), workspace_root: Path.join(root, "workspaces"), codex_command: "#{binary} app-server")
+
+      contract = %SymphonyElixir.Codex.TaskLaunchContract{
+        title: "Implementation SYS-50: bound",
+        executing_identity: %{model: :"gpt-5.6-terra", effort: :medium, role: :implementation, title: "Implementation SYS-50: bound"},
+        project: %{native_project_id: "01a04aab-c77c-79b0-ab09-65187353bb4b"}
+      }
+
+      issue = %Issue{id: "sys-50", identifier: "SYS-50", title: "bound", state: "In Progress"}
+      assert {:error, {:project_bound_thread_unverified, :native_project_mismatch}} = AppServer.run(workspace, "bound", issue, task_contract: contract)
+    after
+      File.rm_rf(root)
+    end
+  end
+
   test "app server launches over ssh for remote workers" do
     test_root =
       Path.join(

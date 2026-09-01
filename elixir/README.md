@@ -172,6 +172,14 @@ For the pinned App Server schema, Symphony sends only the validated native ID
 as `thread/start.projectId`; the saved desktop ID is retained only as contract
 evidence and is never interchanged with it.
 
+Caller intent or an asynchronous client task ID is not proof of placement. A
+project-bound task is accepted only when the synchronous start response and
+the later persisted `thread/read` both return the intended native `projectId`.
+Null, missing, or mismatched values fail closed before a turn. The resulting
+failure carries the resolved thread ID together with intended/observed project
+identity for the separate ledger/correlation integration; it does not claim an
+external task as success.
+
 Notes:
 
 - If a value is missing, defaults are used.
