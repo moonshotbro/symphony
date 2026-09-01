@@ -40,7 +40,8 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
           saved_project_id: String.t(),
           native_project_id: String.t(),
           repository: String.t(),
-          root: Path.t()
+          root: Path.t(),
+          programme: String.t()
         }
   @type t :: %__MODULE__{
           contract_id: String.t(),
@@ -109,7 +110,7 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
 
   defp compile_valid(attrs) do
     with {:ok, values} <- validate(attrs),
-         {:ok, project} <- project_binding(values["project"]),
+         {:ok, project} <- project_binding(values["project"], values["programme"]),
          {:ok, identity} <- identity(values, project) do
       title = title(values)
 
@@ -238,34 +239,57 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
   defp add_unless(errors, false, error), do: [error | errors]
 
   # credo:disable-for-next-line Credo.Check.Refactor.CyclomaticComplexity
-  defp project_binding(project) when is_map(project) do
+  defp project_binding(project, programme) when is_map(project) and is_binary(programme) do
     project_keys = Map.keys(project)
-    normalized_keys = Enum.map(project_keys, &to_string/1)
+    normalized_keys = Enum.map(project_keys, &safe_key/1)
 
     if length(project_keys) != length(Enum.uniq(normalized_keys)) or
-         Enum.any?(normalized_keys, &(&1 not in ~w(saved_project_id native_project_id repository root))) do
+         Enum.any?(normalized_keys, &(&1 not in ~w(saved_project_id native_project_id repository root programme))) do
       {:error, [:unsupported_project_binding_field]}
     else
       project = stringify_keys(project)
-      keys = ~w(saved_project_id native_project_id repository root)
+      keys = ~w(saved_project_id native_project_id repository root programme)
       missing = Enum.filter(keys, &blank?(project[&1]))
 
       result =
         cond do
-          missing != [] -> {:error, Enum.map(missing, &{:missing_project_binding, String.to_existing_atom(&1)})}
-          project["saved_project_id"] == project["native_project_id"] -> {:error, [:project_namespaces_must_be_distinct]}
-          not Regex.match?(~r/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/, project["saved_project_id"]) -> {:error, [:invalid_saved_project_id]}
-          not Regex.match?(~r/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/, project["native_project_id"]) -> {:error, [:invalid_native_project_id]}
-          project["repository"] == "" -> {:error, [:project_repository_mismatch]}
-          not absolute_root?(project["root"]) -> {:error, [:project_root_must_be_absolute]}
-          true -> {:ok, %{saved_project_id: project["saved_project_id"], native_project_id: project["native_project_id"], repository: project["repository"], root: Path.expand(project["root"])}}
+          missing != [] ->
+            {:error, Enum.map(missing, &{:missing_project_binding, String.to_existing_atom(&1)})}
+
+          project["saved_project_id"] == project["native_project_id"] ->
+            {:error, [:project_namespaces_must_be_distinct]}
+
+          not Regex.match?(~r/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/, project["saved_project_id"]) ->
+            {:error, [:invalid_saved_project_id]}
+
+          not Regex.match?(~r/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/, project["native_project_id"]) ->
+            {:error, [:invalid_native_project_id]}
+
+          project["repository"] == "" ->
+            {:error, [:project_repository_mismatch]}
+
+          project["programme"] != programme ->
+            {:error, [:project_programme_mismatch]}
+
+          not absolute_root?(project["root"]) ->
+            {:error, [:project_root_must_be_absolute]}
+
+          true ->
+            {:ok,
+             %{
+               saved_project_id: project["saved_project_id"],
+               native_project_id: project["native_project_id"],
+               repository: project["repository"],
+               root: Path.expand(project["root"]),
+               programme: programme
+             }}
         end
 
       result
     end
   end
 
-  defp project_binding(_), do: {:error, [:project_binding_not_a_map]}
+  defp project_binding(_, _), do: {:error, [:project_binding_not_a_map]}
 
   defp identity(values, project) do
     if values["repository"] != project.repository do
@@ -337,7 +361,7 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
   defp normalize_atom(value) when is_atom(value), do: value
 
   defp normalize_atom(value) when is_binary(value) do
-    Enum.find(@roles ++ @models ++ @goal_policies ++ @write_domains, &(to_string(&1) == value))
+    Enum.find(@roles ++ @models ++ @goal_policies ++ @write_domains ++ @efforts ++ @stall_policies ++ @closeout_policies, &(to_string(&1) == value))
   end
 
   defp normalize_atom(_), do: nil
@@ -347,4 +371,7 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
   defp absolute_root?(root) when is_binary(root), do: Path.type(root) == :absolute
   defp absolute_root?(_), do: false
   defp stringify_keys(map), do: Map.new(map, fn {key, value} -> {to_string(key), value} end)
+  defp safe_key(key) when is_atom(key), do: Atom.to_string(key)
+  defp safe_key(key) when is_binary(key), do: key
+  defp safe_key(_), do: nil
 end
