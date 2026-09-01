@@ -168,7 +168,7 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
         compile(attrs)
       end
     else
-      if Keyword.get(opts, :repository_task, false) do
+      if Keyword.get(opts, :repository_task, workspace_repository?(workspace)) do
         {:error, :project_binding_required_for_repository_task}
       else
         {:ok, nil}
@@ -607,6 +607,12 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
     end
   rescue
     ErlangError -> {:error, :workspace_revision_unavailable}
+  end
+
+  defp workspace_repository?(workspace) when is_binary(workspace) do
+    match?({_output, 0}, System.cmd("git", ["-C", workspace, "rev-parse", "--is-inside-work-tree"], stderr_to_stdout: true))
+  rescue
+    ErlangError -> false
   end
 
   defp repository_matches?(workspace, repository) do
