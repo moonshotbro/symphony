@@ -168,7 +168,11 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
         compile(attrs)
       end
     else
-      {:ok, nil}
+      if Keyword.get(opts, :repository_task, false) do
+        {:error, :project_binding_required_for_repository_task}
+      else
+        {:ok, nil}
+      end
     end
   end
 

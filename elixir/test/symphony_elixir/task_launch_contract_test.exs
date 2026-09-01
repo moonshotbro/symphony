@@ -48,6 +48,13 @@ defmodule SymphonyElixir.Codex.TaskLaunchContractTest do
     assert TaskLaunchContract.title(%{role: self(), task: %{bad: true}}) == "Task work: task"
   end
 
+  test "repository task mode cannot fall back to a disabled project binding" do
+    issue = %SymphonyElixir.Tracker.Issue{identifier: "SYS-50", title: "Bound worker"}
+
+    assert {:error, :project_binding_required_for_repository_task} =
+             TaskLaunchContract.from_runtime(issue, System.tmp_dir!(), repository_task: true)
+  end
+
   test "escalation and post-resolution links are typed and immutable" do
     prior = "tlc-" <> String.duplicate("a", 64)
 
