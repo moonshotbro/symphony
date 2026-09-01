@@ -11,6 +11,57 @@ defmodule SymphonyElixir.Toscanini.EventContract do
   @states ~w(discovered assessed ready claimed dispatched running checkpointed review_requested reconciled needs_input blocked context_exhausted usage_limited failed recovery_pending rejected cancelled archived dead_letter)
   @events ~w(accepted started checkpointed review_requested completed failed blocked needs_input cancelled context_exhausted usage_limited)
   @commands ~w(dispatch_requested review_requested integration_requested reconcile_requested needs_input_acknowledged archive_requested)
+  @top_keys ~w(specversion id source type subject time datacontenttype dataschema correlation_id causation_id data)
+  @delivery_keys [:idempotency_key, :sequence]
+  @known_keys [
+    :specversion,
+    :id,
+    :source,
+    :type,
+    :subject,
+    :time,
+    :datacontenttype,
+    :dataschema,
+    :correlation_id,
+    :causation_id,
+    :data,
+    :envelope_version,
+    :kind,
+    :message_id,
+    :sender,
+    :recipient,
+    :authority_ref,
+    :identity,
+    :lifecycle,
+    :evidence,
+    :delivery,
+    :privacy,
+    :programme,
+    :repo,
+    :issue,
+    :pr,
+    :role,
+    :task,
+    :attempt,
+    :fence,
+    :idempotency,
+    :exact_revision,
+    :idempotency_key,
+    :sequence,
+    :state,
+    :terminal_reason,
+    :blocking_reason,
+    :requested_action,
+    :classification,
+    :retention,
+    :redacted,
+    :repository,
+    :kind,
+    :id,
+    :url,
+    :expected_revision,
+    :refs
+  ]
 
   defstruct [:specversion, :id, :source, :type, :subject, :time, :datacontenttype, :dataschema, :correlation_id, :causation_id, :data]
 
@@ -43,6 +94,7 @@ defmodule SymphonyElixir.Toscanini.EventContract do
     with :ok <- validate_version(envelope.data),
          :ok <- validate_cloud_event(envelope),
          :ok <- validate_data(envelope.data),
+         :ok <- validate_correlations(envelope),
          :ok <- validate_kind_and_type(envelope),
          :ok <- validate_privacy(envelope.data) do
       :ok
@@ -91,26 +143,63 @@ defmodule SymphonyElixir.Toscanini.EventContract do
 
     aliases = %{correlation_id: ["sysmiqcorrelationid"], causation_id: ["sysmiqcausationid"]}
 
-    fields =
-      Enum.into([:specversion, :id, :source, :type, :subject, :time, :datacontenttype, :dataschema, :correlation_id, :causation_id], %{}, fn key ->
-        {key, fetch_alias(attrs, key, Map.get(aliases, key, []))}
-      end)
+    with :ok <- validate_keys(attrs, @top_keys),
+         {:ok, normalized_data} <- normalize_map(data) do
+      fields =
+        Enum.into([:specversion, :id, :source, :type, :subject, :time, :datacontenttype, :dataschema, :correlation_id, :causation_id], %{}, fn key ->
+          {key, fetch_alias(attrs, key, Map.get(aliases, key, []))}
+        end)
 
-    {:ok, fields |> Map.put(:data, normalize_map(data)) |> then(&struct(__MODULE__, &1))}
+      {:ok, fields |> Map.put(:data, normalized_data) |> then(&struct(__MODULE__, &1))}
+    end
   rescue
     ArgumentError -> {:error, :malformed_envelope}
   end
 
   defp normalize_map(map) when is_map(map) do
-    Enum.into(map, %{}, fn {key, value} -> {normalize_key(key), normalize_value(value)} end)
+    Enum.reduce_while(map, {:ok, %{}}, fn {key, value}, {:ok, acc} ->
+      case safe_key(key) do
+        {:ok, atom} ->
+          case normalize_value(value) do
+            {:ok, normalized} -> {:cont, {:ok, Map.put(acc, atom, normalized)}}
+            error -> {:halt, error}
+          end
+
+        :error ->
+          {:halt, {:error, :unknown_field}}
+      end
+    end)
   end
 
-  defp normalize_map(_), do: %{}
+  defp normalize_map(_), do: {:error, :malformed_data}
   defp normalize_value(value) when is_map(value), do: normalize_map(value)
-  defp normalize_value(value) when is_list(value), do: Enum.map(value, &normalize_value/1)
-  defp normalize_value(value), do: value
-  defp normalize_key(key) when is_atom(key), do: key
-  defp normalize_key(key) when is_binary(key), do: String.to_atom(key)
+
+  defp normalize_value(value) when is_list(value) do
+    Enum.reduce_while(value, {:ok, []}, fn item, {:ok, acc} ->
+      case normalize_value(item) do
+        {:ok, normalized} -> {:cont, {:ok, [normalized | acc]}}
+        error -> {:halt, error}
+      end
+    end)
+    |> then(fn
+      {:ok, values} -> {:ok, Enum.reverse(values)}
+      error -> error
+    end)
+  end
+
+  defp normalize_value(value), do: {:ok, value}
+
+  defp safe_key(key) when is_atom(key), do: if(key in @known_keys, do: {:ok, key}, else: :error)
+
+  defp safe_key(key) when is_binary(key) do
+    Enum.find_value(@known_keys, :error, fn known -> if key == Atom.to_string(known), do: {:ok, known} end)
+  end
+
+  defp safe_key(_), do: :error
+
+  defp validate_keys(map, allowed) when is_map(map) do
+    if Enum.all?(Map.keys(map), fn key -> (is_atom(key) and Atom.to_string(key) in allowed) or (is_binary(key) and key in allowed) end), do: :ok, else: {:error, :unknown_field}
+  end
 
   defp fetch(map, key, default) do
     Map.get(map, key, Map.get(map, Atom.to_string(key), default))
@@ -136,7 +225,7 @@ defmodule SymphonyElixir.Toscanini.EventContract do
     required = [:envelope_version, :kind, :message_id, :correlation_id, :causation_id, :sender, :recipient, :authority_ref, :identity, :lifecycle, :evidence, :delivery, :privacy]
 
     identity_required = [:programme, :repo, :issue, :pr, :role, :task, :attempt, :fence, :idempotency, :exact_revision]
-    delivery_required = [:idempotency_key, :sequence]
+    delivery_required = @delivery_keys
 
     if Enum.all?(required, &Map.has_key?(data, &1)) and
          present?(data.message_id) and present?(data.correlation_id) and
@@ -151,11 +240,23 @@ defmodule SymphonyElixir.Toscanini.EventContract do
   defp validate_kind_and_type(%{data: %{kind: kind}, type: type}) do
     cond do
       not is_binary(type) -> {:error, :unsupported_message_type}
-      kind == "command" and String.starts_with?(type, "sysmiq.command.") and command_name(type) in @commands -> :ok
-      kind == "event" and String.starts_with?(type, "sysmiq.work.") and event_name(type) in @events -> :ok
+      kind == "command" and type in Enum.map(@commands, &"sysmiq.command.#{&1}.v1") -> :ok
+      kind == "event" and type in Enum.map(@events, &"sysmiq.work.#{&1}.v1") -> :ok
       true -> {:error, :unsupported_message_type}
     end
   end
+
+  defp validate_correlations(%__MODULE__{} = e) do
+    data = e.data
+
+    if e.id == data.message_id and e.correlation_id == data.correlation_id and
+         (is_nil(e.causation_id) or e.causation_id == data.causation_id) and
+         authority_matches?(e.subject, data.authority_ref), do: :ok, else: {:error, :identity_mismatch}
+  end
+
+  defp authority_subject(%{repository: repo, issue: issue}), do: "github:#{repo}##{issue}"
+  defp authority_subject(_), do: nil
+  defp authority_matches?(subject, authority), do: subject == authority_subject(authority) or subject == "github:" <> to_string(authority[:repository]) <> "#" <> to_string(authority[:issue])
 
   defp validate_privacy(%{privacy: privacy} = data) do
     prohibited = [:body, :prompt, :message_body, :tool_arguments, :tool_results, :reasoning, :secret, :token]
@@ -217,7 +318,5 @@ defmodule SymphonyElixir.Toscanini.EventContract do
   defp stable_identity(identity), do: Map.delete(identity, :idempotency)
   defp sequence(%{data: %{delivery: %{sequence: sequence}}}) when is_integer(sequence), do: sequence
   defp sequence(_), do: nil
-  defp command_name(type), do: type |> String.trim_leading("sysmiq.command.") |> String.split(".") |> hd()
-  defp event_name(type), do: type |> String.trim_leading("sysmiq.work.") |> String.split(".") |> hd()
   defp present?(value), do: value not in [nil, "", %{}]
 end

@@ -9,7 +9,7 @@ defmodule SymphonyElixir.Toscanini.EventContractTest do
       specversion: "1.0",
       id: id,
       source: "urn:test",
-      type: "sysmiq.work.#{name}",
+      type: "sysmiq.work.#{name}.v1",
       subject: "github:moonshotbro/symphony#51",
       dataschema: "urn:sysmiq:test:1",
       correlation_id: "run-1",
@@ -35,7 +35,7 @@ defmodule SymphonyElixir.Toscanini.EventContractTest do
     assert {:ok, envelope} = EventContract.new(event("e1", 1, "accepted"))
     assert EventContract.event?(envelope)
     assert :ok = EventContract.validate(envelope)
-    command = %{event("c1", 1, "accepted") | type: "sysmiq.command.dispatch_requested", data: Map.put(envelope.data, :kind, "command")}
+    command = %{event("c1", 1, "accepted") | type: "sysmiq.command.dispatch_requested.v1", data: envelope.data |> Map.put(:kind, "command") |> Map.put(:message_id, "c1")}
     assert {:ok, command} = EventContract.new(command)
     assert {:error, :commands_are_not_factual_events} = EventContract.transition(EventContract.initial_state(), command)
   end
@@ -51,8 +51,23 @@ defmodule SymphonyElixir.Toscanini.EventContractTest do
 
   test "rejects privacy-prohibited payloads and illegal state changes" do
     unsafe = put_in(event("e1", 1, "accepted").data[:body], "prompt")
-    assert {:error, :privacy_prohibited} = EventContract.new(unsafe)
+    assert {:error, :unknown_field} = EventContract.new(unsafe)
     assert {:ok, state} = EventContract.transition(EventContract.initial_state(), event("e1", 1, "accepted"))
     assert {:error, {:illegal_transition, "accepted", "completed"}} = EventContract.transition(state, event("e2", 2, "completed"))
+  end
+
+  test "fails closed on unknown fields and contradictory outer identity" do
+    unknown = put_in(event("e1", 1, "accepted").data[:unexpected], "x")
+    assert {:error, :unknown_field} = EventContract.new(unknown)
+    mismatch = %{event("e1", 1, "accepted") | id: "outer", correlation_id: "other"}
+    assert {:error, :identity_mismatch} = EventContract.new(mismatch)
+    suffix = %{event("e1", 1, "accepted") | type: "sysmiq.work.accepted.v1.injected"}
+    assert {:error, :unsupported_message_type} = EventContract.new(suffix)
+  end
+
+  test "does not create atoms for attacker-controlled keys" do
+    key = "attacker_#{System.unique_integer([:positive])}"
+    assert {:error, :unknown_field} = EventContract.new(put_in(event("e1", 1, "accepted").data[key], true))
+    assert_raise ArgumentError, fn -> :erlang.binary_to_existing_atom(key, :utf8) end
   end
 end
