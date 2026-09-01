@@ -1,71 +1,25 @@
 # credo:disable-for-this-file
 defmodule SymphonyElixir.Toscanini.EventContract do
-  @moduledoc """
-  Privacy-safe, deterministic Toscanini command and event contract.
-
-  This module is deliberately a pure value/transition boundary. It does not
-  persist envelopes, deliver commands, or infer authority from an event.
-  """
-
-  @envelope_version "1.0.0"
+  @moduledoc "Privacy-safe, deterministic Toscanini command and event contract."
+  @version "1.0.0"
   @states ~w(discovered assessed ready claimed dispatched running checkpointed review_requested reconciled needs_input blocked context_exhausted usage_limited failed recovery_pending rejected cancelled archived dead_letter)
   @events ~w(accepted started checkpointed review_requested completed failed blocked needs_input cancelled context_exhausted usage_limited)
   @commands ~w(dispatch_requested review_requested integration_requested reconcile_requested needs_input_acknowledged archive_requested)
-  @top_keys ~w(specversion id source type subject time datacontenttype dataschema correlation_id causation_id data)
-  @data_keys ~w(envelope_version kind message_id correlation_id causation_id sender recipient authority_ref identity lifecycle evidence delivery privacy)
-  @delivery_keys [:idempotency_key, :sequence]
-  @known_keys [
-    :specversion,
-    :id,
-    :source,
-    :type,
-    :subject,
-    :time,
-    :datacontenttype,
-    :dataschema,
-    :correlation_id,
-    :causation_id,
-    :data,
-    :envelope_version,
-    :kind,
-    :message_id,
-    :sender,
-    :recipient,
-    :authority_ref,
-    :identity,
-    :lifecycle,
-    :evidence,
-    :delivery,
-    :privacy,
-    :programme,
-    :repo,
-    :issue,
-    :pr,
-    :role,
-    :task,
-    :attempt,
-    :fence,
-    :idempotency,
-    :exact_revision,
-    :idempotency_key,
-    :sequence,
-    :state,
-    :terminal_reason,
-    :blocking_reason,
-    :requested_action,
-    :classification,
-    :retention,
-    :redacted,
-    :repository,
-    :kind,
-    :id,
-    :url,
-    :expected_revision,
-    :refs,
-    :digest
-  ]
+  @top ~w(specversion id source type subject time datacontenttype dataschema correlation_id causation_id data)
+  @data ~w(envelope_version kind message_id correlation_id causation_id sender recipient authority_ref identity lifecycle evidence delivery privacy)
+  @schemas %{
+    sender: ~w(kind id role),
+    recipient: ~w(kind id role),
+    authority: ~w(repository issue pr url expected_revision),
+    identity: ~w(programme repo issue pr role task attempt fence idempotency exact_revision),
+    lifecycle: ~w(state terminal_reason blocking_reason requested_action),
+    evidence: ~w(refs),
+    ref: ~w(url digest kind),
+    delivery: ~w(idempotency_key sequence),
+    privacy: ~w(classification retention redacted)
+  }
+  @keys (@top ++ @data ++ Enum.flat_map(@schemas, fn {_, v} -> v end)) |> Enum.uniq() |> Enum.map(&String.to_atom/1)
   @limits %{depth: 6, entries: 64, string: 512, list: 32}
-
   defstruct [:specversion, :id, :source, :type, :subject, :time, :datacontenttype, :dataschema, :correlation_id, :causation_id, :data]
 
   defmodule State do
@@ -75,346 +29,311 @@ defmodule SymphonyElixir.Toscanini.EventContract do
 
   @type t :: %__MODULE__{}
   @type state :: %State{}
-
+  @type result(a) :: {:ok, a} | {:error, atom() | {atom(), term()}}
   @spec envelope_version() :: String.t()
-  def envelope_version, do: @envelope_version
-
+  def envelope_version, do: @version
   @spec states() :: [String.t()]
   def states, do: @states
-
-  @spec new(map()) :: {:ok, t()} | {:error, atom() | {atom(), term()}}
-  def new(attrs) when is_map(attrs) do
-    with {:ok, envelope} <- normalize(attrs),
-         :ok <- validate(envelope) do
-      {:ok, envelope}
-    end
-  end
-
-  def new(_), do: {:error, :malformed_envelope}
-
-  @spec validate(t() | map()) :: :ok | {:error, atom() | {atom(), term()}}
-  def validate(%__MODULE__{} = envelope) do
-    with :ok <- validate_version(envelope.data),
-         :ok <- validate_cloud_event(envelope),
-         :ok <- validate_data(envelope.data),
-         :ok <- validate_correlations(envelope),
-         :ok <- validate_kind_and_type(envelope),
-         :ok <- validate_privacy(envelope.data) do
-      :ok
-    end
-  rescue
-    _ -> {:error, :malformed_envelope}
-  end
-
-  def validate(_), do: {:error, :malformed_envelope}
-
-  @spec command?(t()) :: boolean()
+  @spec new(term()) :: result(t())
+  def new(value), do: safe(fn -> new_value(value) end)
+  @spec validate(term()) :: :ok | {:error, atom() | {atom(), term()}}
+  def validate(value), do: safe(fn -> validate_value(value) end)
+  @spec command?(term()) :: boolean()
   def command?(%__MODULE__{data: %{kind: "command"}}), do: true
   def command?(_), do: false
-
-  @spec event?(t()) :: boolean()
+  @spec event?(term()) :: boolean()
   def event?(%__MODULE__{data: %{kind: "event"}}), do: true
   def event?(_), do: false
+  @spec initial_state() :: state()
+  def initial_state, do: %State{}
 
-  @spec initial_state(map() | nil) :: state()
-  def initial_state(identity \\ nil), do: %State{identity: identity}
+  @spec initial_state(term()) :: state()
+  def initial_state(identity) when is_map(identity) or is_nil(identity), do: %State{identity: identity}
+  def initial_state(_), do: %State{}
+  @spec transition(term(), term()) :: result(state())
+  def transition(state, envelope), do: safe(fn -> transition_value(state, envelope) end)
+  @spec replay(term(), term()) :: result(state())
+  def replay(values, state \\ initial_state()), do: safe(fn -> replay_value(values, state) end)
 
-  @spec transition(state(), t() | map()) :: {:ok, state()} | {:error, atom() | {atom(), term()}}
-  def transition(%State{} = state, envelope) do
-    with {:ok, envelope} <- ensure_envelope(envelope),
-         :ok <- validate(envelope),
-         :ok <- reject_command_transition(envelope),
-         :ok <- validate_identity(state, envelope),
-         :ok <- reject_duplicate(state, envelope),
-         :ok <- validate_sequence(state, envelope),
-         {:ok, next} <- next_state(state.current, lifecycle(envelope)) do
-      {:ok,
-       %{state | current: next, revision: state.revision + 1, seen_ids: MapSet.put(state.seen_ids, envelope.id), last_sequence: sequence(envelope), identity: state.identity || identity(envelope)}}
+  defp new_value(value) when is_map(value) do
+    with {:ok, envelope} <- normalize(value), :ok <- validate_value(envelope), do: {:ok, envelope}
+  end
+
+  defp new_value(_), do: {:error, :malformed_envelope}
+
+  defp validate_value(%__MODULE__{} = e) do
+    with :ok <- version(e.data), :ok <- cloud(e), :ok <- data(e.data), :ok <- correlations(e), :ok <- kind_type(e), :ok <- privacy(e.data), :ok <- bounds(e), do: :ok
+  end
+
+  defp validate_value(_), do: {:error, :malformed_envelope}
+
+  defp transition_value(%State{} = state, envelope) do
+    with :ok <- state_valid(state),
+         {:ok, e} <- ensure(envelope),
+         :ok <- validate_value(e),
+         :ok <- factual(e),
+         :ok <- same_identity(state, e),
+         :ok <- unique(state, e),
+         :ok <- sequential(state, e),
+         {:ok, next} <- next(state.current, lifecycle(e)) do
+      {:ok, %{state | current: next, revision: state.revision + 1, seen_ids: MapSet.put(state.seen_ids, e.id), last_sequence: sequence(e), identity: state.identity || identity(e)}}
     end
   end
 
-  @spec replay([t() | map()], state()) :: {:ok, state()} | {:error, term()}
-  def replay(envelopes, state \\ initial_state()) when is_list(envelopes) do
-    Enum.reduce_while(envelopes, {:ok, state}, fn envelope, {:ok, current} ->
-      case transition(current, envelope) do
-        {:ok, next} -> {:cont, {:ok, next}}
-        error -> {:halt, error}
-      end
-    end)
+  defp transition_value(_, _), do: {:error, :malformed_state}
+
+  defp replay_value(values, %State{} = state) when is_list(values) do
+    if proper?(values) do
+      Enum.reduce_while(values, {:ok, state}, fn value, {:ok, current} ->
+        case transition_value(current, value) do
+          {:ok, next} -> {:cont, {:ok, next}}
+          error -> {:halt, error}
+        end
+      end)
+    else
+      {:error, :malformed_replay}
+    end
   end
+
+  defp replay_value(_, _), do: {:error, :malformed_replay}
 
   defp normalize(attrs) do
-    data = fetch(attrs, :data, %{})
+    with :ok <- keys(attrs, @top), {:ok, data} <- map(attrs[:data] || attrs["data"] || %{}) do
+      aliases = %{correlation_id: ["sysmiqcorrelationid"], causation_id: ["sysmiqcausationid"]}
 
-    aliases = %{correlation_id: ["sysmiqcorrelationid"], causation_id: ["sysmiqcausationid"]}
-
-    with :ok <- validate_keys(attrs, @top_keys),
-         {:ok, normalized_data} <- normalize_map(data) do
       fields =
         Enum.into([:specversion, :id, :source, :type, :subject, :time, :datacontenttype, :dataschema, :correlation_id, :causation_id], %{}, fn key ->
-          {key, fetch_alias(attrs, key, Map.get(aliases, key, []))}
+          {key, fetch(attrs, key, Map.get(aliases, key, []))}
         end)
 
-      {:ok, fields |> Map.put(:data, normalized_data) |> then(&struct(__MODULE__, &1))}
+      {:ok, struct(__MODULE__, Map.put(fields, :data, data))}
     end
-  rescue
-    ArgumentError -> {:error, :malformed_envelope}
   end
 
-  defp normalize_map(map) when is_map(map) do
-    Enum.reduce_while(map, {:ok, %{}}, fn {key, value}, {:ok, acc} ->
-      case safe_key(key) do
-        {:ok, atom} ->
-          case normalize_value(value) do
-            {:ok, normalized} -> {:cont, {:ok, Map.put(acc, atom, normalized)}}
-            error -> {:halt, error}
-          end
-
-        :error ->
-          {:halt, {:error, :unknown_field}}
-      end
+  defp map(value) when is_map(value) and map_size(value) <= @limits.entries do
+    Enum.reduce_while(value, {:ok, %{}}, fn {key, child}, {:ok, acc} ->
+      with {:ok, atom} <- key(key),
+           {:ok, normalized} <- value(child),
+           do: {:cont, {:ok, Map.put(acc, atom, normalized)}},
+           else: (
+             :error -> {:halt, {:error, :unknown_field}}
+             error -> {:halt, error}
+           )
     end)
   end
 
-  defp normalize_map(_), do: {:error, :malformed_data}
-  defp normalize_value(value) when is_map(value), do: normalize_map(value)
+  defp map(_), do: {:error, :malformed_data}
+  defp value(value) when is_map(value), do: map(value)
 
-  defp normalize_value(value) when is_list(value) do
-    Enum.reduce_while(value, {:ok, []}, fn item, {:ok, acc} ->
-      case normalize_value(item) do
-        {:ok, normalized} -> {:cont, {:ok, [normalized | acc]}}
-        error -> {:halt, error}
-      end
-    end)
-    |> then(fn
-      {:ok, values} -> {:ok, Enum.reverse(values)}
-      error -> error
-    end)
+  defp value(value) when is_list(value) do
+    if proper?(value) do
+      Enum.reduce_while(value, {:ok, []}, fn x, {:ok, acc} ->
+        case value(x) do
+          {:ok, y} -> {:cont, {:ok, [y | acc]}}
+          error -> {:halt, error}
+        end
+      end)
+      |> then(fn
+        {:ok, xs} -> {:ok, Enum.reverse(xs)}
+        error -> error
+      end)
+    else
+      {:error, :malformed_data}
+    end
   end
 
-  defp normalize_value(value), do: {:ok, value}
+  defp value(value) when is_binary(value) or is_integer(value) or is_float(value) or is_boolean(value) or is_nil(value), do: {:ok, value}
+  defp value(_), do: {:error, :malformed_data}
+  defp key(value) when is_atom(value), do: if(value in @keys, do: {:ok, value}, else: :error)
+  defp key(value) when is_binary(value), do: Enum.find_value(@keys, :error, fn atom -> if value == Atom.to_string(atom), do: {:ok, atom} end)
+  defp key(_), do: :error
 
-  defp safe_key(key) when is_atom(key), do: if(key in @known_keys, do: {:ok, key}, else: :error)
+  defp keys(map, allowed) when is_map(map),
+    do: if(Enum.all?(Map.keys(map), fn k -> (is_atom(k) and Atom.to_string(k) in allowed) or (is_binary(k) and k in allowed) end), do: :ok, else: {:error, :unknown_field})
 
-  defp safe_key(key) when is_binary(key) do
-    Enum.find_value(@known_keys, :error, fn known -> if key == Atom.to_string(known), do: {:ok, known} end)
-  end
+  defp keys(_, _), do: {:error, :malformed_envelope}
+  defp fetch(map, key, aliases), do: Enum.find_value([key, Atom.to_string(key) | aliases], fn candidate -> Map.get(map, candidate) end)
+  defp ensure(%__MODULE__{} = e), do: {:ok, e}
+  defp ensure(map) when is_map(map), do: new_value(map)
+  defp ensure(_), do: {:error, :malformed_envelope}
 
-  defp safe_key(_), do: :error
+  defp version(%{envelope_version: @version}), do: :ok
+  defp version(_), do: {:error, :unsupported_version}
 
-  defp validate_keys(map, allowed) when is_map(map) do
-    if Enum.all?(Map.keys(map), fn key -> (is_atom(key) and Atom.to_string(key) in allowed) or (is_binary(key) and key in allowed) end), do: :ok, else: {:error, :unknown_field}
-  end
-
-  defp fetch(map, key, default) do
-    Map.get(map, key, Map.get(map, Atom.to_string(key), default))
-  end
-
-  defp fetch_alias(map, key, aliases) do
-    Enum.find_value([key, Atom.to_string(key) | aliases], fn candidate -> Map.get(map, candidate) end)
-  end
-
-  defp ensure_envelope(%__MODULE__{} = envelope), do: {:ok, envelope}
-  defp ensure_envelope(map) when is_map(map), do: new(map)
-  defp ensure_envelope(_), do: {:error, :malformed_envelope}
-
-  defp validate_version(%{envelope_version: version}) when version in [@envelope_version, "1.0"], do: :ok
-  defp validate_version(_), do: {:error, :unsupported_version}
-
-  defp validate_cloud_event(%__MODULE__{} = e) do
+  defp cloud(%__MODULE__{} = e) do
     required = [e.specversion, e.id, e.source, e.type, e.subject, e.dataschema, e.correlation_id]
 
-    if e.specversion == "1.0" and Enum.all?(required, &present?/1) and
-         Enum.all?(
-           [e.id, e.source, e.type, e.subject, e.time, e.datacontenttype, e.dataschema, e.correlation_id, e.causation_id],
-           &bounded?/1
-         ), do: :ok, else: {:error, :malformed_envelope}
+    if e.specversion == "1.0" and Enum.all?(required, &binary?/1) and nullable_binary?(e.time) and nullable_binary?(e.datacontenttype) and nullable_binary?(e.causation_id),
+      do: :ok,
+      else: {:error, :malformed_envelope}
   end
 
-  defp validate_data(data) when is_map(data) do
-    required = [:envelope_version, :kind, :message_id, :correlation_id, :causation_id, :sender, :recipient, :authority_ref, :identity, :lifecycle, :evidence, :delivery, :privacy]
-
-    identity_required = [:programme, :repo, :issue, :pr, :role, :task, :attempt, :fence, :idempotency, :exact_revision]
-    delivery_required = @delivery_keys
-
-    if bounded?(data) and object_keys?(data, @data_keys) and Enum.all?(required, &Map.has_key?(data, &1)) and
-         present?(data.message_id) and present?(data.correlation_id) and
-         is_map(data.identity) and Enum.all?(identity_required, &Map.has_key?(data.identity, &1)) and
-         is_map(data.delivery) and Enum.all?(delivery_required, &Map.has_key?(data.delivery, &1)) and
-         is_map(data.lifecycle) and
-         is_map(data.privacy) and object_keys?(data.sender, ["kind", "id", "role"]) and
-         object_keys?(data.recipient, ["kind", "id", "role"]) and
-         object_keys?(data.authority_ref, ["repository", "issue", "pr", "url", "expected_revision"]) and
-         object_keys?(data.identity, ["programme", "repo", "issue", "pr", "role", "task", "attempt", "fence", "idempotency", "exact_revision"]) and
-         object_keys?(data.lifecycle, ["state", "terminal_reason", "blocking_reason", "requested_action"]) and
-         object_keys?(data.delivery, ["idempotency_key", "sequence"]) and
-         object_keys?(data.evidence, ["refs"]) and evidence_valid?(data.evidence, data.identity, data.authority_ref) and
-         object_keys?(data.privacy, ["classification", "retention", "redacted"]), do: validate_types(data), else: {:error, :malformed_data}
+  defp data(d) when is_map(d) do
+    if schema?(d, @data) and schema?(d.sender, @schemas.sender) and schema?(d.recipient, @schemas.recipient) and schema?(d.authority_ref, @schemas.authority) and schema?(d.identity, @schemas.identity) and
+         schema?(d.lifecycle, @schemas.lifecycle) and schema?(d.evidence, @schemas.evidence) and schema?(d.delivery, @schemas.delivery) and schema?(d.privacy, @schemas.privacy) and
+         binary?(d.message_id) and binary?(d.correlation_id) and nullable_binary?(d.causation_id) and identity?(d.identity) and principal?(d.sender) and principal?(d.recipient) and
+         authority?(d.authority_ref, d.identity) and lifecycle?(d.lifecycle) and delivery?(d.delivery) and privacy?(d.privacy) and evidence?(d.evidence, d.identity),
+       do: :ok,
+       else: {:error, :malformed_data}
   end
 
-  defp validate_data(_), do: {:error, :malformed_data}
+  defp data(_), do: {:error, :malformed_data}
+  defp kind_type(%{data: %{kind: "event", lifecycle: %{state: state}}, type: "sysmiq.work." <> rest}) when state in @events and rest == state <> ".v1", do: :ok
+  defp kind_type(%{data: %{kind: "command", lifecycle: %{requested_action: action}}, type: "sysmiq.command." <> rest}) when action in @commands and rest == action <> ".v1", do: :ok
+  defp kind_type(_), do: {:error, :unsupported_message_type}
 
-  defp validate_kind_and_type(%{data: %{kind: kind}, type: type}) do
-    cond do
-      not is_binary(type) -> {:error, :unsupported_message_type}
-      kind == "command" and type in Enum.map(@commands, &"sysmiq.command.#{&1}.v1") -> :ok
-      kind == "event" and type in Enum.map(@events, &"sysmiq.work.#{&1}.v1") -> :ok
-      true -> {:error, :unsupported_message_type}
+  defp correlations(%__MODULE__{} = e) do
+    d = e.data
+
+    if e.id == d.message_id and e.correlation_id == d.correlation_id and e.causation_id == d.causation_id and e.subject == subject(d.authority_ref) and source?(e.source, d.sender),
+      do: :ok,
+      else: {:error, :identity_mismatch}
+  end
+
+  defp subject(%{repository: repo, issue: issue}), do: "github:#{repo}##{issue}"
+  defp source?(source, %{kind: kind, id: id}) when is_binary(source) and is_binary(kind) and is_binary(id), do: source == "urn:sysmiq:#{kind}:#{id}"
+  defp source?(_, _), do: false
+
+  # This is the single canonical parser for authority and evidence URLs.
+  defp github(url) when is_binary(url) and byte_size(url) <= @limits.string do
+    uri = URI.parse(url)
+
+    with true <- uri.scheme == "https" and uri.host == "github.com" and is_nil(uri.userinfo) and is_nil(uri.query) and is_nil(uri.fragment),
+         [owner, repo, resource, target] <- String.split(uri.path || "", "/", trim: true),
+         true <- repo?(owner <> "/" <> repo),
+         {:ok, kind} <- ref_kind(resource, target),
+         do: {:ok, %{repo: owner <> "/" <> repo, kind: kind, target: target}},
+         else: (_ -> :error)
+  rescue
+    _ -> :error
+  end
+
+  defp github(_), do: :error
+  defp ref_kind("issues", x), do: if(is_binary(x) and x =~ ~r/^\d+$/, do: {:ok, :issue}, else: :error)
+  defp ref_kind("pull", x), do: if(is_binary(x) and x =~ ~r/^\d+$/, do: {:ok, :pull_request}, else: :error)
+  defp ref_kind("commit", x), do: if(is_binary(x) and x =~ ~r/^[0-9a-fA-F]{7,128}$/, do: {:ok, :commit}, else: :error)
+  defp ref_kind(_, _), do: :error
+
+  defp authority?(a, i) do
+    schema?(a, @schemas.authority) and is_binary(a.repository) and repo?(a.repository) and positive?(a.issue) and nullable_positive?(a.pr) and binary?(a.url) and digest?(a.expected_revision) and
+      a.repository == i.repo and a.issue == i.issue and a.pr == i.pr and a.expected_revision == i.exact_revision and authority_url?(a.url, i)
+  end
+
+  defp authority_url?(url, i) do
+    case github(url) do
+      {:ok, %{repo: repo, kind: :issue, target: target}} -> repo == i.repo and target == Integer.to_string(i.issue)
+      {:ok, %{repo: repo, kind: :pull_request, target: target}} -> repo == i.repo and positive?(i.pr) and target == Integer.to_string(i.pr)
+      {:ok, %{repo: repo, kind: :commit, target: target}} -> repo == i.repo and target == i.exact_revision
+      _ -> false
     end
   end
 
-  defp validate_correlations(%__MODULE__{} = e) do
-    data = e.data
+  defp evidence?(%{refs: refs}, i) when is_list(refs), do: proper?(refs) and length(refs) <= @limits.list and Enum.all?(refs, &evidence_ref?(&1, i))
+  defp evidence?(_, _), do: false
 
-    if e.id == data.message_id and e.correlation_id == data.correlation_id and
-         e.causation_id == data.causation_id and
-         authority_matches?(e.subject, data.authority_ref) and
-         identity_authority_matches?(data.identity, data.authority_ref) and source_matches?(e.source, data.sender), do: :ok, else: {:error, :identity_mismatch}
+  defp evidence_ref?(ref, i) when is_map(ref) do
+    if schema?(ref, @schemas.ref) do
+      with {:ok, parsed} <- github(ref.url),
+           true <- ref.kind in ["issue", "pull_request", "commit", "check", "review"],
+           true <- is_nil(ref.digest) or digest?(ref.digest),
+           do: evidence_target?(parsed, ref.kind, i),
+           else: (_ -> false)
+    else
+      false
+    end
   end
 
-  defp authority_subject(%{repository: repo, issue: issue}), do: "github:#{repo}##{issue}"
-  defp authority_subject(_), do: nil
-  defp authority_matches?(_subject, authority) when not is_map(authority), do: false
-  defp authority_matches?(subject, authority), do: subject == authority_subject(authority) or subject == "github:" <> to_string(authority[:repository]) <> "#" <> to_string(authority[:issue])
+  defp evidence_ref?(_, _), do: false
+  defp evidence_target?(%{repo: repo, kind: :issue, target: x}, "issue", i), do: repo == i.repo and x == Integer.to_string(i.issue)
 
-  defp identity_authority_matches?(identity, authority), do: authority_valid?(authority, identity)
+  defp evidence_target?(%{repo: repo, kind: :pull_request, target: x}, kind, i) when kind in ["pull_request", "check", "review"],
+    do: repo == i.repo and positive?(i.pr) and x == Integer.to_string(i.pr)
 
-  defp source_matches?(source, %{kind: kind, id: id}), do: source == "urn:sysmiq:#{kind}:#{id}"
-  defp source_matches?(_, _), do: false
+  defp evidence_target?(%{repo: repo, kind: :commit, target: x}, "commit", i), do: repo == i.repo and x == i.exact_revision
+  defp evidence_target?(_, _, _), do: false
 
-  defp evidence_valid?(%{refs: refs}, identity, authority) when is_list(refs) do
-    if not proper_list?(refs) or length(refs) > 32, do: false, else: evidence_entries_valid?(refs, identity, authority)
-  end
-
-  defp evidence_valid?(_, _, _), do: false
-
-  defp evidence_entries_valid?(refs, identity, authority) do
-    Enum.all?(refs, fn ref ->
-      is_map(ref) and object_keys?(ref, ["url", "digest", "kind"]) and
-        reference_url?(ref[:url]) and evidence_target?(ref[:url], ref[:kind], identity, authority) and (is_nil(ref[:digest]) or digest?(ref[:digest])) and
-        (is_nil(ref[:kind]) or ref[:kind] in ["issue", "pull_request", "commit", "check", "review"]) and bounded?(ref)
-    end)
-  end
-
-  defp evidence_target?(url, kind, identity, _authority) do
-    path = URI.parse(url).path || ""
-    prefix = "/" <> identity.repo <> "/"
-
-    (kind == "issue" and path == prefix <> "issues/" <> to_string(identity.issue)) or
-      (kind == "pull_request" and identity.pr != nil and path == prefix <> "pull/" <> to_string(identity.pr)) or
-      (kind == "commit" and path == prefix <> "commit/" <> identity.exact_revision) or
-      (kind in ["check", "review"] and identity.pr != nil and path == prefix <> "pull/" <> to_string(identity.pr))
-  rescue
-    _ -> false
-  end
-
-  defp reference_url?(url) when is_binary(url) do
-    uri = URI.parse(url)
-
-    uri.scheme == "https" and uri.host in ["github.com", "api.github.com"] and is_nil(uri.userinfo) and
-      is_nil(uri.query) and is_nil(uri.fragment) and String.match?(uri.path || "", ~r{^/[^/]+/[^/]+/(issues|pull|commit|commits)/[0-9A-Fa-f._-]+$})
-  rescue
-    _ -> false
-  end
-
-  defp reference_url?(_), do: false
-  defp digest?(value), do: is_binary(value) and String.match?(value, ~r/^[0-9a-fA-F]{7,128}$/)
-  defp object_keys?(map, allowed) when is_map(map), do: Enum.all?(Map.keys(map), &(is_atom(&1) and Atom.to_string(&1) in allowed))
-  defp object_keys?(_, _), do: false
-  defp bounded?(term), do: bounded?(term, 0)
-  defp bounded?(_, depth) when depth > @limits.depth, do: false
-  defp bounded?(value, _depth) when is_binary(value), do: byte_size(value) <= @limits.string
-  defp bounded?(value, depth) when is_map(value), do: map_size(value) <= @limits.entries and Enum.all?(value, fn {k, v} -> bounded?(k, depth + 1) and bounded?(v, depth + 1) end)
-  defp bounded?(value, depth) when is_list(value), do: proper_list?(value) and length(value) <= @limits.list and Enum.all?(value, &bounded?(&1, depth + 1))
-  defp bounded?(_, _), do: true
-  defp proper_list?(value), do: proper_list?(value, 0)
-  defp proper_list?([], _), do: true
-  defp proper_list?([_ | tail], depth) when depth <= @limits.list, do: proper_list?(tail, depth + 1)
-  defp proper_list?(_, _), do: false
-
-  defp validate_types(data) do
-    privacy = data.privacy
-
-    identity = data.identity
-    sender = data.sender
-    recipient = data.recipient
-    authority = data.authority_ref
-
-    if is_binary(data.lifecycle.state) and is_binary(data.delivery.idempotency_key) and is_integer(data.delivery.sequence) and
-         identity_valid?(identity) and principal_valid?(sender) and principal_valid?(recipient) and authority_valid?(authority, identity) and
-         privacy.classification in ["metadata", "confidential"] and privacy.retention in ["audit", "operational"] and
-         is_boolean(Map.get(privacy, :redacted, false)), do: :ok, else: {:error, :malformed_data}
-  end
-
-  defp identity_valid?(i),
+  defp identity?(i) when is_map(i),
     do:
-      is_binary(i.programme) and is_binary(i.repo) and repo?(i.repo) and is_integer(i.issue) and i.issue > 0 and
-        (is_nil(i.pr) or (is_integer(i.pr) and i.pr > 0)) and is_binary(i.role) and
-        i.role in ["programme", "implementation", "independent_review", "landing", "recovery", "research", "monitor", "telemetry", "acceptance"] and
-        is_binary(i.task) and is_binary(i.exact_revision) and digest?(i.exact_revision) and is_integer(i.attempt) and i.attempt >= 0 and is_integer(i.fence) and i.fence >= 0 and
-        is_binary(i.idempotency)
+      schema?(i, @schemas.identity) and binary?(i.programme) and repo?(i.repo) and positive?(i.issue) and nullable_positive?(i.pr) and
+        i.role in ["programme", "implementation", "independent_review", "landing", "recovery", "research", "monitor", "telemetry", "acceptance"] and binary?(i.task) and is_integer(i.attempt) and
+        i.attempt >= 0 and is_integer(i.fence) and i.fence >= 0 and binary?(i.idempotency) and digest?(i.exact_revision)
 
-  defp principal_valid?(p),
-    do: is_map(p) and Map.has_key?(p, :kind) and Map.has_key?(p, :id) and Map.has_key?(p, :role) and p.kind in ["worker", "role", "adapter"] and is_binary(p.id) and is_binary(p.role)
+  defp identity?(_), do: false
+  defp principal?(p) when is_map(p), do: schema?(p, @schemas.sender) and p.kind in ["worker", "role", "adapter"] and binary?(p.id) and binary?(p.role)
+  defp principal?(_), do: false
+  defp lifecycle?(l), do: binary?(l.state) and nullable_binary?(l.terminal_reason) and nullable_binary?(l.blocking_reason) and nullable_binary?(l.requested_action)
+  defp delivery?(d), do: binary?(d.idempotency_key) and positive?(d.sequence)
+  defp privacy?(p), do: p.classification in ["metadata", "confidential"] and p.retention in ["audit", "operational"] and is_boolean(p.redacted)
+  defp binary?(x), do: is_binary(x) and byte_size(x) in 1..@limits.string
+  defp nullable_binary?(nil), do: true
+  defp nullable_binary?(x), do: binary?(x)
+  defp positive?(x), do: is_integer(x) and x > 0
+  defp nullable_positive?(nil), do: true
+  defp nullable_positive?(x), do: positive?(x)
+  defp digest?(x), do: is_binary(x) and x =~ ~r/^[0-9a-fA-F]{7,128}$/
+  defp repo?(x), do: is_binary(x) and x =~ ~r/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/
 
-  defp authority_valid?(a, i),
-    do:
-      is_map(a) and object_keys?(a, ["repository", "issue", "pr", "url", "expected_revision"]) and is_binary(a.repository) and a.repository == i.repo and is_integer(a.issue) and a.issue == i.issue and
-        (is_nil(Map.get(a, :pr)) or Map.get(a, :pr) == i.pr) and
-        (is_nil(Map.get(a, :expected_revision)) or Map.get(a, :expected_revision) == i.exact_revision)
-
-  defp repo?(repo), do: String.match?(repo, ~r/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/)
-
-  defp validate_privacy(%{privacy: privacy} = data) do
-    prohibited = [:body, :prompt, :message_body, :tool_arguments, :tool_results, :reasoning, :secret, :token]
-    if privacy[:classification] == "restricted" or contains_prohibited?(data, prohibited) or unsafe_value?(data), do: {:error, :privacy_prohibited}, else: :ok
+  defp privacy(d) do
+    bad = [:body, :prompt, :message_body, :tool_arguments, :tool_results, :reasoning, :secret, :token]
+    if prohibited?(d, bad) or unsafe?(d), do: {:error, :privacy_prohibited}, else: :ok
   end
 
-  defp contains_prohibited?(map, prohibited) when is_map(map) do
-    Enum.any?(map, fn {key, value} -> key in prohibited or contains_prohibited?(value, prohibited) end)
-  end
+  defp prohibited?(m, keys) when is_map(m), do: Enum.any?(m, fn {k, v} -> k in keys or prohibited?(v, keys) end)
+  defp prohibited?(xs, keys) when is_list(xs), do: proper?(xs) and Enum.any?(xs, &prohibited?(&1, keys))
+  defp prohibited?(_, _), do: false
+  defp unsafe?(m) when is_map(m), do: Enum.any?(m, fn {_, v} -> unsafe?(v) end)
+  defp unsafe?(xs) when is_list(xs), do: proper?(xs) and Enum.any?(xs, &unsafe?/1)
 
-  defp contains_prohibited?(list, prohibited) when is_list(list), do: Enum.any?(list, &contains_prohibited?(&1, prohibited))
-  defp contains_prohibited?(_, _), do: false
-  defp unsafe_value?(map) when is_map(map), do: Enum.any?(map, fn {_key, value} -> unsafe_value?(value) end)
-  defp unsafe_value?(list) when is_list(list), do: Enum.any?(list, &unsafe_value?/1)
+  defp unsafe?(x) when is_binary(x) do
+    down = String.downcase(x)
 
-  defp unsafe_value?(value) when is_binary(value) do
-    down = String.downcase(value)
-
-    String.contains?(value, ["/Users/", "/home/", "/tmp/", "~/", "BEGIN ", "file://", "\\\\"]) or
-      String.match?(value, ~r{(?i)^[A-Z]:[\\/]}) or String.match?(value, ~r{(?i)^[^/\s:]+@[^:]+:.+}) or
+    String.contains?(x, ["/Users/", "/home/", "/tmp/", "~/", "BEGIN ", "file://", "\\\\"]) or String.match?(x, ~r{(?i)^[A-Z]:[\\/]}) or String.match?(x, ~r{(?i)^[^/\s:]+@[^:]+:.+}) or
       String.contains?(down, ["bearer ", "authorization:", "token=", "password=", "secret=", "api_key=", "private_key"])
   end
 
-  defp unsafe_value?(_), do: false
+  defp unsafe?(_), do: false
+  defp bounds(e), do: if(bounded?(e), do: :ok, else: {:error, :malformed_envelope})
+  defp bounded?(%__MODULE__{} = e), do: bounded?(Map.from_struct(e), 0)
+  defp bounded?(x), do: bounded?(x, 0)
+  defp bounded?(_, d) when d > @limits.depth, do: false
+  defp bounded?(x, _) when is_nil(x) or is_boolean(x) or is_integer(x) or is_float(x), do: true
+  defp bounded?(x, _) when is_binary(x), do: byte_size(x) <= @limits.string
+  defp bounded?(x, d) when is_map(x), do: map_size(x) <= @limits.entries and Enum.all?(x, fn {k, v} -> (is_atom(k) or is_binary(k)) and bounded?(v, d + 1) end)
+  defp bounded?(x, d) when is_list(x), do: proper?(x) and length(x) <= @limits.list and Enum.all?(x, &bounded?(&1, d + 1))
+  defp bounded?(_, _), do: false
+  defp proper?(x), do: proper?(x, 0)
+  defp proper?([], _), do: true
+  defp proper?([_ | tail], n) when n < @limits.list, do: proper?(tail, n + 1)
+  defp proper?(_, _), do: false
 
-  defp reject_command_transition(%{data: %{kind: "command"}}), do: {:error, :commands_are_not_factual_events}
-  defp reject_command_transition(_), do: :ok
+  defp schema?(map, keys) when is_map(map),
+    do: map_size(map) == length(keys) and Enum.all?(keys, &Map.has_key?(map, String.to_atom(&1))) and Enum.all?(Map.keys(map), &(is_atom(&1) and Atom.to_string(&1) in keys))
 
-  defp validate_identity(%State{identity: nil}, _), do: :ok
+  defp schema?(_, _), do: false
+  defp factual(%{data: %{kind: "command"}}), do: {:error, :commands_are_not_factual_events}
+  defp factual(_), do: :ok
 
-  defp validate_identity(%State{identity: expected}, envelope) do
-    if stable_identity(identity(envelope)) == stable_identity(expected), do: :ok, else: {:error, :identity_mismatch}
+  defp state_valid(%State{current: c, revision: r, seen_ids: ids, last_sequence: last, identity: identity}) do
+    if (c in @states or c in @events) and is_integer(r) and r >= 0 and is_struct(ids, MapSet) and is_integer(last) and last >= 0 and (is_nil(identity) or identity?(identity)),
+      do: :ok,
+      else: {:error, :malformed_state}
   end
 
-  defp validate_sequence(%State{last_sequence: last}, envelope) do
-    seq = sequence(envelope)
+  defp same_identity(%State{identity: nil}, _), do: :ok
+  defp same_identity(%State{identity: expected}, e), do: if(Map.delete(identity(e), :idempotency) == Map.delete(expected, :idempotency), do: :ok, else: {:error, :identity_mismatch})
+  defp unique(%State{seen_ids: ids}, %{id: id}), do: if(MapSet.member?(ids, id), do: {:error, :duplicate_transition}, else: :ok)
 
-    cond do
-      not is_integer(seq) -> {:error, :malformed_sequence}
-      seq == last + 1 -> :ok
-      seq <= last -> {:error, :stale_transition}
-      true -> {:error, :out_of_order_transition}
+  defp sequential(%State{last_sequence: last}, e) do
+    case sequence(e) do
+      x when x == last + 1 -> :ok
+      x when is_integer(x) and x <= last -> {:error, :stale_transition}
+      x when is_integer(x) -> {:error, :out_of_order_transition}
+      _ -> {:error, :malformed_sequence}
     end
   end
 
-  defp reject_duplicate(%State{seen_ids: seen}, %{id: id}) do
-    if MapSet.member?(seen, id), do: {:error, :duplicate_transition}, else: :ok
-  end
-
-  defp next_state(current, event) do
-    transitions = %{
+  defp next(current, event) do
+    paths = %{
       "accepted" => ["discovered", "assessed", "ready"],
       "started" => ["accepted", "claimed", "dispatched", "running"],
       "checkpointed" => ["started", "running"],
@@ -428,14 +347,18 @@ defmodule SymphonyElixir.Toscanini.EventContract do
       "usage_limited" => ["running", "checkpointed"]
     }
 
-    if current in Map.get(transitions, event, []), do: {:ok, event}, else: {:error, {:illegal_transition, current, event}}
+    if current in Map.get(paths, event, []), do: {:ok, event}, else: {:error, {:illegal_transition, current, event}}
   end
 
-  defp lifecycle(%{data: %{lifecycle: %{state: state}}}), do: state
-  defp lifecycle(_), do: nil
-  defp identity(%{data: %{identity: identity}}), do: identity
-  defp stable_identity(identity), do: Map.delete(identity, :idempotency)
-  defp sequence(%{data: %{delivery: %{sequence: sequence}}}) when is_integer(sequence), do: sequence
-  defp sequence(_), do: nil
-  defp present?(value), do: value not in [nil, "", %{}]
+  defp lifecycle(%{data: %{lifecycle: %{state: x}}}), do: x
+  defp identity(%{data: %{identity: x}}), do: x
+  defp sequence(%{data: %{delivery: %{sequence: x}}}), do: x
+
+  defp safe(fun) do
+    fun.()
+  rescue
+    _ -> {:error, :malformed_envelope}
+  catch
+    _, _ -> {:error, :malformed_envelope}
+  end
 end

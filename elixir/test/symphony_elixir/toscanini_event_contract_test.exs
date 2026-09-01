@@ -14,19 +14,19 @@ defmodule SymphonyElixir.Toscanini.EventContractTest do
       dataschema: "urn:sysmiq:test:1",
       correlation_id: "run-1",
       data: %{
-        envelope_version: "1.0",
+        envelope_version: "1.0.0",
         kind: "event",
         message_id: id,
         correlation_id: "run-1",
         causation_id: from,
         sender: %{kind: "worker", id: "w1", role: "implementation"},
         recipient: %{kind: "role", id: "programme", role: "programme"},
-        authority_ref: %{repository: "moonshotbro/symphony", issue: 51, expected_revision: "abc1234"},
+        authority_ref: %{repository: "moonshotbro/symphony", issue: 51, pr: nil, url: "https://github.com/moonshotbro/symphony/issues/51", expected_revision: "abc1234"},
         identity: %{programme: "p1", repo: "moonshotbro/symphony", issue: 51, pr: nil, role: "implementation", task: "t1", attempt: 0, fence: 1, idempotency: "i-#{id}", exact_revision: "abc1234"},
-        lifecycle: %{state: name},
+        lifecycle: %{state: name, terminal_reason: nil, blocking_reason: nil, requested_action: nil},
         evidence: %{refs: []},
         delivery: %{idempotency_key: "i-#{id}", sequence: seq},
-        privacy: %{classification: "metadata", retention: "audit"}
+        privacy: %{classification: "metadata", retention: "audit", redacted: false}
       }
     }
   end
@@ -35,7 +35,13 @@ defmodule SymphonyElixir.Toscanini.EventContractTest do
     assert {:ok, envelope} = EventContract.new(event("e1", 1, "accepted"))
     assert EventContract.event?(envelope)
     assert :ok = EventContract.validate(envelope)
-    command = %{event("c1", 1, "accepted") | type: "sysmiq.command.dispatch_requested.v1", data: envelope.data |> Map.put(:kind, "command") |> Map.put(:message_id, "c1")}
+
+    command = %{
+      event("c1", 1, "accepted")
+      | type: "sysmiq.command.dispatch_requested.v1",
+        data: envelope.data |> Map.put(:kind, "command") |> Map.put(:message_id, "c1") |> put_in([:lifecycle, :requested_action], "dispatch_requested")
+    }
+
     assert {:ok, command} = EventContract.new(command)
     assert {:error, :commands_are_not_factual_events} = EventContract.transition(EventContract.initial_state(), command)
   end
@@ -86,5 +92,31 @@ defmodule SymphonyElixir.Toscanini.EventContractTest do
     assert {:error, :malformed_data} = EventContract.new(bad_url)
     bad_pr = put_in(event("e1", 1, "accepted").data[:authority_ref][:pr], 4)
     assert {:error, :malformed_data} = EventContract.new(bad_pr)
+  end
+
+  test "authority is exact, complete, and bound to one canonical GitHub reference parser" do
+    base = event("e1", 1, "accepted")
+
+    assert {:error, :malformed_data} = EventContract.new(put_in(base.data[:authority_ref][:pr], 7))
+    assert {:error, :malformed_data} = EventContract.new(put_in(base.data[:authority_ref][:expected_revision], nil))
+    assert {:error, :malformed_data} = EventContract.new(put_in(base.data[:authority_ref][:url], "https://github.com/moonshotbro/symphony/issues/52"))
+    assert {:error, :malformed_data} = EventContract.new(put_in(base.data[:authority_ref][:url], "https://github.com/other/repo/issues/51"))
+    assert {:error, :malformed_data} = EventContract.new(put_in(base.data[:authority_ref][:url], "https://user:pass@github.com/moonshotbro/symphony/issues/51"))
+    assert {:error, :malformed_data} = EventContract.new(put_in(base.data[:authority_ref][:url], "https://github.com/moonshotbro/symphony/issues/51?token=x"))
+    assert {:error, :malformed_data} = EventContract.new(put_in(base.data[:authority_ref][:url], "git@github.com:moonshotbro/symphony.git"))
+    assert {:error, :malformed_data} = EventContract.new(put_in(base.data[:authority_ref][:url], "file:///tmp/issue"))
+    assert {:error, :malformed_data} = EventContract.new(put_in(base.data[:authority_ref], Map.delete(base.data.authority_ref, :url)))
+  end
+
+  test "direct struct validation and public helpers are total for hostile BEAM terms" do
+    assert {:ok, %EventContract{} = envelope} = EventContract.new(event("e1", 1, "accepted"))
+    assert :ok = EventContract.validate(envelope)
+    hostile_data = %{envelope.data | identity: %{envelope.data.identity | task: self()}}
+    assert {:error, :malformed_data} = EventContract.validate(%EventContract{envelope | data: hostile_data})
+    improper_evidence = %{envelope.data | evidence: %{envelope.data.evidence | refs: [1 | :tail]}}
+    assert {:error, :malformed_data} = EventContract.validate(%EventContract{envelope | data: improper_evidence})
+    assert {:error, :unknown_field} = EventContract.new(%{event("e1", 1, "accepted") | data: %{bad: fn -> :ok end}})
+    assert {:error, :malformed_state} = EventContract.transition(%{}, envelope)
+    assert {:error, :malformed_replay} = EventContract.replay([envelope | :tail])
   end
 end
