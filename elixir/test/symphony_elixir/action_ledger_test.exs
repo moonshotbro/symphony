@@ -229,6 +229,38 @@ defmodule SymphonyElixir.ActionLedgerTest do
     refute encoded =~ "dispatch-current-issue"
   end
 
+  test "typed host assertions survive reload while malformed assertions fail closed", %{path: path} do
+    ledger = start_ledger(path)
+    assert {:ok, action, :new} = ActionLedger.plan(ledger, intent())
+
+    effect = %{
+      "thread_id" => "thread-1",
+      "turn_id" => "turn-1",
+      "session_correlation_id" => "thread-1-turn-1",
+      "workspace_key" => "GH-2",
+      "host_assertion" => %{"type" => "worker_host", "value" => "local"}
+    }
+
+    assert {:ok, persisted} = ActionLedger.transition(ledger, action.id, :dispatched, effect)
+    assert persisted.observed_effect == effect
+    GenServer.stop(ledger)
+
+    recovered = start_ledger(path)
+    assert {:ok, reloaded} = ActionLedger.get(recovered, action.id)
+    assert reloaded.state == :uncertain
+    assert reloaded.observed_effect == Map.put(effect, "disposition", "restart_reconciliation_required")
+
+    assert {:error, {:field_value_invalid, "host_assertion"}} =
+             ActionLedger.observe_effect(recovered, action.id, %{
+               "host_assertion" => %{"type" => "worker_host", "value" => "local", "extra" => "no"}
+             })
+
+    assert {:error, {:field_value_invalid, "host_assertion"}} =
+             ActionLedger.observe_effect(recovered, action.id, %{
+               "host_assertion" => %{"type" => "worker_host", "value" => "Bearer secret-token"}
+             })
+  end
+
   test "reconciler returns each operator disposition deterministically", %{path: path} do
     ledger = start_ledger(path)
 
