@@ -2246,7 +2246,6 @@ defmodule SymphonyElixir.Orchestrator do
     case inspect_recovered_action(action_ledger, action, inspector) do
       {:ok, :already_satisfied} -> claimed
       {:ok, :retryable_failure} -> claimed
-      {:ok, :compensated} -> claimed
       _ -> maybe_claim_action(claimed, action)
     end
   end

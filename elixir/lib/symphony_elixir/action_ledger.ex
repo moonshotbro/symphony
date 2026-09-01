@@ -151,7 +151,7 @@ defmodule SymphonyElixir.ActionLedger do
   preventing a recovered dispatch from being retried blindly.
   """
   @spec inspect_recovered(GenServer.server(), String.t(), map()) ::
-          {:ok, Action.t(), :already_satisfied | :retryable_failure | :quarantined | :compensated}
+          {:ok, Action.t(), :already_satisfied | :retryable_failure | :quarantined}
           | {:error, term()}
   def inspect_recovered(server \\ __MODULE__, action_id, evidence) do
     GenServer.call(server, {:inspect_recovered, action_id, evidence})
@@ -626,15 +626,6 @@ defmodule SymphonyElixir.ActionLedger do
       false -> {:ok, :quarantined, %{"disposition" => "inspection_not_authoritative"}}
       nil -> {:error, {:field_value_invalid, "provider"}}
     end
-  end
-
-  defp settle_existing_effect(
-         %Action{expected_postcondition: "codex.session_observed"},
-         "codex",
-         %{"disposition" => "legacy_zero_turn_compensated", "workspace_key" => workspace_key}
-       )
-       when is_binary(workspace_key) do
-    {:ok, :compensated, %{"workspace_key" => workspace_key, "disposition" => "legacy_zero_turn_compensated"}}
   end
 
   defp settle_existing_effect(%Action{expected_postcondition: "codex.session_observed"}, "codex", evidence) do

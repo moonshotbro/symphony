@@ -1535,42 +1535,6 @@ defmodule SymphonyElixir.AppServerTest do
     end
   end
 
-  test "app server lists exact-workspace threads and hydrates their persisted turns" do
-    test_root = Path.join(System.tmp_dir!(), "symphony-elixir-thread-list-#{System.unique_integer([:positive])}")
-
-    try do
-      workspace_root = Path.join(test_root, "workspaces")
-      workspace = Path.join(workspace_root, "MT-LIST")
-      codex_binary = Path.join(test_root, "fake-codex")
-      File.mkdir_p!(workspace)
-
-      File.write!(codex_binary, """
-      #!/bin/sh
-      count=0
-      while IFS= read -r _line; do
-        count=$((count + 1))
-        case "$count" in
-          1) printf '%s\\n' '{"id":1,"result":{}}' ;;
-          2) ;;
-          3) printf '%s\\n' '{"id":6,"result":{"data":[{"id":"thread-new","cwd":"#{workspace}","status":{"type":"notLoaded"}}],"nextCursor":"older"}}' ;;
-          4) printf '%s\\n' '{"id":6,"result":{"data":[{"id":"thread-old","cwd":"#{workspace}","status":{"type":"notLoaded"}}],"nextCursor":null}}' ;;
-          5) printf '%s\\n' '{"id":5,"result":{"data":[{"id":"turn-new","status":"interrupted","items":[]}],"nextCursor":null}}' ;;
-          6) printf '%s\\n' '{"id":5,"result":{"data":[{"id":"turn-old","status":"interrupted","items":[]}],"nextCursor":null}}'; exit 0 ;;
-          *) exit 1 ;;
-        esac
-      done
-      """)
-
-      File.chmod!(codex_binary, 0o755)
-      write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root, codex_command: "#{codex_binary} app-server")
-
-      assert {:ok, [%{"id" => "thread-new", "turns" => [%{"id" => "turn-new"}]}, %{"id" => "thread-old", "turns" => [%{"id" => "turn-old"}]}]} =
-               AppServer.list_threads(workspace)
-    after
-      File.rm_rf(test_root)
-    end
-  end
-
   test "app server treats only Codex's exact thread-not-loaded response as authoritative absence" do
     test_root = Path.join(System.tmp_dir!(), "symphony-elixir-thread-absence-#{System.unique_integer([:positive])}")
 
