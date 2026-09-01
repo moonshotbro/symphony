@@ -158,7 +158,7 @@ codex:
     saved_project_id: b12752f9-9a65-4194-bc49-77808b21d767
     native_project_id: 01a04aab-c77c-79b0-ab09-65187353bb4b
     repository: moonshotbro/sysmiq-symphony
-    root: /Users/sysmiq/sysmiq-symphony
+    root: /path/to/symphony-repository
 ```
 
 The runtime contract compiler rejects missing, ambiguous, or mismatched

@@ -6,7 +6,7 @@ defmodule SymphonyElixir.Codex.TaskLaunchContractTest do
   test "compiles a deterministic, project-bound worker contract" do
     attrs = valid_attrs()
     assert {:ok, first} = TaskLaunchContract.compile(attrs)
-    assert {:ok, second} = TaskLaunchContract.compile(Map.put(attrs, :title, "ignored"))
+    assert {:ok, second} = TaskLaunchContract.compile(attrs)
     assert first.contract_id == second.contract_id
     assert first.title == "Implementation SYS-50: define contract"
     assert first.project.saved_project_id == "b12752f9-9a65-4194-bc49-77808b21d767"
@@ -18,6 +18,9 @@ defmodule SymphonyElixir.Codex.TaskLaunchContractTest do
 
     assert {:error, errors} = TaskLaunchContract.compile(Map.delete(valid_attrs(), :project))
     assert {:missing, :project} in errors
+
+    assert {:error, errors} = TaskLaunchContract.compile(%{valid_attrs() | exact_revision: String.duplicate("a", 39)})
+    assert :invalid_exact_revision in errors
   end
 
   test "enforces role and goal policy boundaries" do
@@ -34,6 +37,38 @@ defmodule SymphonyElixir.Codex.TaskLaunchContractTest do
     assert Enum.map(contracts, & &1.contract_id) |> Enum.uniq() |> length() == 2
   end
 
+  test "identity changes for every authority-bearing dimension" do
+    {:ok, base} = TaskLaunchContract.compile(valid_attrs())
+
+    for {key, value} <- [
+          {:task, "other"},
+          {:model, :"gpt-5.6-terra"},
+          {:effort, :high},
+          {:goal_policy, :none},
+          {:dependencies, ["SYS-49"]},
+          {:permissions, ["read-only"]},
+          {:evidence_gates, ["review"]},
+          {:evidence, ["different"]},
+          {:stall_policy, :bounded},
+          {:closeout_policy, :archive_exact},
+          {:idempotency_identity, "other"},
+          {:conflict_identity, "other"}
+        ] do
+      attrs = Map.put(valid_attrs(), key, value)
+      assert {:ok, changed} = TaskLaunchContract.compile(attrs)
+      refute changed.contract_id == base.contract_id
+    end
+  end
+
+  test "rejects ambiguous keys and arbitrary typed values" do
+    assert {:error, [:ambiguous_contract_keys]} =
+             TaskLaunchContract.compile(Map.put(valid_attrs(), "task", "ambiguous"))
+
+    assert {:error, errors} = TaskLaunchContract.compile(%{valid_attrs() | dependencies: %{}, evidence: 1})
+    assert :invalid_dependencies in errors
+    assert :invalid_evidence in errors
+  end
+
   defp valid_attrs do
     %{
       programme: "build-toscanini",
@@ -47,7 +82,15 @@ defmodule SymphonyElixir.Codex.TaskLaunchContractTest do
       write_boundary: :product,
       evidence: ["issue-50"],
       model: :"gpt-5.6-luna",
+      effort: :medium,
       goal_policy: :worker,
+      dependencies: [],
+      permissions: ["workspace-write"],
+      evidence_gates: ["tests"],
+      stall_policy: :fail_closed,
+      closeout_policy: :reconcile,
+      idempotency_identity: "issue-50/implementation/sha",
+      conflict_identity: "moonshotbro/sysmiq-symphony:SYS-50:implementation",
       project: %{
         saved_project_id: "b12752f9-9a65-4194-bc49-77808b21d767",
         native_project_id: "01a04aab-c77c-79b0-ab09-65187353bb4b",
