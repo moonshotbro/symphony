@@ -39,6 +39,21 @@ defmodule SymphonyElixir.AppServerTest do
     end
   end
 
+  test "public start session rejects a repository workspace without a bound contract before opening Codex" do
+    root = Path.join(System.tmp_dir!(), "symphony-app-server-public-boundary-#{System.unique_integer([:positive])}")
+    workspace_root = Path.join(root, "workspaces")
+    workspace = Path.join(workspace_root, "SYS-50")
+    File.mkdir_p!(workspace)
+    {_, 0} = System.cmd("git", ["init", "-q", workspace])
+
+    try do
+      write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root)
+      assert {:error, :project_bound_task_contract_missing} = AppServer.start_session(workspace)
+    after
+      File.rm_rf(root)
+    end
+  end
+
   test "app server rejects symlink escape cwd paths under the workspace root" do
     test_root =
       Path.join(

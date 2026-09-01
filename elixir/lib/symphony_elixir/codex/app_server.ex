@@ -47,7 +47,7 @@ defmodule SymphonyElixir.Codex.AppServer do
     worker_host = Keyword.get(opts, :worker_host)
     dynamic_tool_binding = DynamicTool.bind()
 
-    with {:ok, contract} <- validate_launch_contract(Keyword.get(opts, :task_contract)),
+    with {:ok, contract} <- validate_launch_contract(Keyword.get(opts, :task_contract), workspace),
          {:ok, expanded_workspace} <- validate_workspace_cwd(workspace, worker_host),
          {:ok, port} <- start_port(expanded_workspace, worker_host, dynamic_tool_binding) do
       metadata = port_metadata(port, worker_host)
@@ -500,16 +500,16 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp validate_launch_contract(nil) do
-    if TaskLaunchContract.project_binding_enabled?(),
+  defp validate_launch_contract(nil, workspace) do
+    if TaskLaunchContract.project_binding_enabled?() or workspace_repository?(workspace),
       do: {:error, :project_bound_task_contract_missing},
       else: {:ok, nil}
   end
 
-  defp validate_launch_contract(%TaskLaunchContract{} = contract), do: {:ok, contract}
+  defp validate_launch_contract(%TaskLaunchContract{} = contract, _workspace), do: {:ok, contract}
 
-  defp validate_launch_contract(contract) when is_map(contract) do
-    if TaskLaunchContract.project_binding_enabled?() do
+  defp validate_launch_contract(contract, workspace) when is_map(contract) do
+    if TaskLaunchContract.project_binding_enabled?() or workspace_repository?(workspace) do
       {:error, :untrusted_project_bound_task_contract}
     else
       case TaskLaunchContract.compile(contract) do
@@ -519,7 +519,15 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp validate_launch_contract(_), do: {:error, :invalid_task_launch_contract}
+  defp validate_launch_contract(_, _workspace), do: {:error, :invalid_task_launch_contract}
+
+  defp workspace_repository?(workspace) when is_binary(workspace) do
+    match?({_output, 0}, System.cmd("git", ["-C", workspace, "rev-parse", "--is-inside-work-tree"], stderr_to_stdout: true))
+  rescue
+    ErlangError -> false
+  end
+
+  defp workspace_repository?(_), do: false
 
   defp executing_params(contract) do
     %{
