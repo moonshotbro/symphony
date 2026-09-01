@@ -161,9 +161,14 @@ codex:
     root: /path/to/symphony-repository
 ```
 
-The runtime contract compiler rejects missing, ambiguous, or mismatched
-bindings before any App Server task creation. Task creation and authoritative
-readback are implemented by a later integration slice.
+When enabled, the runtime derives the launch contract from this binding, the
+authoritative tracker issue, and the checked-out workspace revision. It rejects
+missing, ambiguous, or mismatched bindings before opening the App Server. The
+supported protocol carries `cwd`, model, effort and policy on `thread/start`,
+sets the concise visible name with `thread/name/set`, then requires
+`thread/read` to confirm the persisted thread identity before the first turn.
+The saved Codex and native project IDs remain internal evidence namespaces:
+they are never interchanged or sent as an unsupported `projectId` field.
 
 Notes:
 

@@ -1,7 +1,46 @@
 defmodule SymphonyElixir.Codex.TaskLaunchContractTest do
-  use ExUnit.Case, async: true
+  use SymphonyElixir.TestSupport
 
   alias SymphonyElixir.Codex.TaskLaunchContract
+
+  test "runtime compiler derives enabled binding from authority and rejects non-repositories" do
+    root = Path.join(System.tmp_dir!(), "symphony-contract-runtime-#{System.unique_integer([:positive])}")
+    File.mkdir_p!(root)
+    {_, 0} = System.cmd("git", ["init", "-q", root])
+    {_, 0} = System.cmd("git", ["-C", root, "config", "user.email", "test@example.test"])
+    {_, 0} = System.cmd("git", ["-C", root, "config", "user.name", "Test"])
+    {_, 0} = System.cmd("git", ["-C", root, "remote", "add", "origin", "https://github.com/moonshotbro/sysmiq-symphony.git"])
+    File.write!(Path.join(root, "README.md"), "test\n")
+    {_, 0} = System.cmd("git", ["-C", root, "add", "."])
+    {_, 0} = System.cmd("git", ["-C", root, "commit", "-qm", "test"])
+
+    try do
+      write_workflow_file!(Workflow.workflow_file_path(),
+        codex_project_binding: %{
+          enabled: true,
+          programme: "build-toscanini",
+          saved_project_id: "b12752f9-9a65-4194-bc49-77808b21d767",
+          native_project_id: "01a04aab-c77c-79b0-ab09-65187353bb4b",
+          repository: "moonshotbro/sysmiq-symphony",
+          root: root
+        }
+      )
+
+      issue = %SymphonyElixir.Tracker.Issue{identifier: "SYS-50", title: "Bound worker"}
+      assert {:ok, contract} = TaskLaunchContract.from_runtime(issue, root, trigger: :integration_design)
+      assert contract.executing_identity.model == :"gpt-5.6-terra"
+      assert contract.project.saved_project_id != contract.project.native_project_id
+      assert TaskLaunchContract.prompt(contract, "work") =~ contract.contract_id
+      assert {:error, :workspace_revision_unavailable} = TaskLaunchContract.from_runtime(issue, Path.join(root, "missing"))
+    after
+      File.rm_rf(root)
+    end
+  end
+
+  test "title is total for malformed inputs" do
+    assert TaskLaunchContract.title(self()) == "Symphony task"
+    assert TaskLaunchContract.title(%{role: self(), task: %{bad: true}}) == "Task work: task"
+  end
 
   test "compiles a deterministic, project-bound worker contract" do
     attrs = valid_attrs()

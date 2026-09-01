@@ -10,6 +10,7 @@ defmodule SymphonyElixir.Codex.AppServer do
   @thread_start_id 2
   @turn_start_id 3
   @thread_read_id 4
+  @thread_name_set_id 6
   @thread_turns_list_id 5
   @thread_turns_page_size 100
   @max_thread_turn_pages 1_000
@@ -26,7 +27,8 @@ defmodule SymphonyElixir.Codex.AppServer do
           thread_id: String.t(),
           workspace: Path.t(),
           worker_host: String.t() | nil,
-          dynamic_tool_binding: map()
+          dynamic_tool_binding: map(),
+          task_contract: TaskLaunchContract.t() | nil
         }
 
   @spec run(Path.t(), String.t(), map(), keyword()) :: {:ok, map()} | {:error, term()}
@@ -45,14 +47,14 @@ defmodule SymphonyElixir.Codex.AppServer do
     worker_host = Keyword.get(opts, :worker_host)
     dynamic_tool_binding = DynamicTool.bind()
 
-    with :ok <- validate_launch_contract(Keyword.get(opts, :task_contract)),
+    with {:ok, contract} <- validate_launch_contract(Keyword.get(opts, :task_contract)),
          {:ok, expanded_workspace} <- validate_workspace_cwd(workspace, worker_host),
          {:ok, port} <- start_port(expanded_workspace, worker_host, dynamic_tool_binding) do
       metadata = port_metadata(port, worker_host)
 
       with {:ok, session_policies} <- session_policies(expanded_workspace, worker_host),
            {:ok, thread_id} <-
-             do_start_session(port, expanded_workspace, session_policies, dynamic_tool_binding, Keyword.get(opts, :task_contract)) do
+             do_start_session(port, expanded_workspace, session_policies, dynamic_tool_binding, contract) do
         {:ok,
          %{
            port: port,
@@ -64,7 +66,8 @@ defmodule SymphonyElixir.Codex.AppServer do
            thread_id: thread_id,
            workspace: expanded_workspace,
            worker_host: worker_host,
-           dynamic_tool_binding: dynamic_tool_binding
+           dynamic_tool_binding: dynamic_tool_binding,
+           task_contract: contract
          }}
       else
         {:error, reason} ->
@@ -470,24 +473,31 @@ defmodule SymphonyElixir.Codex.AppServer do
          workspace,
          %{approval_policy: approval_policy, thread_sandbox: thread_sandbox},
          dynamic_tool_binding,
-         _contract
+         contract
        ) do
+    params = %{
+      "approvalPolicy" => approval_policy,
+      "sandbox" => thread_sandbox,
+      "cwd" => workspace,
+      "dynamicTools" => dynamic_tool_binding.tool_specs
+    }
+
+    params = if contract, do: Map.merge(params, executing_params(contract)), else: params
+
     send_message(port, %{
       "method" => "thread/start",
       "id" => @thread_start_id,
-      "params" => %{
-        "approvalPolicy" => approval_policy,
-        "sandbox" => thread_sandbox,
-        "cwd" => workspace,
-        "dynamicTools" => dynamic_tool_binding.tool_specs
-      }
+      "params" => params
     })
 
     case await_response(port, @thread_start_id) do
       {:ok, %{"thread" => thread_payload}} ->
         case thread_payload do
-          %{"id" => thread_id} -> {:ok, thread_id}
-          _ -> {:error, {:invalid_thread_payload, thread_payload}}
+          %{"id" => thread_id} when is_binary(thread_id) and thread_id != "" ->
+            verify_started_thread(port, thread_id, workspace, contract)
+
+          _ ->
+            {:error, {:invalid_thread_payload, thread_payload}}
         end
 
       other ->
@@ -495,16 +505,72 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp validate_launch_contract(nil), do: :ok
+  defp validate_launch_contract(nil) do
+    if TaskLaunchContract.project_binding_enabled?(),
+      do: {:error, :project_bound_task_contract_missing},
+      else: {:ok, nil}
+  end
+
+  defp validate_launch_contract(%TaskLaunchContract{} = contract), do: {:ok, contract}
 
   defp validate_launch_contract(contract) when is_map(contract) do
-    case TaskLaunchContract.compile(contract) do
-      {:ok, _compiled} -> :ok
-      {:error, errors} -> {:error, {:invalid_task_launch_contract, errors}}
+    if TaskLaunchContract.project_binding_enabled?() do
+      {:error, :untrusted_project_bound_task_contract}
+    else
+      case TaskLaunchContract.compile(contract) do
+        {:ok, compiled} -> {:ok, compiled}
+        {:error, errors} -> {:error, {:invalid_task_launch_contract, errors}}
+      end
     end
   end
 
   defp validate_launch_contract(_), do: {:error, :invalid_task_launch_contract}
+
+  defp executing_params(contract) do
+    %{
+      "model" => Atom.to_string(contract.executing_identity.model),
+      "effort" => Atom.to_string(contract.executing_identity.effort)
+    }
+  end
+
+  defp verify_started_thread(_port, thread_id, _workspace, nil), do: {:ok, thread_id}
+
+  defp verify_started_thread(port, thread_id, workspace, contract) do
+    with :ok <- set_thread_name(port, thread_id, contract.title),
+         {:ok, %{"id" => ^thread_id} = thread} <- read_thread_from_port(port, thread_id),
+         :ok <- verify_thread_readback(thread, workspace, contract) do
+      {:ok, thread_id}
+    else
+      {:ok, other} -> {:error, {:invalid_thread_readback, other}}
+      {:error, reason} -> {:error, {:project_bound_thread_unverified, reason}}
+    end
+  end
+
+  defp set_thread_name(port, thread_id, name) do
+    send_message(port, %{"method" => "thread/name/set", "id" => @thread_name_set_id, "params" => %{"threadId" => thread_id, "name" => name}})
+
+    case await_response(port, @thread_name_set_id) do
+      {:ok, _} -> :ok
+      {:error, reason} -> {:error, {:thread_name_set_failed, reason}}
+    end
+  end
+
+  # credo:disable-for-next-line Credo.Check.Refactor.CyclomaticComplexity
+  defp verify_thread_readback(thread, workspace, contract) do
+    cwd = Map.get(thread, "cwd") || Map.get(thread, "workingDirectory")
+    name = Map.get(thread, "name") || Map.get(thread, "title")
+    model = Map.get(thread, "model")
+    effort = Map.get(thread, "effort")
+
+    cond do
+      cwd != workspace -> {:error, :cwd_mismatch}
+      name != contract.title -> {:error, :title_mismatch}
+      not is_nil(model) and model != Atom.to_string(contract.executing_identity.model) -> {:error, :model_mismatch}
+      not is_nil(effort) and effort != Atom.to_string(contract.executing_identity.effort) -> {:error, :effort_mismatch}
+      Map.get(thread, "ephemeral") == true -> {:error, :ephemeral_thread}
+      true -> :ok
+    end
+  end
 
   defp start_turn(port, thread_id, prompt, issue, workspace, approval_policy, turn_sandbox_policy) do
     send_message(port, %{

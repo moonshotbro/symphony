@@ -6,6 +6,8 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
   validates the authority boundary before a caller enters that effectful path.
   """
 
+  alias SymphonyElixir.Config
+
   @roles [
     :programme,
     :implementation,
@@ -46,6 +48,7 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
           root: Path.t(),
           programme: String.t()
         }
+  @type executing_identity :: %{role: role(), model: atom(), effort: atom(), title: String.t()}
   @type t :: %__MODULE__{
           contract_id: String.t(),
           programme: String.t(),
@@ -69,7 +72,8 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
           closeout_policy: atom(),
           idempotency_identity: String.t(),
           conflict_identity: String.t(),
-          commissioning_identity: String.t() | nil,
+          commissioning_identity: executing_identity() | nil,
+          executing_identity: executing_identity(),
           supersedes: String.t() | nil,
           title: String.t(),
           project: saved_project_binding()
@@ -100,6 +104,7 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
     :idempotency_identity,
     :conflict_identity,
     :commissioning_identity,
+    :executing_identity,
     :supersedes,
     :project
   ]
@@ -109,6 +114,50 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
 
   @spec supported_models() :: [atom()]
   def supported_models, do: @models
+
+  @spec project_binding_enabled?() :: boolean()
+  def project_binding_enabled?, do: binding_enabled?(Config.settings!().codex.project_binding)
+
+  @doc "Builds the only production contract source: workflow binding plus issue and workspace authority."
+  def from_runtime(issue, workspace, opts \\ [])
+
+  @spec from_runtime(map(), Path.t(), keyword()) :: {:ok, t() | nil} | {:error, term()}
+
+  def from_runtime(issue, workspace, opts) when is_map(issue) and is_binary(workspace) and is_list(opts) do
+    binding = Config.settings!().codex.project_binding
+
+    if binding_enabled?(binding) do
+      with {:ok, project} <- runtime_project(binding),
+           {:ok, revision} <- workspace_revision(workspace),
+           :ok <- repository_matches?(workspace, project.repository),
+           {:ok, attrs} <- runtime_attrs(issue, workspace, project, revision, opts) do
+        compile(attrs)
+      end
+    else
+      {:ok, nil}
+    end
+  end
+
+  def from_runtime(_, _, _), do: {:error, :invalid_runtime_launch_authority}
+
+  @spec prompt(t(), String.t()) :: String.t()
+  def prompt(%__MODULE__{} = contract, prompt) when is_binary(prompt) do
+    """
+    Symphony task launch contract (authoritative; do not reinterpret):
+    contract_hash: #{contract.contract_id}
+    repository: #{contract.repository}
+    issue: #{contract.issue_or_pr}
+    role: #{contract.role}
+    revision: #{contract.exact_revision}
+    attempt: #{contract.attempt}
+    fence: #{contract.fence}
+    executing_identity: #{Atom.to_string(contract.executing_identity.model)}/#{contract.executing_identity.effort}/#{contract.executing_identity.role}
+
+    #{prompt}
+    """
+  end
+
+  def prompt(_, _), do: ""
 
   @spec compile(map()) :: {:ok, t()} | {:error, [atom() | {atom(), term()}]}
   def compile(attrs) when is_map(attrs) do
@@ -122,6 +171,7 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
          {:ok, project} <- project_binding(values["project"], values["programme"]),
          {:ok, identity} <- identity(values, project) do
       title = title(values)
+      executing_identity = %{role: values["role"], model: values["model"], effort: values["effort"], title: title}
 
       {:ok,
        struct!(__MODULE__, %{
@@ -148,6 +198,7 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
          idempotency_identity: values["idempotency_identity"],
          conflict_identity: values["conflict_identity"],
          commissioning_identity: values["commissioning_identity"],
+         executing_identity: executing_identity,
          supersedes: values["supersedes"],
          title: title,
          project: project
@@ -165,16 +216,18 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
 
   def compile_many(_), do: {:error, [:contracts_not_a_list]}
 
-  @spec title(t() | map()) :: String.t()
+  @spec title(term()) :: String.t()
   def title(%__MODULE__{} = contract), do: contract.title
 
   def title(attrs) when is_map(attrs) do
     attrs = stringify_keys(attrs)
-    role = attrs["role"] |> to_string() |> String.replace("_", " ")
-    issue = attrs["issue_or_pr"] || "work"
-    task = attrs["task"] || "task"
+    role = safe_title_part(attrs["role"], "task") |> String.replace("_", " ")
+    issue = safe_title_part(attrs["issue_or_pr"], "work")
+    task = safe_title_part(attrs["task"], "task")
     "#{String.capitalize(role)} #{issue}: #{task}" |> String.slice(0, 120)
   end
+
+  def title(_), do: "Symphony task"
 
   defp validate(attrs) do
     required =
@@ -245,7 +298,7 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
     |> add_unless(normalize_atom(attrs["closeout_policy"]) in @closeout_policies, :invalid_closeout_policy)
     |> add_unless(is_binary(attrs["idempotency_identity"]), :invalid_idempotency_identity)
     |> add_unless(is_binary(attrs["conflict_identity"]), :invalid_conflict_identity)
-    |> add_unless(is_nil(attrs["commissioning_identity"]) or is_binary(attrs["commissioning_identity"]), :invalid_commissioning_identity)
+    |> add_unless(valid_identity?(attrs["commissioning_identity"]), :invalid_commissioning_identity)
     |> add_unless(is_nil(attrs["supersedes"]) or is_binary(attrs["supersedes"]), :invalid_supersession_identity)
     |> add_unless(role != :programme or goal == :programme, :programme_goal_required)
     |> add_unless(role == :programme or goal != :programme, :programme_goal_role_required)
@@ -345,6 +398,7 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
           values["idempotency_identity"],
           values["conflict_identity"],
           values["commissioning_identity"],
+          values["role"],
           values["supersedes"],
           values["evidence"],
           project.saved_project_id,
@@ -406,8 +460,100 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
   defp absolute_root?(_), do: false
   defp uuid?(value) when is_binary(value), do: Regex.match?(~r/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/, value)
   defp uuid?(_), do: false
-  defp stringify_keys(map), do: Map.new(map, fn {key, value} -> {to_string(key), value} end)
+  defp stringify_keys(map), do: Map.new(map, fn {key, value} -> {safe_key(key), value} end)
   defp safe_key(key) when is_atom(key), do: Atom.to_string(key)
   defp safe_key(key) when is_binary(key), do: key
   defp safe_key(_), do: nil
+
+  defp safe_title_part(value, _fallback) when is_binary(value), do: String.slice(value, 0, 80)
+  defp safe_title_part(value, _fallback) when is_atom(value) and not is_nil(value), do: Atom.to_string(value)
+  defp safe_title_part(_, fallback), do: fallback
+
+  defp valid_identity?(nil), do: true
+
+  defp valid_identity?(%{role: role, model: model, effort: effort, title: title}),
+    do: role in @roles and model in @models and effort in @efforts and is_binary(title)
+
+  defp valid_identity?(_), do: false
+
+  defp binding_enabled?(%{enabled: true}), do: true
+  defp binding_enabled?(%{"enabled" => true}), do: true
+  defp binding_enabled?(_), do: false
+
+  defp runtime_project(binding) do
+    project = Map.take(Map.from_struct(binding), [:saved_project_id, :native_project_id, :repository, :root, :programme])
+    project_binding(project, Map.get(project, :programme))
+  rescue
+    Protocol.UndefinedError -> {:error, :invalid_project_binding}
+  end
+
+  defp workspace_revision(workspace) do
+    case System.cmd("git", ["-C", workspace, "rev-parse", "HEAD"], stderr_to_stdout: true) do
+      {revision, 0} -> {:ok, String.trim(revision)}
+      _ -> {:error, :workspace_revision_unavailable}
+    end
+  rescue
+    ErlangError -> {:error, :workspace_revision_unavailable}
+  end
+
+  defp repository_matches?(workspace, repository) do
+    case System.cmd("git", ["-C", workspace, "config", "--get", "remote.origin.url"], stderr_to_stdout: true) do
+      {remote, 0} -> if repository_name(String.trim(remote)) == repository, do: :ok, else: {:error, :workspace_repository_mismatch}
+      _ -> {:error, :workspace_repository_unavailable}
+    end
+  rescue
+    ErlangError -> {:error, :workspace_repository_unavailable}
+  end
+
+  defp repository_name(remote) when is_binary(remote) do
+    remote
+    |> String.replace(~r/^git@[^:]+:/, "")
+    |> String.replace(~r|^https?://[^/]+/|, "")
+    |> String.replace_suffix(".git", "")
+  end
+
+  defp runtime_attrs(issue, workspace, project, revision, opts) do
+    identifier = Map.get(issue, :identifier) || Map.get(issue, "identifier")
+    title = Map.get(issue, :title) || Map.get(issue, "title")
+    attempt = Keyword.get(opts, :attempt, 0)
+    role = Keyword.get(opts, :role, :implementation)
+    trigger = Keyword.get(opts, :trigger, :bounded)
+    {model, effort} = model_for_trigger(trigger)
+
+    if is_binary(identifier) and is_binary(title) and is_integer(attempt) and attempt >= 0 do
+      {:ok,
+       %{
+         programme: project.programme,
+         repository: project.repository,
+         issue_or_pr: identifier,
+         role: role,
+         task: title,
+         attempt: attempt,
+         fence: "#{identifier}:#{attempt}:#{revision}",
+         exact_revision: revision,
+         write_boundary: :product,
+         evidence: [],
+         model: model,
+         effort: effort,
+         trigger: trigger,
+         goal_policy: if(role in @worker_goal_roles, do: :worker, else: :none),
+         dependencies: [],
+         permissions: ["workspace-write"],
+         evidence_gates: ["project-bound-readback"],
+         stall_policy: :fail_closed,
+         closeout_policy: :reconcile,
+         idempotency_identity: "#{identifier}/#{role}/#{revision}/#{attempt}",
+         conflict_identity: "#{project.repository}:#{identifier}:#{role}:#{revision}",
+         commissioning_identity: nil,
+         supersedes: nil,
+         project: Map.put(project, :root, workspace)
+       }}
+    else
+      {:error, :invalid_issue_authority}
+    end
+  end
+
+  defp model_for_trigger(trigger) when trigger in @terra_triggers, do: {:"gpt-5.6-terra", :medium}
+  defp model_for_trigger(trigger) when trigger in @sol_triggers, do: {:"gpt-5.6-sol", :high}
+  defp model_for_trigger(_), do: {:"gpt-5.6-luna", :medium}
 end

@@ -4,7 +4,7 @@ defmodule SymphonyElixir.AgentRunner do
   """
 
   require Logger
-  alias SymphonyElixir.Codex.AppServer
+  alias SymphonyElixir.Codex.{AppServer, TaskLaunchContract}
   alias SymphonyElixir.{Config, PromptBuilder, Tracker, Workspace}
   alias SymphonyElixir.Tracker.Issue
 
@@ -89,7 +89,9 @@ defmodule SymphonyElixir.AgentRunner do
     max_turns = Keyword.get(opts, :max_turns, Config.settings!().agent.max_turns)
     issue_state_fetcher = Keyword.get(opts, :issue_state_fetcher, &Tracker.fetch_issues_by_ids/1)
 
-    with {:ok, session} <- AppServer.start_session(workspace, worker_host: worker_host) do
+    with {:ok, contract} <- TaskLaunchContract.from_runtime(issue, workspace, opts),
+         {:ok, session} <-
+           AppServer.start_session(workspace, worker_host: worker_host, task_contract: contract) do
       try do
         do_run_codex_turns(session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, 1, max_turns)
       after
@@ -99,7 +101,7 @@ defmodule SymphonyElixir.AgentRunner do
   end
 
   defp do_run_codex_turns(app_session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, turn_number, max_turns) do
-    prompt = build_turn_prompt(issue, opts, turn_number, max_turns)
+    prompt = build_turn_prompt(issue, opts, turn_number, max_turns, app_session)
 
     with {:ok, turn_session} <-
            AppServer.run_turn(
@@ -139,9 +141,14 @@ defmodule SymphonyElixir.AgentRunner do
     end
   end
 
-  defp build_turn_prompt(issue, opts, 1, _max_turns), do: PromptBuilder.build_prompt(issue, opts)
+  defp build_turn_prompt(issue, opts, 1, _max_turns, %{task_contract: nil}),
+    do: PromptBuilder.build_prompt(issue, opts)
 
-  defp build_turn_prompt(_issue, _opts, turn_number, max_turns) do
+  defp build_turn_prompt(issue, opts, 1, _max_turns, %{task_contract: contract}) do
+    TaskLaunchContract.prompt(contract, PromptBuilder.build_prompt(issue, opts))
+  end
+
+  defp build_turn_prompt(_issue, _opts, turn_number, max_turns, _session) do
     """
     Continuation guidance:
 
