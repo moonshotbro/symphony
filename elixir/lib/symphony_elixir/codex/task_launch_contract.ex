@@ -48,7 +48,39 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
           root: Path.t(),
           programme: String.t()
         }
-  @type executing_identity :: %{role: role(), model: atom(), effort: atom(), title: String.t()}
+  @type executing_identity :: %{
+          contract_id: String.t(),
+          task: String.t(),
+          title: String.t(),
+          model: atom(),
+          effort: atom(),
+          role: role(),
+          issue_or_pr: String.t(),
+          exact_revision: String.t(),
+          attempt: non_neg_integer(),
+          fence: String.t(),
+          project: saved_project_binding()
+        }
+  @type commissioning_identity ::
+          %{kind: :human, authority: String.t()}
+          | %{
+              kind: :agent,
+              contract_id: String.t(),
+              task_id: String.t(),
+              role: role(),
+              model: atom(),
+              effort: atom()
+            }
+  @type escalation_link ::
+          %{
+            prior_contract_id: String.t(),
+            prior_task_id: String.t(),
+            prior_role: role(),
+            prior_model: atom(),
+            prior_effort: atom(),
+            trigger: atom(),
+            reason: String.t()
+          }
   @type t :: %__MODULE__{
           contract_id: String.t(),
           programme: String.t(),
@@ -72,9 +104,10 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
           closeout_policy: atom(),
           idempotency_identity: String.t(),
           conflict_identity: String.t(),
-          commissioning_identity: executing_identity() | nil,
+          commissioning_identity: commissioning_identity() | nil,
           executing_identity: executing_identity(),
-          supersedes: String.t() | nil,
+          escalation: escalation_link() | nil,
+          supersedes: %{contract_id: String.t(), resolution: String.t()} | nil,
           title: String.t(),
           project: saved_project_binding()
         }
@@ -105,6 +138,7 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
     :conflict_identity,
     :commissioning_identity,
     :executing_identity,
+    :escalation,
     :supersedes,
     :project
   ]
@@ -171,7 +205,7 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
          {:ok, project} <- project_binding(values["project"], values["programme"]),
          {:ok, identity} <- identity(values, project) do
       title = title(values)
-      executing_identity = %{role: values["role"], model: values["model"], effort: values["effort"], title: title}
+      executing_identity = executing_identity(identity, values, project, title)
 
       {:ok,
        struct!(__MODULE__, %{
@@ -199,6 +233,7 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
          conflict_identity: values["conflict_identity"],
          commissioning_identity: values["commissioning_identity"],
          executing_identity: executing_identity,
+         escalation: values["escalation"],
          supersedes: values["supersedes"],
          title: title,
          project: project
@@ -238,6 +273,12 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
     if missing != [] do
       {:error, Enum.map(missing, &{:missing, String.to_existing_atom(&1)})}
     else
+      attrs =
+        attrs
+        |> Map.put("commissioning_identity", normalize_commissioning(attrs["commissioning_identity"]))
+        |> Map.put("escalation", normalize_escalation(attrs["escalation"]))
+        |> Map.put("supersedes", normalize_supersession(attrs["supersedes"]))
+
       role = normalize_atom(attrs["role"])
       trigger = normalize_atom(attrs["trigger"] || "bounded")
       model = normalize_atom(attrs["model"])
@@ -265,6 +306,7 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
              "stall_policy" => normalize_atom(attrs["stall_policy"]),
              "closeout_policy" => normalize_atom(attrs["closeout_policy"]),
              "commissioning_identity" => attrs["commissioning_identity"],
+             "escalation" => attrs["escalation"],
              "supersedes" => attrs["supersedes"]
            })}
 
@@ -298,14 +340,23 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
     |> add_unless(normalize_atom(attrs["closeout_policy"]) in @closeout_policies, :invalid_closeout_policy)
     |> add_unless(is_binary(attrs["idempotency_identity"]), :invalid_idempotency_identity)
     |> add_unless(is_binary(attrs["conflict_identity"]), :invalid_conflict_identity)
-    |> add_unless(valid_identity?(attrs["commissioning_identity"]), :invalid_commissioning_identity)
-    |> add_unless(is_nil(attrs["supersedes"]) or is_binary(attrs["supersedes"]), :invalid_supersession_identity)
+    |> add_unless(valid_commissioning?(attrs["commissioning_identity"]), :invalid_commissioning_identity)
+    |> add_unless(
+      valid_escalation?(attrs["escalation"], trigger) or direct_human_commission?(attrs["commissioning_identity"]),
+      :invalid_escalation_link
+    )
+    |> add_unless(valid_supersession?(attrs["supersedes"]), :invalid_supersession_identity)
     |> add_unless(role != :programme or goal == :programme, :programme_goal_required)
     |> add_unless(role == :programme or goal != :programme, :programme_goal_role_required)
     |> add_unless(goal != :worker or role in @worker_goal_roles, :worker_goal_role_invalid)
     |> add_unless(
       role not in [:independent_review, :landing, :monitor, :telemetry, :acceptance] or goal == :none,
       :role_requires_no_goal
+    )
+    |> add_unless(
+      not escalation_trigger?(trigger) or direct_human_commission?(attrs["commissioning_identity"]) or
+        valid_escalation?(attrs["escalation"], trigger),
+      :escalation_link_required
     )
   end
 
@@ -398,7 +449,7 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
           values["idempotency_identity"],
           values["conflict_identity"],
           values["commissioning_identity"],
-          values["role"],
+          values["escalation"],
           values["supersedes"],
           values["evidence"],
           project.saved_project_id,
@@ -438,7 +489,7 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
     length(keys) != length(Enum.uniq(normalized)) or
       Enum.any?(
         normalized,
-        &(&1 not in ~w(programme repository issue_or_pr role task attempt fence exact_revision write_boundary evidence model effort trigger goal_policy dependencies permissions evidence_gates stall_policy closeout_policy idempotency_identity conflict_identity commissioning_identity supersedes project))
+        &(&1 not in ~w(programme repository issue_or_pr role task attempt fence exact_revision write_boundary evidence model effort trigger goal_policy dependencies permissions evidence_gates stall_policy closeout_policy idempotency_identity conflict_identity commissioning_identity escalation supersedes project))
       )
   end
 
@@ -469,12 +520,70 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
   defp safe_title_part(value, _fallback) when is_atom(value) and not is_nil(value), do: Atom.to_string(value)
   defp safe_title_part(_, fallback), do: fallback
 
-  defp valid_identity?(nil), do: true
+  defp normalize_commissioning(nil), do: nil
+  defp normalize_commissioning(value) when is_map(value), do: stringify_keys(value)
+  defp normalize_commissioning(_), do: :invalid
+  defp normalize_escalation(nil), do: nil
+  defp normalize_escalation(value) when is_map(value), do: stringify_keys(value)
+  defp normalize_escalation(_), do: :invalid
+  defp normalize_supersession(nil), do: nil
+  defp normalize_supersession(value) when is_map(value), do: stringify_keys(value)
+  defp normalize_supersession(_), do: :invalid
 
-  defp valid_identity?(%{role: role, model: model, effort: effort, title: title}),
-    do: role in @roles and model in @models and effort in @efforts and is_binary(title)
+  defp valid_commissioning?(nil), do: true
 
-  defp valid_identity?(_), do: false
+  defp valid_commissioning?(%{"kind" => "human", "authority" => authority} = identity),
+    do: Map.keys(identity) |> Enum.sort() == ["authority", "kind"] and nonblank_string?(authority)
+
+  defp valid_commissioning?(%{"kind" => "agent", "contract_id" => id, "task_id" => task_id, "role" => role, "model" => model, "effort" => effort} = identity) do
+    Map.keys(identity) |> Enum.sort() == ["contract_id", "effort", "kind", "model", "role", "task_id"] and
+      contract_id?(id) and nonblank_string?(task_id) and normalize_atom(role) in @roles and
+      normalize_atom(model) in @models and normalize_atom(effort) in @efforts
+  end
+
+  defp valid_commissioning?(_), do: false
+
+  defp direct_human_commission?(identity) when is_map(identity),
+    do: valid_commissioning?(identity) and Map.get(identity, "kind") == "human"
+
+  defp direct_human_commission?(_), do: false
+  defp escalation_trigger?(trigger), do: trigger in (@terra_triggers ++ @sol_triggers)
+  defp valid_escalation?(nil, trigger), do: not escalation_trigger?(trigger)
+
+  defp valid_escalation?(
+         %{"prior_contract_id" => id, "prior_task_id" => task_id, "prior_role" => role, "prior_model" => model, "prior_effort" => effort, "trigger" => trigger, "reason" => reason} = link,
+         target_trigger
+       ) do
+    Map.keys(link) |> Enum.sort() == ["prior_contract_id", "prior_effort", "prior_model", "prior_role", "prior_task_id", "reason", "trigger"] and
+      contract_id?(id) and nonblank_string?(task_id) and normalize_atom(role) in @roles and
+      normalize_atom(model) == :"gpt-5.6-luna" and normalize_atom(effort) == :medium and
+      normalize_atom(trigger) == target_trigger and nonblank_string?(reason)
+  end
+
+  defp valid_escalation?(_, _), do: false
+  defp valid_supersession?(nil), do: true
+
+  defp valid_supersession?(%{"contract_id" => id, "resolution" => resolution} = value),
+    do: Map.keys(value) |> Enum.sort() == ["contract_id", "resolution"] and contract_id?(id) and nonblank_string?(resolution)
+
+  defp valid_supersession?(_), do: false
+  defp contract_id?(value), do: is_binary(value) and Regex.match?(~r/^tlc-[0-9a-f]{64}$/, value)
+  defp nonblank_string?(value), do: is_binary(value) and String.trim(value) != ""
+
+  defp executing_identity(contract_id, values, project, title),
+    do: %{
+      contract_id: contract_id,
+      task: values["task"],
+      title: title,
+      model: values["model"],
+      effort: values["effort"],
+      role: values["role"],
+      issue_or_pr: values["issue_or_pr"],
+      exact_revision: values["exact_revision"],
+      attempt: values["attempt"],
+      fence: values["fence"],
+      project: project
+    }
 
   defp binding_enabled?(%{enabled: true}), do: true
   defp binding_enabled?(%{"enabled" => true}), do: true
@@ -518,6 +627,9 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
     attempt = Keyword.get(opts, :attempt, 0)
     role = Keyword.get(opts, :role, :implementation)
     trigger = Keyword.get(opts, :trigger, :bounded)
+    commissioning_identity = Keyword.get(opts, :commissioning_identity)
+    escalation = Keyword.get(opts, :escalation)
+    supersedes = Keyword.get(opts, :supersedes)
     {model, effort} = model_for_trigger(trigger)
 
     if is_binary(identifier) and is_binary(title) and is_integer(attempt) and attempt >= 0 do
@@ -544,8 +656,9 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
          closeout_policy: :reconcile,
          idempotency_identity: "#{identifier}/#{role}/#{revision}/#{attempt}",
          conflict_identity: "#{project.repository}:#{identifier}:#{role}:#{revision}",
-         commissioning_identity: nil,
-         supersedes: nil,
+         commissioning_identity: commissioning_identity,
+         escalation: escalation,
+         supersedes: supersedes,
          project: Map.put(project, :root, workspace)
        }}
     else

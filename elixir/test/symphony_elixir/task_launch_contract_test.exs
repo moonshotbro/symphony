@@ -27,7 +27,13 @@ defmodule SymphonyElixir.Codex.TaskLaunchContractTest do
       )
 
       issue = %SymphonyElixir.Tracker.Issue{identifier: "SYS-50", title: "Bound worker"}
-      assert {:ok, contract} = TaskLaunchContract.from_runtime(issue, root, trigger: :integration_design)
+
+      assert {:ok, contract} =
+               TaskLaunchContract.from_runtime(issue, root,
+                 trigger: :integration_design,
+                 commissioning_identity: %{kind: "human", authority: "programme"}
+               )
+
       assert contract.executing_identity.model == :"gpt-5.6-terra"
       assert contract.project.saved_project_id != contract.project.native_project_id
       assert TaskLaunchContract.prompt(contract, "work") =~ contract.contract_id
@@ -40,6 +46,31 @@ defmodule SymphonyElixir.Codex.TaskLaunchContractTest do
   test "title is total for malformed inputs" do
     assert TaskLaunchContract.title(self()) == "Symphony task"
     assert TaskLaunchContract.title(%{role: self(), task: %{bad: true}}) == "Task work: task"
+  end
+
+  test "escalation and post-resolution links are typed and immutable" do
+    prior = "tlc-" <> String.duplicate("a", 64)
+
+    link = %{
+      prior_contract_id: prior,
+      prior_task_id: "review-50",
+      prior_role: :independent_review,
+      prior_model: :"gpt-5.6-luna",
+      prior_effort: :medium,
+      trigger: :integration_design,
+      reason: "provider boundary"
+    }
+
+    assert {:error, errors} = TaskLaunchContract.compile(Map.merge(valid_attrs(), %{model: :"gpt-5.6-terra", trigger: :integration_design}))
+    assert :escalation_link_required in errors
+
+    assert {:ok, terra} = TaskLaunchContract.compile(Map.merge(valid_attrs(), %{model: :"gpt-5.6-terra", trigger: :integration_design, escalation: link}))
+    assert terra.executing_identity.model == :"gpt-5.6-terra"
+    assert terra.executing_identity.contract_id == terra.contract_id
+
+    assert {:ok, luna} = TaskLaunchContract.compile(Map.merge(valid_attrs(), %{task: "verify escalation", supersedes: %{contract_id: terra.contract_id, resolution: "ambiguity resolved"}}))
+    refute luna.contract_id == terra.contract_id
+    assert luna.supersedes["contract_id"] == terra.contract_id
   end
 
   test "compiles a deterministic, project-bound worker contract" do
@@ -96,7 +127,15 @@ defmodule SymphonyElixir.Codex.TaskLaunchContractTest do
       refute changed.contract_id == base.contract_id
     end
 
-    assert {:ok, terra} = TaskLaunchContract.compile(Map.merge(valid_attrs(), %{model: :"gpt-5.6-terra", trigger: :scope_discovery}))
+    assert {:ok, terra} =
+             TaskLaunchContract.compile(
+               Map.merge(valid_attrs(), %{
+                 model: :"gpt-5.6-terra",
+                 trigger: :scope_discovery,
+                 commissioning_identity: %{kind: "human", authority: "programme"}
+               })
+             )
+
     refute terra.contract_id == base.contract_id
     assert {:error, errors} = TaskLaunchContract.compile(Map.merge(valid_attrs(), %{model: :"gpt-5.6-luna", trigger: :scope_discovery}))
     assert :model_trigger_mismatch in errors
