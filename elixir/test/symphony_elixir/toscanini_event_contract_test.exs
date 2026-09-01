@@ -22,7 +22,7 @@ defmodule SymphonyElixir.Toscanini.EventContractTest do
         sender: %{kind: "worker", id: "w1", role: "implementation"},
         recipient: %{kind: "role", id: "programme", role: "programme"},
         authority_ref: %{repository: "moonshotbro/symphony", issue: 51},
-        identity: %{programme: "p1", repo: "moonshotbro/symphony", issue: 51, pr: nil, role: "implementation", task: "t1", attempt: 0, fence: 1, idempotency: "i-#{id}", exact_revision: "abc"},
+        identity: %{programme: "p1", repo: "moonshotbro/symphony", issue: 51, pr: nil, role: "implementation", task: "t1", attempt: 0, fence: 1, idempotency: "i-#{id}", exact_revision: "abc1234"},
         lifecycle: %{state: name},
         evidence: %{refs: []},
         delivery: %{idempotency_key: "i-#{id}", sequence: seq},
@@ -82,5 +82,9 @@ defmodule SymphonyElixir.Toscanini.EventContractTest do
     assert {:error, :unknown_field} = EventContract.new(deep)
     credential = put_in(event("e1", 1, "accepted").data[:identity][:task], "Bearer secret")
     assert {:error, :privacy_prohibited} = EventContract.new(credential)
+    bad_url = put_in(event("e1", 1, "accepted").data[:evidence][:refs], [%{url: "https://evil.test/x", kind: "commit"}])
+    assert {:error, :malformed_data} = EventContract.new(bad_url)
+    bad_pr = put_in(event("e1", 1, "accepted").data[:authority_ref][:pr], 4)
+    assert {:error, :malformed_data} = EventContract.new(bad_pr)
   end
 end

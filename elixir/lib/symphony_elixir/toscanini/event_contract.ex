@@ -280,11 +280,24 @@ defmodule SymphonyElixir.Toscanini.EventContract do
   defp evidence_valid?(%{refs: refs}) when is_list(refs) and length(refs) <= 32 do
     Enum.all?(refs, fn ref ->
       is_map(ref) and object_keys?(ref, ["url", "digest", "kind"]) and
-        is_binary(ref[:url]) and String.starts_with?(ref[:url], "https://") and bounded?(ref)
+        reference_url?(ref[:url]) and (is_nil(ref[:digest]) or digest?(ref[:digest])) and
+        (is_nil(ref[:kind]) or ref[:kind] in ["github_issue", "github_pr", "commit", "check", "review"]) and bounded?(ref)
     end)
   end
 
   defp evidence_valid?(_), do: false
+
+  defp reference_url?(url) when is_binary(url) do
+    uri = URI.parse(url)
+
+    uri.scheme == "https" and uri.host in ["github.com", "api.github.com"] and is_nil(uri.userinfo) and
+      is_nil(uri.query) and is_nil(uri.fragment) and String.match?(uri.path || "", ~r{^/[^/]+/[^/]+/(issues|pull|commit|commits)/[0-9A-Fa-f._-]+$})
+  rescue
+    _ -> false
+  end
+
+  defp reference_url?(_), do: false
+  defp digest?(value), do: is_binary(value) and String.match?(value, ~r/^[0-9a-fA-F]{7,128}$/)
   defp object_keys?(map, allowed) when is_map(map), do: Enum.all?(Map.keys(map), &(is_atom(&1) and Atom.to_string(&1) in allowed))
   defp object_keys?(_, _), do: false
   defp bounded?(term), do: bounded?(term, 0)
@@ -297,10 +310,35 @@ defmodule SymphonyElixir.Toscanini.EventContract do
   defp validate_types(data) do
     privacy = data.privacy
 
+    identity = data.identity
+    sender = data.sender
+    recipient = data.recipient
+    authority = data.authority_ref
+
     if is_binary(data.lifecycle.state) and is_binary(data.delivery.idempotency_key) and is_integer(data.delivery.sequence) and
+         identity_valid?(identity) and principal_valid?(sender) and principal_valid?(recipient) and authority_valid?(authority, identity) and
          privacy.classification in ["metadata", "confidential"] and privacy.retention in ["audit", "operational"] and
          is_boolean(Map.get(privacy, :redacted, false)), do: :ok, else: {:error, :malformed_data}
   end
+
+  defp identity_valid?(i),
+    do:
+      is_binary(i.programme) and is_binary(i.repo) and repo?(i.repo) and is_integer(i.issue) and i.issue > 0 and
+        (is_nil(i.pr) or (is_integer(i.pr) and i.pr > 0)) and is_binary(i.role) and
+        i.role in ["programme", "implementation", "independent_review", "landing", "recovery", "research", "monitor", "telemetry", "acceptance"] and
+        is_binary(i.task) and is_binary(i.exact_revision) and digest?(i.exact_revision) and is_integer(i.attempt) and i.attempt >= 0 and is_integer(i.fence) and i.fence >= 0 and
+        is_binary(i.idempotency)
+
+  defp principal_valid?(p),
+    do: is_map(p) and Map.has_key?(p, :kind) and Map.has_key?(p, :id) and Map.has_key?(p, :role) and p.kind in ["worker", "role", "adapter"] and is_binary(p.id) and is_binary(p.role)
+
+  defp authority_valid?(a, i),
+    do:
+      is_map(a) and is_binary(a.repository) and a.repository == i.repo and a.issue == i.issue and
+        (is_nil(Map.get(a, :pr)) or Map.get(a, :pr) == i.pr) and
+        (is_nil(Map.get(a, :expected_revision)) or Map.get(a, :expected_revision) == i.exact_revision)
+
+  defp repo?(repo), do: String.match?(repo, ~r/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/)
 
   defp validate_privacy(%{privacy: privacy} = data) do
     prohibited = [:body, :prompt, :message_body, :tool_arguments, :tool_results, :reasoning, :secret, :token]
