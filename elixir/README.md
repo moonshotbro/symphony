@@ -167,8 +167,10 @@ missing, ambiguous, or mismatched bindings before opening the App Server. The
 supported protocol carries `cwd`, model, effort and policy on `thread/start`,
 sets the concise visible name with `thread/name/set`, then requires
 `thread/read` to confirm the persisted thread identity before the first turn.
-The saved Codex and native project IDs remain internal evidence namespaces:
-they are never interchanged or sent as an unsupported `projectId` field.
+The saved Codex and native App Server project IDs remain distinct namespaces.
+For the pinned App Server schema, Symphony sends only the validated native ID
+as `thread/start.projectId`; the saved desktop ID is retained only as contract
+evidence and is never interchanged with it.
 
 Notes:
 

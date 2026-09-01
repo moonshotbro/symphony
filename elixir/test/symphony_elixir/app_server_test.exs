@@ -1575,6 +1575,51 @@ defmodule SymphonyElixir.AppServerTest do
              AppServer.read_thread("thread-remote", "/remote/workspaces/../outside", worker_host: "worker-01")
   end
 
+  test "project-bound launch uses only pinned schema fields and readback gates the turn" do
+    root = Path.join(System.tmp_dir!(), "symphony-project-wire-#{System.unique_integer([:positive])}")
+    workspace = Path.join(root, "workspaces/SYS-50")
+    binary = Path.join(root, "fake-codex")
+    File.mkdir_p!(workspace)
+
+    try do
+      File.write!(binary, """
+      #!/bin/sh
+      count=0
+      while IFS= read -r line; do
+        count=$((count + 1))
+        case "$count" in
+          1) printf '%s\\n' '{"id":1,"result":{}}' ;;
+          2) ;;
+          3)
+            case "$line" in *'"projectId":"01a04aab-c77c-79b0-ab09-65187353bb4b"'*) ;; *) exit 9;; esac
+            case "$line" in *'"model":"gpt-5.6-terra"'*) ;; *) exit 11;; esac
+            case "$line" in *'"model_reasoning_effort":"medium"'*) ;; *) exit 12;; esac
+            case "$line" in *'"effort"'*) exit 10;; esac
+            printf '%s\\n' '{"id":2,"result":{"model":"gpt-5.6-terra","reasoningEffort":"medium","thread":{"id":"bound-thread","sessionId":"bound-session","projectId":"01a04aab-c77c-79b0-ab09-65187353bb4b","cwd":"WORKSPACE","ephemeral":false,"instructionSources":["project"]}}}' | sed "s|WORKSPACE|$PWD|" ;;
+          4) printf '%s\\n' '{"id":6,"result":{}}' ;;
+          5) printf '%s\\n' '{"id":4,"result":{"thread":{"id":"bound-thread","sessionId":"bound-session","projectId":"01a04aab-c77c-79b0-ab09-65187353bb4b","cwd":"WORKSPACE","name":"Implementation SYS-50: bound","ephemeral":false,"instructionSources":["project"]}}}' | sed "s|WORKSPACE|$PWD|" ;;
+          6) printf '%s\\n' '{"id":5,"result":{"data":[]}}' ;;
+          7) printf '%s\\n' '{"id":3,"result":{"turn":{"id":"bound-turn"}}}'; printf '%s\\n' '{"method":"turn/completed"}' ;;
+        esac
+      done
+      """)
+
+      File.chmod!(binary, 0o755)
+      write_workflow_file!(Workflow.workflow_file_path(), workspace_root: Path.join(root, "workspaces"), codex_command: "#{binary} app-server")
+
+      contract = %SymphonyElixir.Codex.TaskLaunchContract{
+        title: "Implementation SYS-50: bound",
+        executing_identity: %{model: :"gpt-5.6-terra", effort: :medium, role: :implementation, title: "Implementation SYS-50: bound"},
+        project: %{native_project_id: "01a04aab-c77c-79b0-ab09-65187353bb4b"}
+      }
+
+      issue = %Issue{id: "sys-50", identifier: "SYS-50", title: "bound", state: "In Progress"}
+      assert {:ok, _} = AppServer.run(workspace, "bound", issue, task_contract: contract)
+    after
+      File.rm_rf(root)
+    end
+  end
+
   test "app server launches over ssh for remote workers" do
     test_root =
       Path.join(

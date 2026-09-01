@@ -116,7 +116,8 @@ defmodule SymphonyElixir.Codex.AppServer do
           turn_sandbox_policy: turn_sandbox_policy,
           thread_id: thread_id,
           workspace: workspace,
-          dynamic_tool_binding: dynamic_tool_binding
+          dynamic_tool_binding: dynamic_tool_binding,
+          task_contract: task_contract
         },
         prompt,
         issue,
@@ -129,7 +130,7 @@ defmodule SymphonyElixir.Codex.AppServer do
         DynamicTool.execute(tool, arguments, dynamic_tool_binding, issue: issue)
       end)
 
-    case start_turn(port, thread_id, prompt, issue, workspace, approval_policy, turn_sandbox_policy) do
+    case start_turn(port, thread_id, prompt, issue, workspace, approval_policy, turn_sandbox_policy, task_contract) do
       {:ok, turn_id} ->
         session_id = "#{thread_id}-#{turn_id}"
         Logger.info("Codex session started for #{issue_context(issue)} session_id=#{session_id}")
@@ -491,14 +492,8 @@ defmodule SymphonyElixir.Codex.AppServer do
     })
 
     case await_response(port, @thread_start_id) do
-      {:ok, %{"thread" => thread_payload}} ->
-        case thread_payload do
-          %{"id" => thread_id} when is_binary(thread_id) and thread_id != "" ->
-            verify_started_thread(port, thread_id, workspace, contract)
-
-          _ ->
-            {:error, {:invalid_thread_payload, thread_payload}}
-        end
+      {:ok, %{"thread" => thread_payload} = response} ->
+        verify_started_thread(port, thread_payload, response, workspace, contract)
 
       other ->
         other
@@ -529,22 +524,31 @@ defmodule SymphonyElixir.Codex.AppServer do
   defp executing_params(contract) do
     %{
       "model" => Atom.to_string(contract.executing_identity.model),
-      "effort" => Atom.to_string(contract.executing_identity.effort)
+      "config" => %{"model_reasoning_effort" => Atom.to_string(contract.executing_identity.effort)},
+      "projectId" => contract.project.native_project_id
     }
   end
 
-  defp verify_started_thread(_port, thread_id, _workspace, nil), do: {:ok, thread_id}
+  defp verify_started_thread(_port, %{"id" => thread_id}, _response, _workspace, nil)
+       when is_binary(thread_id) and thread_id != "",
+       do: {:ok, thread_id}
 
-  defp verify_started_thread(port, thread_id, workspace, contract) do
-    with :ok <- set_thread_name(port, thread_id, contract.title),
+  defp verify_started_thread(port, %{"id" => thread_id} = thread, response, workspace, contract)
+       when is_binary(thread_id) and thread_id != "" do
+    with :ok <- verify_start_response(thread, response, workspace, contract),
+         {:ok, session_id} <- thread_session_id(thread),
+         :ok <- set_thread_name(port, thread_id, contract.title),
          {:ok, %{"id" => ^thread_id} = thread} <- read_thread_from_port(port, thread_id),
-         :ok <- verify_thread_readback(thread, workspace, contract) do
+         :ok <- verify_thread_readback(thread, workspace, session_id, contract) do
       {:ok, thread_id}
     else
       {:ok, other} -> {:error, {:invalid_thread_readback, other}}
       {:error, reason} -> {:error, {:project_bound_thread_unverified, reason}}
     end
   end
+
+  defp verify_started_thread(_port, _thread, _response, _workspace, _contract),
+    do: {:error, {:invalid_thread_payload, :missing_thread_id}}
 
   defp set_thread_name(port, thread_id, name) do
     send_message(port, %{"method" => "thread/name/set", "id" => @thread_name_set_id, "params" => %{"threadId" => thread_id, "name" => name}})
@@ -556,39 +560,57 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   # credo:disable-for-next-line Credo.Check.Refactor.CyclomaticComplexity
-  defp verify_thread_readback(thread, workspace, contract) do
+  defp verify_start_response(thread, response, workspace, contract) do
+    cond do
+      Map.get(response, "model") != Atom.to_string(contract.executing_identity.model) -> {:error, :start_model_mismatch}
+      Map.get(response, "reasoningEffort") != Atom.to_string(contract.executing_identity.effort) -> {:error, :start_effort_mismatch}
+      true -> verify_thread_authority(thread, workspace, nil, contract, false)
+    end
+  end
+
+  # credo:disable-for-next-line Credo.Check.Refactor.CyclomaticComplexity
+  defp verify_thread_readback(thread, workspace, session_id, contract) do
+    verify_thread_authority(thread, workspace, session_id, contract, true)
+  end
+
+  # credo:disable-for-next-line Credo.Check.Refactor.CyclomaticComplexity
+  defp verify_thread_authority(thread, workspace, session_id, contract, require_name) do
     cwd = Map.get(thread, "cwd") || Map.get(thread, "workingDirectory")
     name = Map.get(thread, "name") || Map.get(thread, "title")
-    model = Map.get(thread, "model")
-    effort = Map.get(thread, "effort")
 
     cond do
       cwd != workspace -> {:error, :cwd_mismatch}
-      name != contract.title -> {:error, :title_mismatch}
-      not is_nil(model) and model != Atom.to_string(contract.executing_identity.model) -> {:error, :model_mismatch}
-      not is_nil(effort) and effort != Atom.to_string(contract.executing_identity.effort) -> {:error, :effort_mismatch}
+      Map.get(thread, "projectId") != contract.project.native_project_id -> {:error, :native_project_mismatch}
       Map.get(thread, "ephemeral") == true -> {:error, :ephemeral_thread}
+      not instruction_sources?(thread) -> {:error, :instruction_sources_missing}
+      require_name and name != contract.title -> {:error, :title_mismatch}
+      not is_nil(session_id) and Map.get(thread, "sessionId") != session_id -> {:error, :session_id_mismatch}
       true -> :ok
     end
   end
 
-  defp start_turn(port, thread_id, prompt, issue, workspace, approval_policy, turn_sandbox_policy) do
+  defp thread_session_id(%{"sessionId" => session_id}) when is_binary(session_id) and session_id != "", do: {:ok, session_id}
+  defp thread_session_id(_), do: {:error, :session_id_missing}
+
+  defp instruction_sources?(%{"instructionSources" => sources}) when is_list(sources), do: sources != []
+  defp instruction_sources?(_), do: false
+
+  defp start_turn(port, thread_id, prompt, issue, workspace, approval_policy, turn_sandbox_policy, contract) do
+    params = %{
+      "threadId" => thread_id,
+      "input" => [%{"type" => "text", "text" => prompt}],
+      "cwd" => workspace,
+      "title" => if(contract, do: contract.title, else: "#{issue.identifier}: #{issue.title}"),
+      "approvalPolicy" => approval_policy,
+      "sandboxPolicy" => turn_sandbox_policy
+    }
+
+    params = if contract, do: Map.merge(params, %{"model" => Atom.to_string(contract.executing_identity.model), "effort" => Atom.to_string(contract.executing_identity.effort)}), else: params
+
     send_message(port, %{
       "method" => "turn/start",
       "id" => @turn_start_id,
-      "params" => %{
-        "threadId" => thread_id,
-        "input" => [
-          %{
-            "type" => "text",
-            "text" => prompt
-          }
-        ],
-        "cwd" => workspace,
-        "title" => "#{issue.identifier}: #{issue.title}",
-        "approvalPolicy" => approval_policy,
-        "sandboxPolicy" => turn_sandbox_policy
-      }
+      "params" => params
     })
 
     case await_response(port, @turn_start_id) do
