@@ -12,10 +12,33 @@ defmodule SymphonyElixir.Codex.RecoveryInspector do
   @spec inspect(Action.t(), keyword()) :: {:ok, map()} | {:error, term()}
   def inspect(%Action{} = action, opts \\ []) do
     reader = Keyword.get(opts, :thread_reader, &AppServer.read_thread/3)
+    lister = Keyword.get(opts, :thread_lister, &AppServer.list_threads/2)
 
-    with :ok <- task_creation_action(action),
-         {:ok, correlation} <- correlation(action),
-         {:ok, workspace} <- Workspace.path_for_key(correlation.workspace_key, correlation.worker_host),
+    with :ok <- task_creation_action(action) do
+      inspect_correlation(action, reader, lister)
+    end
+  end
+
+  defp inspect_correlation(action, reader, lister) do
+    case correlation(action) do
+      {:ok, correlation} ->
+        inspect_exact(correlation, reader)
+
+      {:error, {:recovery_correlation_missing, "thread_id"}} = missing ->
+        if legacy_recovery_applicable?(action), do: inspect_legacy_zero_turn(action, lister), else: missing
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp legacy_recovery_applicable?(%Action{observed_effect: %{"disposition" => "restart_reconciliation_required"}}),
+    do: true
+
+  defp legacy_recovery_applicable?(_action), do: false
+
+  defp inspect_exact(correlation, reader) do
+    with {:ok, workspace} <- Workspace.path_for_key(correlation.workspace_key, correlation.worker_host),
          {:ok, thread} <- reader.(correlation.thread_id, workspace, worker_host: correlation.worker_host),
          :ok <- strict_match(thread, correlation, workspace) do
       {:ok,
@@ -33,6 +56,65 @@ defmodule SymphonyElixir.Codex.RecoveryInspector do
 
       {:error, reason} ->
         {:error, reason}
+    end
+  end
+
+  defp inspect_legacy_zero_turn(%Action{observed_effect: effect, target: target}, lister)
+       when is_map(effect) and is_map(target) do
+    with {:ok, workspace_key} <- required(effect, "workspace_key"),
+         true <- effect["disposition"] == "restart_reconciliation_required" or {:error, :legacy_recovery_not_applicable},
+         {:ok, worker_host} <- legacy_worker_host(target),
+         {:ok, workspace} <- Workspace.path_for_key(workspace_key, worker_host),
+         {:ok, threads} <- lister.(workspace, worker_host: worker_host),
+         {:ok, _thread} <- unique_legacy_zero_turn(threads, workspace) do
+      {:ok,
+       %{
+         provider: "codex",
+         authoritative: true,
+         exists: true,
+         workspace_key: workspace_key,
+         disposition: "legacy_zero_turn_compensated"
+       }}
+    end
+  end
+
+  defp inspect_legacy_zero_turn(_action, _lister), do: {:error, :legacy_recovery_not_applicable}
+
+  defp legacy_worker_host(%{"worker_host" => "local"}), do: {:ok, nil}
+  defp legacy_worker_host(%{"worker_host" => host}) when is_binary(host) and host != "", do: {:ok, host}
+  defp legacy_worker_host(%{"worker_host" => _invalid}), do: {:error, :legacy_host_invalid}
+  defp legacy_worker_host(%{"type" => "codex_task"}), do: {:ok, nil}
+  defp legacy_worker_host(_target), do: {:error, :legacy_host_invalid}
+
+  defp unique_legacy_zero_turn(threads, workspace) when is_list(threads) do
+    matches = Enum.filter(threads, &legacy_zero_turn?(&1, workspace))
+
+    case matches do
+      [thread] -> {:ok, thread}
+      [] -> {:error, :legacy_zero_turn_not_found}
+      _ -> {:error, :legacy_zero_turn_ambiguous}
+    end
+  end
+
+  defp unique_legacy_zero_turn(_threads, _workspace), do: {:error, :legacy_thread_list_invalid}
+
+  defp legacy_zero_turn?(thread, workspace) when is_map(thread) do
+    status = thread["status"]
+    turns = thread["turns"]
+
+    thread["cwd"] == workspace and
+      status in ["notLoaded", %{"type" => "notLoaded"}] and
+      match?([%{"status" => "interrupted", "items" => []}], turns) and
+      zero_usage?(thread) and Enum.all?(turns, &zero_usage?/1)
+  end
+
+  defp legacy_zero_turn?(_thread, _workspace), do: false
+
+  defp zero_usage?(record) when is_map(record) do
+    case record["usage"] || record["tokenUsage"] do
+      nil -> true
+      usage when is_map(usage) -> Enum.all?(Map.values(usage), &(&1 in [0, nil]))
+      _ -> false
     end
   end
 

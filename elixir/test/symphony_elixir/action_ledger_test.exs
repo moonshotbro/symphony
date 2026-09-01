@@ -729,6 +729,31 @@ defmodule SymphonyElixir.ActionLedgerTest do
     assert satisfied.state == :already_satisfied
   end
 
+  test "authoritative legacy zero-turn evidence compensates an uncertain action exactly once", %{path: path} do
+    ledger = start_ledger(path)
+
+    assert {:ok, action, :new} =
+             ActionLedger.plan(
+               ledger,
+               intent(%{checkpoint: "legacy-zero-turn", expected_postcondition: "codex.session_observed"})
+             )
+
+    assert {:ok, _} = ActionLedger.transition(ledger, action.id, :dispatched)
+    assert {:ok, _} = ActionLedger.transition(ledger, action.id, :uncertain)
+
+    evidence = %{
+      provider: "codex",
+      authoritative: true,
+      exists: true,
+      workspace_key: "GH-2",
+      disposition: "legacy_zero_turn_compensated"
+    }
+
+    assert {:ok, compensated, :compensated} = ActionLedger.inspect_recovered(ledger, action.id, evidence)
+    assert compensated.observed_effect["disposition"] == "legacy_zero_turn_compensated"
+    assert {:error, :action_not_uncertain} = ActionLedger.inspect_recovered(ledger, action.id, evidence)
+  end
+
   test "read-only path inspection reports corruption without repairing it", %{root: root, path: path} do
     assert {:ok, report} = ActionLedger.inspect_storage(path)
     assert report.schema == "symphony.action-ledger.v1"

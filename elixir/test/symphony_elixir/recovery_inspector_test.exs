@@ -152,6 +152,109 @@ defmodule SymphonyElixir.RecoveryInspectorTest do
              )
   end
 
+  test "legacy zero-turn recovery compensates only one exact empty interrupted session" do
+    root = Path.join(System.tmp_dir!(), "symphony-legacy-zero-turn-#{System.unique_integer([:positive])}")
+    workspace_root = Path.join(root, "workspaces")
+    workspace = Path.join(workspace_root, "GH-38")
+    File.mkdir_p!(workspace)
+    on_exit(fn -> File.rm_rf(root) end)
+    write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root)
+
+    candidate = %{
+      "id" => "thread-legacy",
+      "status" => %{"type" => "notLoaded"},
+      "turns" => [%{"id" => "turn-legacy", "status" => "interrupted", "items" => [], "usage" => %{"totalTokens" => 0}}]
+    }
+
+    assert {:ok, evidence} =
+             RecoveryInspector.inspect(legacy_action(),
+               thread_lister: fn actual_workspace, worker_host: nil ->
+                 {:ok, [Map.put(candidate, "cwd", actual_workspace)]}
+               end
+             )
+
+    assert evidence == %{
+             provider: "codex",
+             authoritative: true,
+             exists: true,
+             workspace_key: "GH-38",
+             disposition: "legacy_zero_turn_compensated"
+           }
+
+    assert {:error, :legacy_zero_turn_not_found} =
+             RecoveryInspector.inspect(legacy_action(),
+               thread_lister: fn _actual_workspace, worker_host: nil -> {:ok, []} end
+             )
+
+    assert {:error, :legacy_zero_turn_ambiguous} =
+             RecoveryInspector.inspect(legacy_action(),
+               thread_lister: fn actual_workspace, worker_host: nil ->
+                 exact = Map.put(candidate, "cwd", actual_workspace)
+                 {:ok, [exact, Map.put(exact, "id", "other")]}
+               end
+             )
+
+    assert {:error, :legacy_zero_turn_not_found} =
+             RecoveryInspector.inspect(legacy_action(),
+               thread_lister: fn _actual_workspace, worker_host: nil -> {:ok, [Map.put(candidate, "cwd", "/wrong")]} end
+             )
+
+    non_zero = put_in(candidate, ["turns", Access.at(0), "items"], [%{"type" => "agentMessage"}])
+
+    assert {:error, :legacy_zero_turn_not_found} =
+             RecoveryInspector.inspect(legacy_action(),
+               thread_lister: fn actual_workspace, worker_host: nil -> {:ok, [Map.put(non_zero, "cwd", actual_workspace)]} end
+             )
+
+    non_zero_usage = put_in(candidate, ["turns", Access.at(0), "usage", "totalTokens"], 1)
+
+    assert {:error, :legacy_zero_turn_not_found} =
+             RecoveryInspector.inspect(legacy_action(),
+               thread_lister: fn actual_workspace, worker_host: nil ->
+                 {:ok, [Map.put(non_zero_usage, "cwd", actual_workspace)]}
+               end
+             )
+
+    wrong_host = %{legacy_action() | target: %{"type" => "codex_task", "worker_host" => ""}}
+    assert {:error, :legacy_host_invalid} = RecoveryInspector.inspect(wrong_host)
+
+    remote_host = %{legacy_action() | target: %{"type" => "codex_task", "worker_host" => "worker-01"}}
+
+    assert {:ok, %{disposition: "legacy_zero_turn_compensated"}} =
+             RecoveryInspector.inspect(remote_host,
+               thread_lister: fn actual_workspace, worker_host: "worker-01" ->
+                 {:ok, [Map.put(candidate, "cwd", actual_workspace)]}
+               end
+             )
+
+    local_host = %{legacy_action() | target: %{"type" => "codex_task", "worker_host" => "local"}}
+
+    assert {:ok, %{disposition: "legacy_zero_turn_compensated"}} =
+             RecoveryInspector.inspect(local_host,
+               thread_lister: fn actual_workspace, worker_host: nil ->
+                 {:ok, [Map.put(candidate, "cwd", actual_workspace)]}
+               end
+             )
+
+    assert {:error, :legacy_recovery_not_applicable} =
+             RecoveryInspector.inspect(%{legacy_action() | target: nil})
+
+    assert {:error, :legacy_host_invalid} =
+             RecoveryInspector.inspect(%{legacy_action() | target: %{}})
+
+    assert {:error, :legacy_thread_list_invalid} =
+             RecoveryInspector.inspect(legacy_action(),
+               thread_lister: fn _actual_workspace, worker_host: nil -> {:ok, :invalid} end
+             )
+
+    assert {:error, :legacy_zero_turn_not_found} =
+             RecoveryInspector.inspect(legacy_action(),
+               thread_lister: fn actual_workspace, worker_host: nil ->
+                 {:ok, [:invalid, Map.merge(candidate, %{"cwd" => actual_workspace, "usage" => 1})]}
+               end
+             )
+  end
+
   defp action(effect) do
     %Action{
       id: "act-1",
@@ -179,5 +282,9 @@ defmodule SymphonyElixir.RecoveryInspectorTest do
       "session_correlation_id" => "thread-1-turn-1",
       "host_assertion" => %{"type" => "worker_host", "value" => "local"}
     })
+  end
+
+  defp legacy_action do
+    action(%{"workspace_key" => "GH-38", "disposition" => "restart_reconciliation_required"})
   end
 end

@@ -11,8 +11,11 @@ defmodule SymphonyElixir.Codex.AppServer do
   @turn_start_id 3
   @thread_read_id 4
   @thread_turns_list_id 5
+  @thread_list_id 6
   @thread_turns_page_size 100
   @max_thread_turn_pages 1_000
+  @thread_list_page_size 100
+  @max_thread_list_pages 1_000
   @port_line_bytes 1_048_576
   @max_stream_log_bytes 1_000
   @remote_canonical_marker "__SYMPHONY_REMOTE_CANONICAL_PATHS__"
@@ -99,6 +102,24 @@ defmodule SymphonyElixir.Codex.AppServer do
       end
     else
       {:error, :thread_id_invalid}
+    end
+  end
+
+  @doc "Read-only list of persisted Codex threads whose cwd exactly matches a workspace."
+  @spec list_threads(Path.t(), keyword()) :: {:ok, [map()]} | {:error, term()}
+  def list_threads(workspace, opts \\ []) do
+    worker_host = Keyword.get(opts, :worker_host)
+    dynamic_tool_binding = DynamicTool.bind()
+
+    with {:ok, expanded_workspace} <- validate_workspace_cwd(workspace, worker_host),
+         {:ok, port} <- start_port(expanded_workspace, worker_host, dynamic_tool_binding) do
+      try do
+        with :ok <- send_initialize(port) do
+          list_threads_from_port(port, expanded_workspace)
+        end
+      after
+        stop_port(port)
+      end
     end
   end
 
@@ -550,6 +571,68 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp read_thread_turns(port, thread_id), do: read_thread_turns(port, thread_id, nil, [], 0)
+
+  defp list_threads_from_port(port, workspace), do: list_threads_from_port(port, workspace, nil, [], 0)
+
+  defp list_threads_from_port(_port, _workspace, _cursor, _threads, page_count)
+       when page_count >= @max_thread_list_pages,
+       do: {:error, :thread_list_pagination_limit}
+
+  defp list_threads_from_port(port, workspace, cursor, threads, page_count) do
+    send_message(port, %{
+      "method" => "thread/list",
+      "id" => @thread_list_id,
+      "params" => %{
+        "cwd" => workspace,
+        "cursor" => cursor,
+        "limit" => @thread_list_page_size,
+        "sortDirection" => "desc"
+      }
+    })
+
+    case await_response(port, @thread_list_id) do
+      {:ok, %{"data" => page_threads} = response} when is_list(page_threads) ->
+        case Map.get(response, "nextCursor") do
+          nil ->
+            hydrate_listed_threads(port, threads ++ page_threads)
+
+          next_cursor when is_binary(next_cursor) ->
+            list_threads_from_port(
+              port,
+              workspace,
+              next_cursor,
+              threads ++ page_threads,
+              page_count + 1
+            )
+
+          _ ->
+            {:error, {:invalid_thread_list_payload, response}}
+        end
+
+      {:ok, response} ->
+        {:error, {:invalid_thread_list_payload, response}}
+
+      {:error, reason} ->
+        {:error, {:thread_list_failed, reason}}
+    end
+  end
+
+  defp hydrate_listed_threads(port, threads) do
+    Enum.reduce_while(threads, {:ok, []}, fn
+      %{"id" => thread_id} = thread, {:ok, hydrated} when is_binary(thread_id) ->
+        case read_thread_turns(port, thread_id) do
+          {:ok, turns} -> {:cont, {:ok, [Map.put(thread, "turns", turns) | hydrated]}}
+          {:error, reason} -> {:halt, {:error, {:thread_list_hydration_failed, thread_id, reason}}}
+        end
+
+      thread, _acc ->
+        {:halt, {:error, {:invalid_thread_list_item, thread}}}
+    end)
+    |> case do
+      {:ok, hydrated} -> {:ok, Enum.reverse(hydrated)}
+      {:error, _reason} = error -> error
+    end
+  end
 
   defp read_thread_turns(_port, _thread_id, _cursor, _turns, page_count)
        when page_count >= @max_thread_turn_pages,
