@@ -17,11 +17,11 @@ defmodule SymphonyElixir.ActionLedger do
   @terminal_states ~w(preflight_rejected succeeded already_satisfied compensated terminal_failure)a
   @source_keys ~w(goal_id task_id issue_id issue_identifier repository revision session_id review_source reviewer review_fingerprint review_checks)
   @target_keys ~w(type id host project worker_host)
-  @effect_keys ~w(thread_id turn_id automation_id fork_thread_id destination_thread_id worktree_id revision session_id worker_host disposition workspace_key)
+  @effect_keys ~w(thread_id turn_id automation_id fork_thread_id destination_thread_id worktree_id revision session_id session_correlation_id worker_host host_assertion disposition workspace_key)
   @inspection_keys ~w(provider authoritative exists session_id workspace_key revision disposition)
   @identity_keys ~w(goal_id task_id issue_id issue_identifier repository revision session_id)
   @target_identity_keys ~w(type id host project worker_host)
-  @effect_identity_keys ~w(thread_id turn_id automation_id fork_thread_id destination_thread_id worktree_id revision session_id worker_host workspace_key)
+  @effect_identity_keys ~w(thread_id turn_id automation_id fork_thread_id destination_thread_id worktree_id revision session_id session_correlation_id worker_host workspace_key)
   @forbidden_key_fragments ~w(prompt secret token password body content credential)
   @blocker_classifications ~w(goal.stalled)
 
@@ -413,6 +413,7 @@ defmodule SymphonyElixir.ActionLedger do
     cond do
       key not in allowed_keys -> {:error, {:field_not_allowed, key}}
       forbidden_key?(key) -> {:error, {:sensitive_field_forbidden, key}}
+      key == "host_assertion" -> normalize_host_assertion(raw_value)
       is_nil(raw_value) -> :skip
       not is_binary(raw_value) -> {:error, {:field_value_invalid, key}}
       String.trim(raw_value) == "" -> {:error, {:field_value_invalid, key}}
@@ -420,6 +421,21 @@ defmodule SymphonyElixir.ActionLedger do
       true -> validate_field_value(key, raw_value)
     end
   end
+
+  # A recovery host assertion is structured evidence, not an arbitrary nested
+  # payload. Keep its schema exact so ledger reload remains fail-closed.
+  defp normalize_host_assertion(%{"type" => "worker_host", "value" => value} = assertion)
+       when map_size(assertion) == 2 do
+    case validate_field_value("worker_host", value) do
+      {:ok, _key, normalized_value} ->
+        {:ok, "host_assertion", %{"type" => "worker_host", "value" => normalized_value}}
+
+      {:error, _reason} ->
+        {:error, {:field_value_invalid, "host_assertion"}}
+    end
+  end
+
+  defp normalize_host_assertion(_assertion), do: {:error, {:field_value_invalid, "host_assertion"}}
 
   # Identifiers and dispositions are deliberately narrower than arbitrary
   # bounded strings: reject values that could carry credentials or payloads.
