@@ -145,6 +145,26 @@ You are working on an issue from the configured tracker {{ issue.identifier }}.
 Title: {{ issue.title }} Body: {{ issue.description }}
 ```
 
+For project-bound Codex task contracts, `codex.project_binding` must declare
+the saved Codex project ID, the distinct native App Server project ID, the
+repository they own, and its absolute root. The two IDs are separate
+namespaces and are never interchangeable:
+
+```yaml
+codex:
+  project_binding:
+    enabled: true
+    programme: build-toscanini
+    saved_project_id: b12752f9-9a65-4194-bc49-77808b21d767
+    native_project_id: 01a04aab-c77c-79b0-ab09-65187353bb4b
+    repository: moonshotbro/sysmiq-symphony
+    root: /Users/sysmiq/sysmiq-symphony
+```
+
+The runtime contract compiler rejects missing, ambiguous, or mismatched
+bindings before any App Server task creation. Task creation and authoritative
+readback are implemented by a later integration slice.
+
 Notes:
 
 - If a value is missing, defaults are used.
