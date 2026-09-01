@@ -42,8 +42,6 @@ defmodule SymphonyElixir.Codex.TaskLaunchContractTest do
 
     for {key, value} <- [
           {:task, "other"},
-          {:model, :"gpt-5.6-terra"},
-          {:effort, :high},
           {:goal_policy, :none},
           {:dependencies, ["SYS-49"]},
           {:permissions, ["read-only"]},
@@ -58,6 +56,11 @@ defmodule SymphonyElixir.Codex.TaskLaunchContractTest do
       assert {:ok, changed} = TaskLaunchContract.compile(attrs)
       refute changed.contract_id == base.contract_id
     end
+
+    assert {:ok, terra} = TaskLaunchContract.compile(Map.merge(valid_attrs(), %{model: :"gpt-5.6-terra", trigger: :scope_discovery}))
+    refute terra.contract_id == base.contract_id
+    assert {:error, errors} = TaskLaunchContract.compile(Map.merge(valid_attrs(), %{model: :"gpt-5.6-luna", trigger: :scope_discovery}))
+    assert :model_trigger_mismatch in errors
   end
 
   test "rejects ambiguous keys and arbitrary typed values" do

@@ -24,6 +24,9 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
   @efforts ~w(low medium high xhigh max ultra)a
   @stall_policies ~w(fail_closed bounded)a
   @closeout_policies ~w(reconcile archive_none archive_exact)a
+  @luna_triggers ~w(bounded implementation tests documentation hygiene mechanical_review gate_repair)a
+  @terra_triggers ~w(ambiguous_diagnosis integration_design repository_wide_judgment recovery privacy_telemetry_semantics provider_boundary_reasoning scope_discovery)a
+  @sol_triggers ~w(security_architecture consequential_production_customer_billing difficult_cross_repository_incident final_high_risk_review)a
 
   @type role ::
           :programme
@@ -57,6 +60,7 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
           evidence: [String.t()],
           model: atom(),
           effort: atom(),
+          trigger: atom(),
           goal_policy: goal_policy(),
           dependencies: [String.t()],
           permissions: [String.t()],
@@ -65,6 +69,8 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
           closeout_policy: atom(),
           idempotency_identity: String.t(),
           conflict_identity: String.t(),
+          commissioning_identity: String.t() | nil,
+          supersedes: String.t() | nil,
           title: String.t(),
           project: saved_project_binding()
         }
@@ -83,6 +89,7 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
     :evidence,
     :model,
     :effort,
+    :trigger,
     :goal_policy,
     :title,
     :dependencies,
@@ -92,6 +99,8 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
     :closeout_policy,
     :idempotency_identity,
     :conflict_identity,
+    :commissioning_identity,
+    :supersedes,
     :project
   ]
 
@@ -129,6 +138,7 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
          evidence: values["evidence"],
          model: values["model"],
          effort: values["effort"],
+         trigger: values["trigger"],
          goal_policy: values["goal_policy"],
          dependencies: values["dependencies"],
          permissions: values["permissions"],
@@ -137,6 +147,8 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
          closeout_policy: values["closeout_policy"],
          idempotency_identity: values["idempotency_identity"],
          conflict_identity: values["conflict_identity"],
+         commissioning_identity: values["commissioning_identity"],
+         supersedes: values["supersedes"],
          title: title,
          project: project
        })}
@@ -174,12 +186,13 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
       {:error, Enum.map(missing, &{:missing, String.to_existing_atom(&1)})}
     else
       role = normalize_atom(attrs["role"])
+      trigger = normalize_atom(attrs["trigger"] || "bounded")
       model = normalize_atom(attrs["model"])
       effort = normalize_atom(attrs["effort"])
       goal = normalize_atom(attrs["goal_policy"])
       boundary = normalize_atom(attrs["write_boundary"])
       attempt = attrs["attempt"] || 0
-      errors = validation_errors(role, model, effort, goal, boundary, attempt, attrs)
+      errors = validation_errors(role, model, effort, trigger, goal, boundary, attempt, attrs)
 
       case errors do
         [] ->
@@ -188,6 +201,7 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
              "role" => role,
              "model" => model,
              "effort" => effort,
+             "trigger" => trigger,
              "goal_policy" => goal,
              "write_boundary" => boundary,
              "attempt" => attempt,
@@ -196,7 +210,9 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
              "permissions" => attrs["permissions"],
              "evidence_gates" => attrs["evidence_gates"],
              "stall_policy" => normalize_atom(attrs["stall_policy"]),
-             "closeout_policy" => normalize_atom(attrs["closeout_policy"])
+             "closeout_policy" => normalize_atom(attrs["closeout_policy"]),
+             "commissioning_identity" => attrs["commissioning_identity"],
+             "supersedes" => attrs["supersedes"]
            })}
 
         errors ->
@@ -205,7 +221,8 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
     end
   end
 
-  defp validation_errors(role, model, effort, goal, boundary, attempt, attrs) do
+  # credo:disable-for-next-line Credo.Check.Refactor.CyclomaticComplexity
+  defp validation_errors(role, model, effort, trigger, goal, boundary, attempt, attrs) do
     []
     |> add_unless(
       Enum.all?(~w(programme repository issue_or_pr task fence exact_revision idempotency_identity conflict_identity), &(is_binary(attrs[&1]) and String.trim(attrs[&1]) != "")),
@@ -214,6 +231,8 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
     |> add_unless(role in @roles, {:unsupported_role, role})
     |> add_unless(model in @models, {:unsupported_model, model})
     |> add_unless(effort in @efforts, {:unsupported_effort, effort})
+    |> add_unless(trigger in (@luna_triggers ++ @terra_triggers ++ @sol_triggers), {:unsupported_trigger, trigger})
+    |> add_unless(model_for_trigger?(model, effort, trigger), :model_trigger_mismatch)
     |> add_unless(goal in @goal_policies, {:unsupported_goal_policy, goal})
     |> add_unless(boundary in @write_domains, {:unsupported_write_boundary, boundary})
     |> add_unless(is_integer(attempt) and attempt >= 0, :invalid_attempt)
@@ -226,6 +245,8 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
     |> add_unless(normalize_atom(attrs["closeout_policy"]) in @closeout_policies, :invalid_closeout_policy)
     |> add_unless(is_binary(attrs["idempotency_identity"]), :invalid_idempotency_identity)
     |> add_unless(is_binary(attrs["conflict_identity"]), :invalid_conflict_identity)
+    |> add_unless(is_nil(attrs["commissioning_identity"]) or is_binary(attrs["commissioning_identity"]), :invalid_commissioning_identity)
+    |> add_unless(is_nil(attrs["supersedes"]) or is_binary(attrs["supersedes"]), :invalid_supersession_identity)
     |> add_unless(role != :programme or goal == :programme, :programme_goal_required)
     |> add_unless(role == :programme or goal != :programme, :programme_goal_role_required)
     |> add_unless(goal != :worker or role in @worker_goal_roles, :worker_goal_role_invalid)
@@ -237,6 +258,12 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
 
   defp add_unless(errors, true, _error), do: errors
   defp add_unless(errors, false, error), do: [error | errors]
+
+  defp model_for_trigger?(model, effort, trigger) do
+    (trigger in @luna_triggers and model == :"gpt-5.6-luna" and effort == :medium) or
+      (trigger in @terra_triggers and model == :"gpt-5.6-terra" and effort == :medium) or
+      (trigger in @sol_triggers and model == :"gpt-5.6-sol" and effort in [:high, :xhigh, :max, :ultra])
+  end
 
   # credo:disable-for-next-line Credo.Check.Refactor.CyclomaticComplexity
   defp project_binding(project, programme) when is_map(project) and is_binary(programme) do
@@ -308,6 +335,7 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
           values["fence"],
           values["model"],
           values["effort"],
+          values["trigger"],
           values["goal_policy"],
           values["dependencies"],
           values["permissions"],
@@ -316,6 +344,8 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
           values["closeout_policy"],
           values["idempotency_identity"],
           values["conflict_identity"],
+          values["commissioning_identity"],
+          values["supersedes"],
           values["evidence"],
           project.saved_project_id,
           project.native_project_id,
@@ -349,19 +379,23 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
 
   defp ambiguous_keys?(attrs) do
     keys = Map.keys(attrs)
-    normalized = Enum.map(keys, &to_string/1)
+    normalized = Enum.map(keys, &safe_key/1)
 
     length(keys) != length(Enum.uniq(normalized)) or
       Enum.any?(
         normalized,
-        &(&1 not in ~w(programme repository issue_or_pr role task attempt fence exact_revision write_boundary evidence model effort goal_policy dependencies permissions evidence_gates stall_policy closeout_policy idempotency_identity conflict_identity project))
+        &(&1 not in ~w(programme repository issue_or_pr role task attempt fence exact_revision write_boundary evidence model effort trigger goal_policy dependencies permissions evidence_gates stall_policy closeout_policy idempotency_identity conflict_identity commissioning_identity supersedes project))
       )
   end
 
   defp normalize_atom(value) when is_atom(value), do: value
 
+  # credo:disable-for-next-line Credo.Check.Readability.MaxLineLength
   defp normalize_atom(value) when is_binary(value) do
-    Enum.find(@roles ++ @models ++ @goal_policies ++ @write_domains ++ @efforts ++ @stall_policies ++ @closeout_policies, &(to_string(&1) == value))
+    supported = @roles ++ @models ++ @goal_policies ++ @write_domains ++ @efforts
+    supported = supported ++ @stall_policies ++ @closeout_policies
+    supported = supported ++ @luna_triggers ++ @terra_triggers ++ @sol_triggers
+    Enum.find(supported, &(to_string(&1) == value))
   end
 
   defp normalize_atom(_), do: nil
