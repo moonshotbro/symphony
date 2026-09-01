@@ -12,6 +12,7 @@ defmodule SymphonyElixir.Toscanini.EventContract do
   @events ~w(accepted started checkpointed review_requested completed failed blocked needs_input cancelled context_exhausted usage_limited)
   @commands ~w(dispatch_requested review_requested integration_requested reconcile_requested needs_input_acknowledged archive_requested)
   @top_keys ~w(specversion id source type subject time datacontenttype dataschema correlation_id causation_id data)
+  @data_keys ~w(envelope_version kind message_id correlation_id causation_id sender recipient authority_ref identity lifecycle evidence delivery privacy)
   @delivery_keys [:idempotency_key, :sequence]
   @known_keys [
     :specversion,
@@ -62,6 +63,7 @@ defmodule SymphonyElixir.Toscanini.EventContract do
     :expected_revision,
     :refs
   ]
+  @limits %{depth: 6, entries: 64, string: 512, list: 32}
 
   defstruct [:specversion, :id, :source, :type, :subject, :time, :datacontenttype, :dataschema, :correlation_id, :causation_id, :data]
 
@@ -227,12 +229,18 @@ defmodule SymphonyElixir.Toscanini.EventContract do
     identity_required = [:programme, :repo, :issue, :pr, :role, :task, :attempt, :fence, :idempotency, :exact_revision]
     delivery_required = @delivery_keys
 
-    if Enum.all?(required, &Map.has_key?(data, &1)) and
+    if bounded?(data) and object_keys?(data, @data_keys) and Enum.all?(required, &Map.has_key?(data, &1)) and
          present?(data.message_id) and present?(data.correlation_id) and
          is_map(data.identity) and Enum.all?(identity_required, &Map.has_key?(data.identity, &1)) and
          is_map(data.delivery) and Enum.all?(delivery_required, &Map.has_key?(data.delivery, &1)) and
          is_map(data.lifecycle) and
-         is_map(data.privacy), do: :ok, else: {:error, :malformed_data}
+         is_map(data.privacy) and object_keys?(data.sender, ["kind", "id", "role"]) and
+         object_keys?(data.recipient, ["kind", "id", "role"]) and
+         object_keys?(data.authority_ref, ["repository", "issue", "pr", "url", "expected_revision"]) and
+         object_keys?(data.identity, ["programme", "repo", "issue", "pr", "role", "task", "attempt", "fence", "idempotency", "exact_revision"]) and
+         object_keys?(data.lifecycle, ["state", "terminal_reason", "blocking_reason", "requested_action"]) and
+         object_keys?(data.delivery, ["idempotency_key", "sequence"]) and
+         object_keys?(data.privacy, ["classification", "retention", "redacted"]), do: validate_types(data), else: {:error, :malformed_data}
   end
 
   defp validate_data(_), do: {:error, :malformed_data}
@@ -250,13 +258,30 @@ defmodule SymphonyElixir.Toscanini.EventContract do
     data = e.data
 
     if e.id == data.message_id and e.correlation_id == data.correlation_id and
-         (is_nil(e.causation_id) or e.causation_id == data.causation_id) and
+         e.causation_id == data.causation_id and
          authority_matches?(e.subject, data.authority_ref), do: :ok, else: {:error, :identity_mismatch}
   end
 
   defp authority_subject(%{repository: repo, issue: issue}), do: "github:#{repo}##{issue}"
   defp authority_subject(_), do: nil
+  defp authority_matches?(_subject, authority) when not is_map(authority), do: false
   defp authority_matches?(subject, authority), do: subject == authority_subject(authority) or subject == "github:" <> to_string(authority[:repository]) <> "#" <> to_string(authority[:issue])
+  defp object_keys?(map, allowed) when is_map(map), do: Enum.all?(Map.keys(map), &(is_atom(&1) and Atom.to_string(&1) in allowed))
+  defp object_keys?(_, _), do: false
+  defp bounded?(term), do: bounded?(term, 0)
+  defp bounded?(_, depth) when depth > @limits.depth, do: false
+  defp bounded?(value, _depth) when is_binary(value), do: byte_size(value) <= @limits.string
+  defp bounded?(value, depth) when is_map(value), do: map_size(value) <= @limits.entries and Enum.all?(value, fn {k, v} -> bounded?(k, depth + 1) and bounded?(v, depth + 1) end)
+  defp bounded?(value, depth) when is_list(value), do: length(value) <= @limits.list and Enum.all?(value, &bounded?(&1, depth + 1))
+  defp bounded?(_, _), do: true
+
+  defp validate_types(data) do
+    privacy = data.privacy
+
+    if is_binary(data.lifecycle.state) and is_binary(data.delivery.idempotency_key) and is_integer(data.delivery.sequence) and
+         privacy.classification in ["metadata", "confidential"] and privacy.retention in ["audit", "operational"] and
+         is_boolean(Map.get(privacy, :redacted, false)), do: :ok, else: {:error, :malformed_data}
+  end
 
   defp validate_privacy(%{privacy: privacy} = data) do
     prohibited = [:body, :prompt, :message_body, :tool_arguments, :tool_results, :reasoning, :secret, :token]

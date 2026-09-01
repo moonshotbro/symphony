@@ -70,4 +70,13 @@ defmodule SymphonyElixir.Toscanini.EventContractTest do
     assert {:error, :unknown_field} = EventContract.new(put_in(event("e1", 1, "accepted").data[key], true))
     assert_raise ArgumentError, fn -> :erlang.binary_to_existing_atom(key, :utf8) end
   end
+
+  test "rejects malformed nested objects, privacy values, and oversized content" do
+    malformed = put_in(event("e1", 1, "accepted").data[:authority_ref], "not-an-object")
+    assert {:error, :malformed_data} = EventContract.new(malformed)
+    invalid_privacy = put_in(event("e1", 1, "accepted").data[:privacy][:classification], "public")
+    assert {:error, :malformed_data} = EventContract.new(invalid_privacy)
+    oversized = put_in(event("e1", 1, "accepted").data[:evidence][:refs], [String.duplicate("x", 513)])
+    assert {:error, :malformed_data} = EventContract.new(oversized)
+  end
 end
