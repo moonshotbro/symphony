@@ -78,5 +78,9 @@ defmodule SymphonyElixir.Toscanini.EventContractTest do
     assert {:error, :malformed_data} = EventContract.new(invalid_privacy)
     oversized = put_in(event("e1", 1, "accepted").data[:evidence][:refs], [String.duplicate("x", 513)])
     assert {:error, :malformed_data} = EventContract.new(oversized)
+    deep = put_in(event("e1", 1, "accepted").data[:evidence][:refs], [%{url: "https://example.test", digest: "x", kind: %{nested: %{nested: %{nested: %{nested: %{nested: %{nested: true}}}}}}}])
+    assert {:error, :unknown_field} = EventContract.new(deep)
+    credential = put_in(event("e1", 1, "accepted").data[:identity][:task], "Bearer secret")
+    assert {:error, :privacy_prohibited} = EventContract.new(credential)
   end
 end

@@ -61,7 +61,8 @@ defmodule SymphonyElixir.Toscanini.EventContract do
     :id,
     :url,
     :expected_revision,
-    :refs
+    :refs,
+    :digest
   ]
   @limits %{depth: 6, entries: 64, string: 512, list: 32}
 
@@ -220,7 +221,12 @@ defmodule SymphonyElixir.Toscanini.EventContract do
 
   defp validate_cloud_event(%__MODULE__{} = e) do
     required = [e.specversion, e.id, e.source, e.type, e.subject, e.dataschema, e.correlation_id]
-    if e.specversion == "1.0" and Enum.all?(required, &present?/1), do: :ok, else: {:error, :malformed_envelope}
+
+    if e.specversion == "1.0" and Enum.all?(required, &present?/1) and
+         Enum.all?(
+           [e.id, e.source, e.type, e.subject, e.time, e.datacontenttype, e.dataschema, e.correlation_id, e.causation_id],
+           &bounded?/1
+         ), do: :ok, else: {:error, :malformed_envelope}
   end
 
   defp validate_data(data) when is_map(data) do
@@ -240,6 +246,7 @@ defmodule SymphonyElixir.Toscanini.EventContract do
          object_keys?(data.identity, ["programme", "repo", "issue", "pr", "role", "task", "attempt", "fence", "idempotency", "exact_revision"]) and
          object_keys?(data.lifecycle, ["state", "terminal_reason", "blocking_reason", "requested_action"]) and
          object_keys?(data.delivery, ["idempotency_key", "sequence"]) and
+         object_keys?(data.evidence, ["refs"]) and evidence_valid?(data.evidence) and
          object_keys?(data.privacy, ["classification", "retention", "redacted"]), do: validate_types(data), else: {:error, :malformed_data}
   end
 
@@ -259,13 +266,25 @@ defmodule SymphonyElixir.Toscanini.EventContract do
 
     if e.id == data.message_id and e.correlation_id == data.correlation_id and
          e.causation_id == data.causation_id and
-         authority_matches?(e.subject, data.authority_ref), do: :ok, else: {:error, :identity_mismatch}
+         authority_matches?(e.subject, data.authority_ref) and
+         identity_authority_matches?(data.identity, data.authority_ref), do: :ok, else: {:error, :identity_mismatch}
   end
 
   defp authority_subject(%{repository: repo, issue: issue}), do: "github:#{repo}##{issue}"
   defp authority_subject(_), do: nil
   defp authority_matches?(_subject, authority) when not is_map(authority), do: false
   defp authority_matches?(subject, authority), do: subject == authority_subject(authority) or subject == "github:" <> to_string(authority[:repository]) <> "#" <> to_string(authority[:issue])
+  defp identity_authority_matches?(%{repo: repo, issue: issue}, %{repository: repo, issue: issue}), do: true
+  defp identity_authority_matches?(_, _), do: false
+
+  defp evidence_valid?(%{refs: refs}) when is_list(refs) and length(refs) <= 32 do
+    Enum.all?(refs, fn ref ->
+      is_map(ref) and object_keys?(ref, ["url", "digest", "kind"]) and
+        is_binary(ref[:url]) and String.starts_with?(ref[:url], "https://") and bounded?(ref)
+    end)
+  end
+
+  defp evidence_valid?(_), do: false
   defp object_keys?(map, allowed) when is_map(map), do: Enum.all?(Map.keys(map), &(is_atom(&1) and Atom.to_string(&1) in allowed))
   defp object_keys?(_, _), do: false
   defp bounded?(term), do: bounded?(term, 0)
@@ -285,7 +304,7 @@ defmodule SymphonyElixir.Toscanini.EventContract do
 
   defp validate_privacy(%{privacy: privacy} = data) do
     prohibited = [:body, :prompt, :message_body, :tool_arguments, :tool_results, :reasoning, :secret, :token]
-    if privacy[:classification] == "restricted" or contains_prohibited?(data, prohibited), do: {:error, :privacy_prohibited}, else: :ok
+    if privacy[:classification] == "restricted" or contains_prohibited?(data, prohibited) or unsafe_value?(data), do: {:error, :privacy_prohibited}, else: :ok
   end
 
   defp contains_prohibited?(map, prohibited) when is_map(map) do
@@ -294,6 +313,17 @@ defmodule SymphonyElixir.Toscanini.EventContract do
 
   defp contains_prohibited?(list, prohibited) when is_list(list), do: Enum.any?(list, &contains_prohibited?(&1, prohibited))
   defp contains_prohibited?(_, _), do: false
+  defp unsafe_value?(map) when is_map(map), do: Enum.any?(map, fn {_key, value} -> unsafe_value?(value) end)
+  defp unsafe_value?(list) when is_list(list), do: Enum.any?(list, &unsafe_value?/1)
+
+  defp unsafe_value?(value) when is_binary(value) do
+    down = String.downcase(value)
+
+    String.contains?(value, ["/Users/", "/home/", "BEGIN "]) or
+      String.contains?(down, ["bearer ", "token=", "password=", "secret="])
+  end
+
+  defp unsafe_value?(_), do: false
 
   defp reject_command_transition(%{data: %{kind: "command"}}), do: {:error, :commands_are_not_factual_events}
   defp reject_command_transition(_), do: :ok
