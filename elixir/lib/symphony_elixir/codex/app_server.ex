@@ -536,7 +536,8 @@ defmodule SymphonyElixir.Codex.AppServer do
       else: {:ok, nil}
   end
 
-  defp validate_launch_contract(%TaskLaunchContract{} = contract, _workspace), do: {:ok, contract}
+  defp validate_launch_contract(%TaskLaunchContract{} = contract, _workspace),
+    do: TaskLaunchContract.verify(contract)
 
   defp validate_launch_contract(contract, workspace) when is_map(contract) do
     if TaskLaunchContract.project_binding_enabled?() or workspace_repository?(workspace) do
@@ -625,15 +626,33 @@ defmodule SymphonyElixir.Codex.AppServer do
   defp verify_thread_authority(thread, workspace, session_id, contract, require_name) do
     cwd = Map.get(thread, "cwd") || Map.get(thread, "workingDirectory")
     name = Map.get(thread, "name") || Map.get(thread, "title")
+    git_info = Map.get(thread, "gitInfo")
 
     cond do
       cwd != workspace -> {:error, :cwd_mismatch}
       Map.get(thread, "projectId") != contract.project.native_project_id -> {:error, :native_project_mismatch}
-      Map.get(thread, "ephemeral") == true -> {:error, :ephemeral_thread}
+      Map.get(thread, "ephemeral") != false -> {:error, :thread_persistence_unverified}
+      not valid_session_id?(Map.get(thread, "sessionId")) -> {:error, :session_id_missing}
+      not exact_git_identity?(git_info, contract) -> {:error, :thread_revision_or_repository_mismatch}
       require_name and name != contract.title -> {:error, :title_mismatch}
       not is_nil(session_id) and Map.get(thread, "sessionId") != session_id -> {:error, :session_id_mismatch}
       true -> :ok
     end
+  end
+
+  defp valid_session_id?(value), do: is_binary(value) and String.trim(value) != ""
+
+  defp exact_git_identity?(%{"sha" => sha, "originUrl" => origin}, contract)
+       when is_binary(sha) and is_binary(origin),
+       do: sha == contract.exact_revision and repository_name(origin) == contract.repository
+
+  defp exact_git_identity?(_, _contract), do: false
+
+  defp repository_name(remote) do
+    remote
+    |> String.replace(~r/^git@[^:]+:/, "")
+    |> String.replace(~r|^https?://[^/]+/|, "")
+    |> String.replace_suffix(".git", "")
   end
 
   defp thread_session_id(%{"sessionId" => session_id}) when is_binary(session_id) and session_id != "", do: {:ok, session_id}

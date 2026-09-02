@@ -80,7 +80,7 @@ defmodule SymphonyElixir.Codex.CoordinationEffectsTest do
              CoordinationEffects.dispatch(ledger, intent(), :fork, provider(fn _ -> {:ok, child()} end))
   end
 
-  test "ambiguous post-effect inspection remains held while exact child read settles it", %{ledger: ledger} do
+  test "recovery quarantines a child read that lacks bound persistence and authority facts", %{ledger: ledger} do
     {:ok, action, :new} = ActionLedger.plan(ledger, intent())
     {:ok, _} = ActionLedger.transition(ledger, action.id, :dispatched)
 
@@ -91,10 +91,8 @@ defmodule SymphonyElixir.Codex.CoordinationEffectsTest do
         "disposition" => "zero_response"
       })
 
-    assert {:already_satisfied, settled} =
+    assert {:error, {:uncertain_action_quarantined, _}} =
              CoordinationEffects.dispatch(ledger, intent(), :fork, provider(fn _ -> raise "must not fork" end))
-
-    assert settled.state == :already_satisfied
   end
 
   test "restart turns dispatched action uncertain and preserves duplicate suppression", %{ledger: ledger, path: path} do
@@ -173,7 +171,7 @@ defmodule SymphonyElixir.Codex.CoordinationEffectsTest do
     assert {:error, :provider_permission_denied} =
              CoordinationEffects.dispatch(ledger, intent("permission-direct"), :fork, provider(fn _ -> {:error, :permission} end))
 
-    assert {:ok, %{id: "child-no-correlation"}, _} =
+    assert {:error, :provider_fork_response_invalid} =
              CoordinationEffects.dispatch(
                ledger,
                intent("no-correlation"),

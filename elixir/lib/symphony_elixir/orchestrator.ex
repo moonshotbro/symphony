@@ -17,7 +17,7 @@ defmodule SymphonyElixir.Orchestrator do
     Workspace
   }
 
-  alias SymphonyElixir.Codex.{AppServer, CoordinationEffects, RecoveryInspector}
+  alias SymphonyElixir.Codex.{AppServer, CoordinationEffects, RecoveryInspector, TaskLaunchContract}
 
   alias SymphonyElixir.Tracker.Issue
 
@@ -112,12 +112,16 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp normalize_fork_read({:ok, %{"id" => id, "forkedFromId" => source_id}})
+  defp normalize_fork_read({:ok, %{"id" => id, "forkedFromId" => source_id} = thread})
        when is_binary(id) and is_binary(source_id),
-       do: {:ok, %{id: id, forked_from_id: source_id}}
+       do: {:ok, thread |> Map.put(:id, id) |> Map.put(:forked_from_id, source_id)}
 
   defp normalize_fork_read({:ok, _thread}), do: {:error, :fork_read_invalid}
   defp normalize_fork_read({:error, reason}), do: {:error, reason}
+
+  defp attach_fork_host({:ok, thread}, nil), do: {:ok, Map.put(thread, :worker_host, "local")}
+  defp attach_fork_host({:ok, thread}, host) when is_binary(host), do: {:ok, Map.put(thread, :worker_host, host)}
+  defp attach_fork_host(other, _host), do: other
 
   @impl true
   def handle_info({:tick, tick_token}, %{tick_token: tick_token} = state)
@@ -1586,19 +1590,26 @@ defmodule SymphonyElixir.Orchestrator do
     worker_host = Keyword.get(opts, :worker_host)
     task_contract = Keyword.get(opts, :task_contract)
 
-    provider = %{
-      fork: fn thread_id ->
-        AppServer.fork_thread(thread_id, workspace,
-          worker_host: worker_host,
-          task_contract: task_contract
-        )
-      end,
-      inspect_fork: fn thread_id ->
-        AppServer.read_thread(thread_id, workspace, worker_host: worker_host) |> normalize_fork_read()
-      end
-    }
+    with {:ok, contract} <- TaskLaunchContract.verify(task_contract),
+         :ok <- TaskLaunchContract.verify_fork_binding(contract, intent, workspace, worker_host) do
+      provider = %{
+        fork: fn thread_id ->
+          AppServer.fork_thread(thread_id, workspace,
+            worker_host: worker_host,
+            task_contract: task_contract
+          )
+        end,
+        inspect_fork: fn thread_id ->
+          AppServer.read_thread(thread_id, workspace, worker_host: worker_host)
+          |> normalize_fork_read()
+          |> attach_fork_host(worker_host)
+        end
+      }
 
-    {:reply, CoordinationEffects.dispatch(state.action_ledger, intent, :fork, provider), state}
+      {:reply, CoordinationEffects.dispatch(state.action_ledger, intent, :fork, provider), state}
+    else
+      {:error, reason} -> {:reply, {:error, reason}, state}
+    end
   end
 
   def handle_call({:fork_thread, _intent, _workspace, _opts}, _from, state),

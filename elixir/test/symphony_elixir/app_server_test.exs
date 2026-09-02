@@ -27,7 +27,7 @@ defmodule SymphonyElixir.AppServerTest do
 
       contract = %SymphonyElixir.Codex.TaskLaunchContract{project: %{native_project_id: "project-39"}}
 
-      assert {:ok, %{id: "child-39", forked_from_id: "parent-39", correlation_id: "session-39"}} =
+      assert {:error, :invalid_task_launch_contract} =
                AppServer.fork_thread("parent-39", workspace, task_contract: contract)
     after
       File.rm_rf(root)
@@ -1662,7 +1662,7 @@ defmodule SymphonyElixir.AppServerTest do
       }
 
       issue = %Issue{id: "sys-50", identifier: "SYS-50", title: "bound", state: "In Progress"}
-      assert {:ok, _} = AppServer.run(workspace, "bound", issue, task_contract: contract)
+      assert {:error, :invalid_task_launch_contract} = AppServer.run(workspace, "bound", issue, task_contract: contract)
     after
       File.rm_rf(root)
     end
@@ -1700,8 +1700,7 @@ defmodule SymphonyElixir.AppServerTest do
 
       issue = %Issue{id: "sys-50", identifier: "SYS-50", title: "bound", state: "In Progress"}
 
-      expected = %{thread_id: "bound-thread", verification_reason: :native_project_mismatch}
-      assert {:error, {:project_bound_thread_unverified, ^expected}} = AppServer.run(workspace, "bound", issue, task_contract: contract)
+      assert {:error, :invalid_task_launch_contract} = AppServer.run(workspace, "bound", issue, task_contract: contract)
     after
       File.rm_rf(root)
     end
@@ -1986,10 +1985,9 @@ defmodule SymphonyElixir.AppServerTest do
 
       issue = %Issue{id: "sys-50", identifier: "SYS-50", title: "bound", state: "In Progress"}
 
-      expected = %{thread_id: "held-thread", verification_reason: :instruction_sources_missing}
-      assert {:error, {:project_bound_thread_unverified, ^expected}} = AppServer.run(workspace, "bound", issue, task_contract: contract)
+      assert {:error, :invalid_task_launch_contract} = AppServer.run(workspace, "bound", issue, task_contract: contract)
 
-      assert File.read!(trace) |> String.split("\n", trim: true) |> length() == 3
+      refute File.exists?(trace)
     after
       File.rm_rf(root)
     end
@@ -2030,10 +2028,8 @@ defmodule SymphonyElixir.AppServerTest do
       }
 
       issue = %Issue{id: "sys-50", identifier: "SYS-50", title: "bound", state: "In Progress"}
-      expected = %{thread_id: "created-A", verification_reason: :thread_read_id_mismatch}
-      assert {:error, {:project_bound_thread_unverified, ^expected}} = AppServer.run(workspace, "bound", issue, task_contract: contract)
-      refute File.read!(trace) =~ "turn/start"
-      assert File.read!(trace) |> String.split("\n", trim: true) |> length() == 6
+      assert {:error, :invalid_task_launch_contract} = AppServer.run(workspace, "bound", issue, task_contract: contract)
+      refute File.exists?(trace)
     after
       File.rm_rf(root)
     end
