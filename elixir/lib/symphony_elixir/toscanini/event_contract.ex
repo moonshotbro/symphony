@@ -1,17 +1,18 @@
 # credo:disable-for-this-file
 defmodule SymphonyElixir.Toscanini.EventContract do
+  alias SymphonyElixir.Codex.TaskAccountabilityRegistry
   @moduledoc "Privacy-safe, deterministic Toscanini command and event contract."
   @version "1.1.0"
-  @states ~w(discovered assessed ready claimed dispatched running checkpointed review_requested reconciled needs_input blocked context_exhausted usage_limited failed recovery_pending rejected cancelled archived dead_letter)
-  @events ~w(accepted started checkpointed review_requested completed failed blocked needs_input cancelled context_exhausted usage_limited)
-  @commands ~w(dispatch_requested review_requested integration_requested reconcile_requested needs_input_acknowledged archive_requested)
+  @states ~w(discovered assessed ready claimed dispatched running progress candidate_ready review_pending rework_requested landing cleanup_pending complete superseded attention recovery_pending blocked failed cancelled archived dead_letter)
+  @events ~w(task_accepted durable_progress candidate_ready review_accepted review_rejected rework_requested landed cleanup_complete superseded resumed attention failed cancelled)
+  @commands ~w(start steer request_candidate repair_findings review_exact_head resume supersede stop dispatch_requested)
   @top ~w(specversion id source type subject time datacontenttype dataschema correlation_id causation_id data)
   @data ~w(envelope_version kind message_id correlation_id causation_id sender recipient authority_ref identity lifecycle evidence delivery recovery privacy)
   @schemas %{
     sender: ~w(kind id role),
     recipient: ~w(kind id role),
     authority: ~w(repository issue pr url expected_revision),
-    identity: ~w(programme repo issue pr role task attempt fence idempotency exact_revision),
+    identity: ~w(programme repo issue pr role task attempt fence idempotency exact_revision registry_id registry_version canonical_digest authority_revision primary_role domain_alias work_character),
     lifecycle: ~w(state terminal_reason blocking_reason requested_action),
     evidence: ~w(refs),
     ref: ~w(url digest kind),
@@ -25,7 +26,7 @@ defmodule SymphonyElixir.Toscanini.EventContract do
 
   defmodule State do
     @moduledoc false
-    defstruct current: "discovered", revision: 0, seen_ids: MapSet.new(), last_sequence: 0, identity: nil
+    defstruct current: "discovered", revision: 0, seen_ids: MapSet.new(), seen_operations: MapSet.new(), last_sequence: 0, last_id: nil, identity: nil
   end
 
   @type t :: %__MODULE__{}
@@ -77,10 +78,23 @@ defmodule SymphonyElixir.Toscanini.EventContract do
          :ok <- validate_value(e),
          :ok <- factual(e),
          :ok <- same_identity(state, e),
+         :ok <- operation_idempotency(state, e),
+         :ok <- causation(state, e),
+         :ok <- terminal_evidence(e),
          :ok <- unique(state, e),
          :ok <- sequential(state, e),
          {:ok, next} <- next(state.current, lifecycle(e)) do
-      {:ok, %{state | current: next, revision: state.revision + 1, seen_ids: MapSet.put(state.seen_ids, e.id), last_sequence: sequence(e), identity: state.identity || identity(e)}}
+      {:ok,
+       %{
+         state
+         | current: next,
+           revision: state.revision + 1,
+           seen_ids: MapSet.put(state.seen_ids, e.id),
+           seen_operations: MapSet.put(state.seen_operations, e.data.delivery.idempotency_key),
+           last_sequence: sequence(e),
+           last_id: e.id,
+           identity: state.identity || identity(e)
+       }}
     end
   end
 
@@ -309,10 +323,18 @@ defmodule SymphonyElixir.Toscanini.EventContract do
   defp identity?(i) when is_map(i),
     do:
       schema?(i, @schemas.identity) and binary?(i.programme) and repo?(i.repo) and positive?(i.issue) and nullable_positive?(i.pr) and
-        i.role in ["programme", "implementation", "independent_review", "landing", "recovery", "research", "monitor", "telemetry", "acceptance"] and binary?(i.task) and is_integer(i.attempt) and
-        i.attempt >= 0 and is_integer(i.fence) and i.fence >= 0 and binary?(i.idempotency) and digest?(i.exact_revision)
+        i.role == i.primary_role and i.primary_role in TaskAccountabilityRegistry.roles() and identifier?(i.task) and is_integer(i.attempt) and
+        i.attempt >= 0 and is_integer(i.fence) and i.fence >= 0 and binary?(i.idempotency) and digest?(i.exact_revision) and registry_identity?(i)
 
   defp identity?(_), do: false
+
+  defp registry_identity?(identity) do
+    registry = TaskAccountabilityRegistry.identity()
+
+    identity.registry_id == registry.registry_id and identity.registry_version == registry.registry_version and identity.canonical_digest == registry.canonical_digest and
+      identity.authority_revision == registry.authority_revision and binary?(identity.domain_alias) and identity.work_character == "bounded"
+  end
+
   defp principal?(p) when is_map(p), do: schema?(p, @schemas.sender) and p.kind in ["worker", "role", "adapter"] and binary?(p.id) and binary?(p.role)
   defp principal?(_), do: false
   defp lifecycle?(l), do: binary?(l.state) and nullable_binary?(l.terminal_reason) and nullable_binary?(l.blocking_reason) and nullable_binary?(l.requested_action)
@@ -321,10 +343,11 @@ defmodule SymphonyElixir.Toscanini.EventContract do
   defp recovery?(recovery) do
     route?(recovery.original_route) and route?(recovery.effective_route) and effort?(recovery.governed_effort) and bounded_attempt?(recovery.attempt) and
       bounded_budget?(recovery.budget) and nullable_timestamp?(recovery.resume_at) and failure_class?(recovery.failure_class) and is_boolean(recovery.response_started) and
-      is_boolean(recovery.effect_uncertain) and recovery_lifecycle?(recovery.lifecycle) and recovery_outcome?(recovery.outcome) and circuit_state?(recovery.circuit_state)
+      is_boolean(recovery.effect_uncertain) and recovery_lifecycle?(recovery.lifecycle) and recovery_outcome?(recovery.outcome) and circuit_state?(recovery.circuit_state) and
+      recovery_coherent?(recovery)
   end
 
-  defp route?(value), do: value in ["primary", "fallback", "held"]
+  defp route?(value), do: value in ["sol", "terra", "luna", "held"]
   defp effort?(value), do: value in ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]
   defp bounded_attempt?(value), do: is_integer(value) and value in 0..@limits.list
   defp bounded_budget?(value), do: is_integer(value) and value in 0..1_000_000
@@ -335,6 +358,12 @@ defmodule SymphonyElixir.Toscanini.EventContract do
   defp recovery_lifecycle?(value), do: value in ["not_required", "observed", "held", "scheduled", "resumed", "abandoned"]
   defp recovery_outcome?(value), do: value in ["pending", "recovered", "failed", "not_started"]
   defp circuit_state?(value), do: value in ["closed", "open", "half_open"]
+  defp recovery_coherent?(%{lifecycle: "not_required", failure_class: "none", outcome: "not_started", circuit_state: "closed", effective_route: route}), do: route in ["sol", "terra", "luna"]
+  defp recovery_coherent?(%{lifecycle: "held", effective_route: "held", outcome: "pending", circuit_state: "open"}), do: true
+  defp recovery_coherent?(%{lifecycle: "scheduled", outcome: "pending", circuit_state: state}), do: state in ["open", "half_open"]
+  defp recovery_coherent?(%{lifecycle: "resumed", outcome: "recovered", circuit_state: "closed", effective_route: route}), do: route in ["sol", "terra", "luna"]
+  defp recovery_coherent?(%{lifecycle: "abandoned", outcome: "failed"}), do: true
+  defp recovery_coherent?(_), do: false
   defp privacy?(p), do: p.classification in ["metadata", "confidential"] and p.retention in ["audit", "operational"] and is_boolean(p.redacted)
   defp binary?(x), do: is_binary(x) and byte_size(x) in 1..@limits.string
   defp nullable_binary?(nil), do: true
@@ -344,6 +373,7 @@ defmodule SymphonyElixir.Toscanini.EventContract do
   defp nullable_positive?(x), do: positive?(x)
   defp digest?(x), do: is_binary(x) and x =~ ~r/^[0-9a-fA-F]{7,128}$/
   defp repo?(x), do: is_binary(x) and x =~ ~r/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/
+  defp identifier?(x), do: is_binary(x) and byte_size(x) in 1..128 and x =~ ~r/^[A-Za-z0-9._:-]+$/
 
   defp privacy(d) do
     bad = [:body, :prompt, :message_body, :tool_arguments, :tool_results, :reasoning, :secret, :token]
@@ -395,6 +425,16 @@ defmodule SymphonyElixir.Toscanini.EventContract do
   defp same_identity(%State{identity: expected}, e), do: if(Map.delete(identity(e), :idempotency) == Map.delete(expected, :idempotency), do: :ok, else: {:error, :identity_mismatch})
   defp unique(%State{seen_ids: ids}, %{id: id}), do: if(MapSet.member?(ids, id), do: {:error, :duplicate_transition}, else: :ok)
 
+  defp operation_idempotency(%State{seen_operations: operations}, %{data: %{identity: %{idempotency: identity_key}, delivery: %{idempotency_key: delivery_key}}}) when identity_key == delivery_key,
+    do: if(MapSet.member?(operations, delivery_key), do: {:error, :duplicate_operation}, else: :ok)
+
+  defp operation_idempotency(_, _), do: {:error, :idempotency_mismatch}
+  defp causation(%State{revision: 0}, _), do: :ok
+  defp causation(%State{last_id: last_id}, %{causation_id: last_id}) when is_binary(last_id), do: :ok
+  defp causation(_, _), do: {:error, :causation_mismatch}
+  defp terminal_evidence(%{data: %{lifecycle: %{state: "completed"}, evidence: %{refs: []}}}), do: {:error, :missing_terminal_evidence}
+  defp terminal_evidence(_), do: :ok
+
   defp sequential(%State{last_sequence: last}, e) do
     case sequence(e) do
       x when x == last + 1 -> :ok
@@ -406,11 +446,17 @@ defmodule SymphonyElixir.Toscanini.EventContract do
 
   defp next(current, event) do
     paths = %{
-      "accepted" => ["discovered", "assessed", "ready"],
-      "started" => ["accepted", "claimed", "dispatched", "running"],
-      "checkpointed" => ["started", "running"],
-      "review_requested" => ["running", "checkpointed"],
-      "completed" => ["review_requested", "reconciled"],
+      "task_accepted" => ["discovered", "assessed", "ready"],
+      "durable_progress" => ["task_accepted", "claimed", "dispatched", "running", "progress"],
+      "candidate_ready" => ["durable_progress", "running", "progress"],
+      "review_accepted" => ["candidate_ready", "review_pending"],
+      "review_rejected" => ["candidate_ready", "review_pending"],
+      "rework_requested" => ["review_rejected"],
+      "landed" => ["review_accepted", "landing"],
+      "cleanup_complete" => ["landed", "cleanup_pending"],
+      "superseded" => @states,
+      "resumed" => ["attention", "recovery_pending", "blocked"],
+      "attention" => ["running", "progress", "recovery_pending"],
       "failed" => ["running", "checkpointed", "recovery_pending"],
       "blocked" => ["running", "ready", "claimed"],
       "needs_input" => ["running", "blocked"],
