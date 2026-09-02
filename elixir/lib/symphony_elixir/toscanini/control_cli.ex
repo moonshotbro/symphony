@@ -60,13 +60,60 @@ defmodule SymphonyElixir.Toscanini.ControlCLI do
 
     case result do
       {:ok, %{} = contract} ->
-        Map.merge(identity, %{"ok" => true, "operation" => "construct_task", "contract" => Map.from_struct(contract)})
+        case authoritative_identity(contract, request) do
+          {:ok, authoritative} ->
+            Map.merge(authoritative, %{"ok" => true, "operation" => "construct_task", "contract" => Map.from_struct(contract)})
+
+          {:error, reason} ->
+            Map.merge(identity, %{"ok" => false, "operation" => "construct_task", "error" => reason})
+        end
 
       {:ok, nil} ->
         Map.merge(identity, %{"ok" => false, "operation" => "construct_task", "error" => "project_binding_required"})
 
       {:error, reason} ->
         Map.merge(identity, %{"ok" => false, "operation" => "construct_task", "error" => inspect(reason)})
+    end
+  end
+
+  defp authoritative_identity(contract, request) do
+    project = contract.project
+    saved_project_id = Map.get(project, :saved_project_id) || Map.get(project, "saved_project_id")
+    expected_project = Map.get(request, "project_id")
+    expected_fence = Map.get(request, "fence")
+    expected_issue = Map.get(request, "issue_identifier") || issue_identifier(request)
+    expected_head = Map.get(request, "head_sha", Map.get(request, "expected_sha"))
+
+    cond do
+      contract.repository != Map.get(request, "repository") ->
+        {:error, "repository_mismatch"}
+
+      saved_project_id != expected_project ->
+        {:error, "project_id_mismatch"}
+
+      contract.fence != expected_fence ->
+        {:error, "fence_mismatch"}
+
+      contract.issue_or_pr != expected_issue ->
+        {:error, "issue_identity_mismatch"}
+
+      not is_nil(expected_head) and contract.exact_revision != expected_head ->
+        {:error, "head_mismatch"}
+
+      true ->
+        {:ok,
+         %{
+           "operation" => "construct_task",
+           "repository" => contract.repository,
+           "project_id" => saved_project_id,
+           "fence" => contract.fence,
+           "task_id" => Map.get(request, "task_id"),
+           "head_sha" => contract.exact_revision,
+           "issue_identifier" => contract.issue_or_pr,
+           "workspace_path" => Map.get(request, "workspace_path")
+         }
+         |> Enum.reject(fn {_key, value} -> is_nil(value) end)
+         |> Map.new()}
     end
   end
 

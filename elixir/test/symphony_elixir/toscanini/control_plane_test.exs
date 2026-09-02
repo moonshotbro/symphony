@@ -89,13 +89,15 @@ defmodule SymphonyElixir.Toscanini.ControlPlaneTest do
 
       request = %{
         "repository" => "moonshotbro/symphony",
-        "project_id" => "p",
-        "fence" => "f",
+        "project_id" => "b12752f9-9a65-4194-bc49-77808b21d767",
         "issue_identifier" => "SYS-61",
         "objective" => "Bounded construction",
         "role" => "execution_production",
         "workspace_path" => root
       }
+
+      {revision, 0} = System.cmd("git", ["-C", root, "rev-parse", "HEAD"])
+      request = Map.put(request, "fence", "SYS-61:0:#{String.trim(revision)}")
 
       result =
         request
@@ -109,6 +111,14 @@ defmodule SymphonyElixir.Toscanini.ControlPlaneTest do
       assert result["fence"] == request["fence"]
       assert result["contract"]["repository"] == request["repository"]
       assert result["contract"]["issue_or_pr"] == "SYS-61"
+
+      mismatch =
+        ControlCLI.invoke("construct_task", {:ok, Map.put(request, "project_id", "untrusted-project")})
+        |> Jason.encode!()
+        |> Jason.decode!()
+
+      assert mismatch["ok"] == false
+      assert mismatch["error"] == "project_id_mismatch"
     after
       File.rm_rf(root)
     end
