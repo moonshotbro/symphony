@@ -182,6 +182,18 @@ defmodule SymphonyElixir.Toscanini.EventContractTest do
              EventContract.transition(state, put_in(accepted.data[:evidence][:risk_assurance][:assurance_outcome], "unresolved"))
   end
 
+  test "review acceptance requires a stored review projection from its predecessor" do
+    accepted = event("e4", 4, "review_accepted", "e3")
+    identity = accepted.data.identity
+
+    state = %EventContract.State{current: "candidate_ready", revision: 3, last_sequence: 3, last_id: "e3", identity: identity}
+
+    assert {:error, :missing_risk_assurance} = EventContract.transition(state, accepted)
+
+    malformed = %{state | risk_assurance: %{stage: "review", assurance_outcome: "unresolved"}}
+    assert {:error, :missing_risk_assurance} = EventContract.transition(malformed, accepted)
+  end
+
   test "rejects privacy-prohibited payloads and illegal state changes" do
     unsafe = put_in(event("e1", 1, "task_accepted").data[:body], "prompt")
     assert {:error, :unknown_field} = EventContract.new(unsafe)

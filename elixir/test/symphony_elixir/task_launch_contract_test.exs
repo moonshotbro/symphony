@@ -167,6 +167,11 @@ defmodule SymphonyElixir.Codex.TaskLaunchContractTest do
     assert :invalid_risk_assurance in errors
     assert {:error, errors} = TaskLaunchContract.compile(Map.put(review, :risk_assurance, Map.put(risk_assurance(), :extra, "rejected")))
     assert :invalid_risk_assurance in errors
+
+    assert {:error, errors} =
+             TaskLaunchContract.compile(Map.put(review, :risk_assurance, %{:schema => risk_assurance().schema, "schema" => risk_assurance().schema}))
+
+    assert :invalid_risk_assurance in errors
   end
 
   test "detects duplicate identity in a batch while allowing distinct attempts" do

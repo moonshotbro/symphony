@@ -683,7 +683,18 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
   defp normalize_supersession(value) when is_map(value), do: stringify_keys(value)
   defp normalize_supersession(_), do: :invalid
   defp normalize_risk_assurance(nil), do: nil
-  defp normalize_risk_assurance(value) when is_map(value), do: stringify_keys(value)
+
+  defp normalize_risk_assurance(value) when is_map(value) do
+    keys = Map.keys(value)
+    normalized_keys = Enum.map(keys, &safe_key/1)
+
+    if length(keys) != length(Enum.uniq(normalized_keys)) or Enum.any?(normalized_keys, &is_nil/1) do
+      :invalid
+    else
+      Map.new(value, fn {key, child} -> {safe_key(key), child} end)
+    end
+  end
+
   defp normalize_risk_assurance(_), do: :invalid
 
   defp valid_risk_assurance?(nil, _repository, _head, role), do: role not in [:independent_review, :landing]

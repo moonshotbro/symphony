@@ -575,18 +575,43 @@ defmodule SymphonyElixir.Toscanini.EventContract do
     projection = Map.get(evidence, :risk_assurance)
 
     cond do
-      lifecycle in ["candidate_ready", "review_accepted", "landed"] and is_nil(projection) -> {:error, :missing_risk_assurance}
-      lifecycle == "candidate_ready" and {projection.stage, projection.assurance_outcome} != {"review", "unresolved"} -> {:error, :risk_assurance_stage_invalid}
-      lifecycle == "review_accepted" and {projection.stage, projection.assurance_outcome} != {"landing", "pass"} -> {:error, :risk_assurance_stage_invalid}
-      lifecycle == "landed" and {projection.stage, projection.assurance_outcome} != {"landing", "pass"} -> {:error, :risk_assurance_stage_invalid}
-      (lifecycle == "review_accepted" and state.risk_assurance) && risk_assurance_binding(projection) != risk_assurance_binding(state.risk_assurance) -> {:error, :risk_assurance_mismatch}
-      lifecycle == "landed" and projection != state.risk_assurance -> {:error, :risk_assurance_mismatch}
-      true -> :ok
+      lifecycle in ["candidate_ready", "review_accepted", "landed"] and is_nil(projection) ->
+        {:error, :missing_risk_assurance}
+
+      lifecycle == "review_accepted" and state.current in ["candidate_ready", "review_pending"] and
+          not prior_review_projection?(state) ->
+        {:error, :missing_risk_assurance}
+
+      lifecycle == "candidate_ready" and {projection.stage, projection.assurance_outcome} != {"review", "unresolved"} ->
+        {:error, :risk_assurance_stage_invalid}
+
+      lifecycle == "review_accepted" and {projection.stage, projection.assurance_outcome} != {"landing", "pass"} ->
+        {:error, :risk_assurance_stage_invalid}
+
+      lifecycle == "landed" and {projection.stage, projection.assurance_outcome} != {"landing", "pass"} ->
+        {:error, :risk_assurance_stage_invalid}
+
+      (lifecycle == "review_accepted" and state.risk_assurance) && risk_assurance_binding(projection) != risk_assurance_binding(state.risk_assurance) ->
+        {:error, :risk_assurance_mismatch}
+
+      lifecycle == "landed" and projection != state.risk_assurance ->
+        {:error, :risk_assurance_mismatch}
+
+      true ->
+        :ok
     end
   end
 
   defp risk_assurance(%{data: %{evidence: evidence}}), do: Map.get(evidence, :risk_assurance)
   defp risk_assurance_binding(projection), do: Map.take(projection, [:repository, :head_sha, :matrix_revision, :required_gate_ids])
+
+  defp prior_review_projection?(%State{identity: identity, risk_assurance: projection})
+       when is_map(identity) and is_map(projection) do
+    Map.get(projection, :stage) == "review" and Map.get(projection, :assurance_outcome) == "unresolved" and
+      risk_assurance?(projection, identity)
+  end
+
+  defp prior_review_projection?(_), do: false
 
   defp sequential(%State{last_sequence: last}, e) do
     case sequence(e) do
