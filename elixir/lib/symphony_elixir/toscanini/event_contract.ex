@@ -16,7 +16,8 @@ defmodule SymphonyElixir.Toscanini.EventContract do
     authority: ~w(repository issue pr url expected_revision),
     identity: ~w(programme repo issue pr role task attempt fence idempotency exact_revision registry_id registry_version canonical_digest authority_revision primary_role domain_alias work_character),
     lifecycle: ~w(state terminal_reason blocking_reason requested_action),
-    evidence: ~w(refs),
+    evidence: ~w(refs risk_assurance),
+    risk_assurance: ~w(schema repository head_sha risk_receipt_digest assurance_receipt_digest evidence_manifest_digest matrix_revision required_gate_ids artifact_url stage assurance_outcome),
     ref: ~w(url digest kind),
     delivery: ~w(idempotency_key sequence),
     recovery:
@@ -29,7 +30,7 @@ defmodule SymphonyElixir.Toscanini.EventContract do
 
   defmodule State do
     @moduledoc false
-    defstruct current: "discovered", revision: 0, seen_ids: MapSet.new(), seen_operations: MapSet.new(), last_sequence: 0, last_id: nil, identity: nil
+    defstruct current: "discovered", revision: 0, seen_ids: MapSet.new(), seen_operations: MapSet.new(), last_sequence: 0, last_id: nil, identity: nil, risk_assurance: nil
   end
 
   @type t :: %__MODULE__{}
@@ -82,6 +83,7 @@ defmodule SymphonyElixir.Toscanini.EventContract do
          :ok <- factual(e),
          :ok <- nonterminal(state),
          :ok <- same_identity(state, e),
+         :ok <- risk_assurance_continuity(state, e),
          :ok <- operation_idempotency(state, e),
          :ok <- causation(state, e),
          :ok <- terminal_evidence(e),
@@ -97,7 +99,8 @@ defmodule SymphonyElixir.Toscanini.EventContract do
            seen_operations: MapSet.put(state.seen_operations, e.data.delivery.idempotency_key),
            last_sequence: sequence(e),
            last_id: e.id,
-           identity: state.identity || identity(e)
+           identity: state.identity || identity(e),
+           risk_assurance: risk_assurance(e) || state.risk_assurance
        }}
     end
   end
@@ -224,7 +227,7 @@ defmodule SymphonyElixir.Toscanini.EventContract do
 
   defp data(d) when is_map(d) do
     if schema?(d, @data) and schema?(d.sender, @schemas.sender) and schema?(d.recipient, @schemas.recipient) and schema?(d.authority_ref, @schemas.authority) and schema?(d.identity, @schemas.identity) and
-         schema?(d.lifecycle, @schemas.lifecycle) and schema?(d.evidence, @schemas.evidence) and schema?(d.delivery, @schemas.delivery) and schema?(d.recovery, @schemas.recovery) and
+         schema?(d.lifecycle, @schemas.lifecycle) and schema?(d.delivery, @schemas.delivery) and schema?(d.recovery, @schemas.recovery) and
          schema?(d.privacy, @schemas.privacy) and
          binary?(d.message_id) and binary?(d.correlation_id) and nullable_binary?(d.causation_id) and identity?(d.identity) and principal?(d.sender) and principal?(d.recipient) and
          authority?(d.authority_ref, d.identity) and lifecycle?(d.lifecycle) and delivery?(d.delivery) and recovery?(d.recovery) and privacy?(d.privacy) and evidence?(d.evidence, d.identity),
@@ -297,8 +300,48 @@ defmodule SymphonyElixir.Toscanini.EventContract do
     end
   end
 
-  defp evidence?(%{refs: refs}, i) when is_list(refs), do: proper?(refs) and length(refs) <= @limits.list and Enum.all?(refs, &evidence_ref?(&1, i))
+  defp evidence?(evidence, identity) when is_map(evidence) do
+    keys = Map.keys(evidence)
+    projection = Map.get(evidence, :risk_assurance)
+
+    Enum.sort(keys) in [[:refs], [:refs, :risk_assurance]] and is_list(evidence.refs) and proper?(evidence.refs) and length(evidence.refs) <= @limits.list and
+      Enum.all?(evidence.refs, &evidence_ref?(&1, identity)) and (is_nil(projection) or risk_assurance?(projection, identity))
+  end
+
   defp evidence?(_, _), do: false
+
+  defp risk_assurance?(projection, identity) when is_map(projection) do
+    schema?(projection, @schemas.risk_assurance) and projection.schema == "sysmiq.symphony.risk-assurance.v1" and
+      projection.repository == identity.repo and repo?(projection.repository) and sha?(projection.head_sha) and projection.head_sha == identity.exact_revision and
+      receipt_digest?(projection.risk_receipt_digest) and receipt_digest?(projection.assurance_receipt_digest) and receipt_digest?(projection.evidence_manifest_digest) and
+      matrix_revision?(projection.matrix_revision) and required_gate_ids?(projection.required_gate_ids) and artifact_url?(projection.artifact_url, identity) and
+      projection.stage in ["review", "landing"] and projection.assurance_outcome in ["unresolved", "pass"]
+  end
+
+  defp risk_assurance?(_, _), do: false
+
+  defp required_gate_ids?(gates) when is_list(gates) and gates != [] and length(gates) <= @limits.list, do: Enum.all?(gates, &identifier?/1)
+  defp required_gate_ids?(_), do: false
+  defp matrix_revision?(revision), do: is_binary(revision) and byte_size(revision) in 1..128
+  defp sha?(value), do: is_binary(value) and value =~ ~r/^[0-9a-f]{40}$/
+  defp receipt_digest?(value), do: is_binary(value) and value =~ ~r/^[0-9a-f]{64}$/
+
+  defp artifact_url?(url, identity) when is_binary(url) and byte_size(url) <= @limits.string do
+    uri = URI.parse(url)
+
+    uri.scheme == "https" and uri.host == "github.com" and is_nil(uri.userinfo) and is_nil(uri.query) and is_nil(uri.fragment) and
+      case String.split(uri.path || "", "/", trim: true) do
+        [owner, repo, "actions", "runs", run_id, "artifacts"] ->
+          owner <> "/" <> repo == identity.repo and run_id =~ ~r/^\d+$/
+
+        _ ->
+          false
+      end
+  rescue
+    _ -> false
+  end
+
+  defp artifact_url?(_, _), do: false
 
   defp evidence_ref?(ref, i) when is_map(ref) do
     if schema?(ref, @schemas.ref) do
@@ -505,9 +548,9 @@ defmodule SymphonyElixir.Toscanini.EventContract do
   defp factual(%{data: %{kind: "command"}}), do: {:error, :commands_are_not_factual_events}
   defp factual(_), do: :ok
 
-  defp state_valid(%State{current: c, revision: r, seen_ids: ids, seen_operations: operations, last_sequence: last, last_id: last_id, identity: identity}) do
+  defp state_valid(%State{current: c, revision: r, seen_ids: ids, seen_operations: operations, last_sequence: last, last_id: last_id, identity: identity, risk_assurance: projection}) do
     if (c in @states or c in @events) and is_integer(r) and r >= 0 and is_struct(ids, MapSet) and is_struct(operations, MapSet) and is_integer(last) and last >= 0 and
-         (is_nil(last_id) or identifier?(last_id)) and (is_nil(identity) or identity?(identity)),
+         (is_nil(last_id) or identifier?(last_id)) and (is_nil(identity) or identity?(identity)) and (is_nil(projection) or is_map(projection)),
        do: :ok,
        else: {:error, :malformed_state}
   end
@@ -527,6 +570,48 @@ defmodule SymphonyElixir.Toscanini.EventContract do
   defp causation(_, _), do: {:error, :causation_mismatch}
   defp terminal_evidence(%{data: %{lifecycle: %{state: state}, evidence: %{refs: []}}}) when state in @terminal_events, do: {:error, :missing_terminal_evidence}
   defp terminal_evidence(_), do: :ok
+
+  defp risk_assurance_continuity(state, %{data: %{lifecycle: %{state: lifecycle}, evidence: evidence}}) do
+    projection = Map.get(evidence, :risk_assurance)
+
+    cond do
+      lifecycle in ["candidate_ready", "review_accepted", "landed"] and is_nil(projection) ->
+        {:error, :missing_risk_assurance}
+
+      lifecycle == "review_accepted" and state.current in ["candidate_ready", "review_pending"] and
+          not prior_review_projection?(state) ->
+        {:error, :missing_risk_assurance}
+
+      lifecycle == "candidate_ready" and {projection.stage, projection.assurance_outcome} != {"review", "unresolved"} ->
+        {:error, :risk_assurance_stage_invalid}
+
+      lifecycle == "review_accepted" and {projection.stage, projection.assurance_outcome} != {"landing", "pass"} ->
+        {:error, :risk_assurance_stage_invalid}
+
+      lifecycle == "landed" and {projection.stage, projection.assurance_outcome} != {"landing", "pass"} ->
+        {:error, :risk_assurance_stage_invalid}
+
+      (lifecycle == "review_accepted" and state.risk_assurance) && risk_assurance_binding(projection) != risk_assurance_binding(state.risk_assurance) ->
+        {:error, :risk_assurance_mismatch}
+
+      lifecycle == "landed" and projection != state.risk_assurance ->
+        {:error, :risk_assurance_mismatch}
+
+      true ->
+        :ok
+    end
+  end
+
+  defp risk_assurance(%{data: %{evidence: evidence}}), do: Map.get(evidence, :risk_assurance)
+  defp risk_assurance_binding(projection), do: Map.take(projection, [:repository, :head_sha, :matrix_revision, :required_gate_ids])
+
+  defp prior_review_projection?(%State{identity: identity, risk_assurance: projection})
+       when is_map(identity) and is_map(projection) do
+    Map.get(projection, :stage) == "review" and Map.get(projection, :assurance_outcome) == "unresolved" and
+      risk_assurance?(projection, identity)
+  end
+
+  defp prior_review_projection?(_), do: false
 
   defp sequential(%State{last_sequence: last}, e) do
     case sequence(e) do

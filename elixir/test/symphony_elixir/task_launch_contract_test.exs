@@ -3,6 +3,25 @@ defmodule SymphonyElixir.Codex.TaskLaunchContractTest do
 
   alias SymphonyElixir.Codex.TaskLaunchContract
 
+  defp risk_assurance(overrides \\ %{}) do
+    Map.merge(
+      %{
+        schema: "sysmiq.symphony.risk-assurance.v1",
+        repository: "moonshotbro/sysmiq-symphony",
+        head_sha: "3d3ee035725b0728f041d8d10fc29f5c8adc42c0",
+        risk_receipt_digest: String.duplicate("a", 64),
+        assurance_receipt_digest: String.duplicate("b", 64),
+        evidence_manifest_digest: String.duplicate("c", 64),
+        matrix_revision: "risk-matrix-v1",
+        required_gate_ids: ["G-EXACT-HEAD-REVIEW"],
+        artifact_url: "https://github.com/moonshotbro/sysmiq-symphony/actions/runs/50/artifacts",
+        stage: "review",
+        assurance_outcome: "unresolved"
+      },
+      overrides
+    )
+  end
+
   test "runtime compiler derives enabled binding from authority and rejects non-repositories" do
     root = Path.join(System.tmp_dir!(), "symphony-contract-runtime-#{System.unique_integer([:positive])}")
     File.mkdir_p!(root)
@@ -110,6 +129,51 @@ defmodule SymphonyElixir.Codex.TaskLaunchContractTest do
     assert {:unsupported_model, nil} in errors
   end
 
+  test "requires closed risk assurance for review and landing contracts" do
+    review = review_attrs()
+    assert {:ok, contract} = TaskLaunchContract.compile(Map.put(review, :risk_assurance, risk_assurance()))
+    assert contract.risk_assurance["head_sha"] == contract.exact_revision
+
+    assert {:ok, changed} =
+             TaskLaunchContract.compile(Map.put(review, :risk_assurance, risk_assurance(%{risk_receipt_digest: String.duplicate("d", 64)})))
+
+    refute changed.contract_id == contract.contract_id
+
+    assert {:error, errors} = TaskLaunchContract.compile(review)
+    assert :invalid_risk_assurance in errors
+
+    landing =
+      Map.merge(review, %{
+        role: :landing,
+        write_boundary: :merge,
+        evidence: ["accepted_verdict", "destination_receipt", "clean_state"],
+        permissions: ["land_bound_destination"],
+        primary_role: "integration_closeout",
+        domain_alias: "landing owner",
+        permission_envelope: ["land_bound_destination"],
+        integrator_principal: "integrator",
+        accepted_verdict: %{"accepted" => true, "role" => "verification_assessment", "fence" => "lease-50-1"},
+        receipt_identity: "receipt-50",
+        receipt_fence: "lease-50-1"
+      })
+
+    assert {:ok, _} = TaskLaunchContract.compile(Map.put(landing, :risk_assurance, risk_assurance(%{stage: "landing", assurance_outcome: "pass"})))
+    assert {:error, errors} = TaskLaunchContract.compile(landing)
+    assert :invalid_risk_assurance in errors
+
+    assert {:error, errors} =
+             TaskLaunchContract.compile(Map.put(review, :risk_assurance, risk_assurance(%{repository: "other/repository"})))
+
+    assert :invalid_risk_assurance in errors
+    assert {:error, errors} = TaskLaunchContract.compile(Map.put(review, :risk_assurance, Map.put(risk_assurance(), :extra, "rejected")))
+    assert :invalid_risk_assurance in errors
+
+    assert {:error, errors} =
+             TaskLaunchContract.compile(Map.put(review, :risk_assurance, %{:schema => risk_assurance().schema, "schema" => risk_assurance().schema}))
+
+    assert :invalid_risk_assurance in errors
+  end
+
   test "detects duplicate identity in a batch while allowing distinct attempts" do
     assert {:error, [:duplicate_contract_identity]} = TaskLaunchContract.compile_many([valid_attrs(), valid_attrs()])
     assert {:ok, contracts} = TaskLaunchContract.compile_many([valid_attrs(), %{valid_attrs() | attempt: 1}])
@@ -193,5 +257,31 @@ defmodule SymphonyElixir.Codex.TaskLaunchContractTest do
         root: "/Users/sysmiq/sysmiq-symphony"
       }
     }
+  end
+
+  defp review_attrs do
+    Map.merge(valid_attrs(), %{
+      role: :independent_review,
+      goal_policy: :none,
+      write_boundary: :review,
+      evidence: ["verdict", "reproduction_basis"],
+      permissions: ["read_candidate_and_test_scope"],
+      primary_role: "verification_assessment",
+      domain_alias: "independent review",
+      registry_id: "SYS-LIB-ROLE-REGISTRY-001",
+      registry_version: "1.0",
+      authority_revision: "7cce0ffd5a7ebb6980b6754b996b81fed108023b",
+      canonical_digest: "a88eb4f4d35806679e7df9dde7885ae25a1b362306a08efd187b16717cf28fc2",
+      permission_envelope: ["read_candidate_and_test_scope"],
+      handoff: "independent_review",
+      execution_principal: "worker",
+      reviewer_principal: "reviewer",
+      candidate_id: "candidate-50",
+      verdict_candidate_id: "candidate-50",
+      verdict_attempt: 0,
+      execution_fence: "lease-50-1",
+      verdict_exact_revision: "3d3ee035725b0728f041d8d10fc29f5c8adc42c0",
+      verdict_fence: "lease-50-1"
+    })
   end
 end

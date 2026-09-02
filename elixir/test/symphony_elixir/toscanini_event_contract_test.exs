@@ -5,9 +5,57 @@ defmodule SymphonyElixir.Toscanini.EventContractTest do
   alias SymphonyElixir.Toscanini.EventContract
   alias SymphonyElixir.Codex.TaskAccountabilityRegistry
 
+  @head String.duplicate("a", 40)
+
+  defp risk_assurance(overrides \\ %{}) do
+    Map.merge(
+      %{
+        schema: "sysmiq.symphony.risk-assurance.v1",
+        repository: "moonshotbro/symphony",
+        head_sha: @head,
+        risk_receipt_digest: String.duplicate("b", 64),
+        assurance_receipt_digest: String.duplicate("c", 64),
+        evidence_manifest_digest: String.duplicate("d", 64),
+        matrix_revision: "risk-matrix-v1",
+        required_gate_ids: ["G-EXACT-HEAD-REVIEW"],
+        artifact_url: "https://github.com/moonshotbro/symphony/actions/runs/51/artifacts",
+        stage: "review",
+        assurance_outcome: "unresolved"
+      },
+      overrides
+    )
+  end
+
   defp event(id, seq, name, from \\ nil) do
     causation_id = from || if(seq == 1, do: nil, else: "e#{seq - 1}")
     refs = if(name in ["cleanup_complete", "superseded", "failed", "cancelled"], do: [%{url: "https://github.com/moonshotbro/symphony/issues/51", digest: nil, kind: "issue"}], else: [])
+
+    projection =
+      case name do
+        "candidate_ready" ->
+          risk_assurance()
+
+        "review_accepted" ->
+          risk_assurance(%{
+            stage: "landing",
+            assurance_outcome: "pass",
+            assurance_receipt_digest: String.duplicate("e", 64),
+            evidence_manifest_digest: String.duplicate("f", 64),
+            artifact_url: "https://github.com/moonshotbro/symphony/actions/runs/52/artifacts"
+          })
+
+        "landed" ->
+          risk_assurance(%{
+            stage: "landing",
+            assurance_outcome: "pass",
+            assurance_receipt_digest: String.duplicate("e", 64),
+            evidence_manifest_digest: String.duplicate("f", 64),
+            artifact_url: "https://github.com/moonshotbro/symphony/actions/runs/52/artifacts"
+          })
+
+        _ ->
+          nil
+      end
 
     %{
       specversion: "1.0",
@@ -26,7 +74,7 @@ defmodule SymphonyElixir.Toscanini.EventContractTest do
         causation_id: causation_id,
         sender: %{kind: "worker", id: "worker-000000000000000000000000000000e1", role: "implementation"},
         recipient: %{kind: "role", id: "programme", role: "programme"},
-        authority_ref: %{repository: "moonshotbro/symphony", issue: 51, pr: nil, url: "https://github.com/moonshotbro/symphony/issues/51", expected_revision: "abc1234"},
+        authority_ref: %{repository: "moonshotbro/symphony", issue: 51, pr: nil, url: "https://github.com/moonshotbro/symphony/issues/51", expected_revision: @head},
         identity: %{
           programme: "programme-000000000000000000000000000000e1",
           repo: "moonshotbro/symphony",
@@ -37,7 +85,7 @@ defmodule SymphonyElixir.Toscanini.EventContractTest do
           attempt: 0,
           fence: 1,
           idempotency: "op-#{String.pad_leading(id, 32, "0")}",
-          exact_revision: "abc1234",
+          exact_revision: @head,
           registry_id: "SYS-LIB-ROLE-REGISTRY-001",
           registry_version: "1.0",
           canonical_digest: "a88eb4f4d35806679e7df9dde7885ae25a1b362306a08efd187b16717cf28fc2",
@@ -47,7 +95,7 @@ defmodule SymphonyElixir.Toscanini.EventContractTest do
           work_character: "bounded"
         },
         lifecycle: %{state: name, terminal_reason: nil, blocking_reason: nil, requested_action: nil},
-        evidence: %{refs: refs},
+        evidence: if(projection, do: %{refs: refs, risk_assurance: projection}, else: %{refs: refs}),
         delivery: %{idempotency_key: "op-#{String.pad_leading(id, 32, "0")}", sequence: seq},
         recovery: %{
           original_route: "sol",
@@ -105,6 +153,45 @@ defmodule SymphonyElixir.Toscanini.EventContractTest do
     assert state.revision == 6
     assert {:error, :terminal_state} = EventContract.transition(state, hd(events))
     assert {:error, :causation_mismatch} = EventContract.transition(EventContract.initial_state(), event("e2", 2, "durable_progress"))
+  end
+
+  test "binds staged risk assurance to the exact review and landing head" do
+    candidate = event("e3", 3, "candidate_ready", "e2")
+    accepted = event("e4", 4, "review_accepted", "e3")
+    landed = event("e5", 5, "landed", "e4")
+    previous = [event("e1", 1, "task_accepted"), event("e2", 2, "durable_progress")]
+
+    assert {:error, :missing_risk_assurance} =
+             EventContract.replay(previous ++ [put_in(candidate.data[:evidence], %{refs: []})])
+
+    assert {:error, :malformed_data} =
+             EventContract.new(put_in(candidate.data[:evidence][:risk_assurance][:repository], "other/repository"))
+
+    assert {:error, :malformed_data} =
+             EventContract.new(put_in(candidate.data[:evidence][:risk_assurance][:head_sha], String.duplicate("e", 40)))
+
+    assert {:error, :risk_assurance_stage_invalid} =
+             EventContract.replay(previous ++ [put_in(candidate.data[:evidence][:risk_assurance][:assurance_outcome], "pass")])
+
+    assert {:ok, state} = EventContract.replay(previous ++ [candidate, accepted])
+
+    assert {:error, :risk_assurance_mismatch} =
+             EventContract.transition(state, put_in(landed.data[:evidence][:risk_assurance][:assurance_receipt_digest], String.duplicate("d", 64)))
+
+    assert {:error, :risk_assurance_stage_invalid} =
+             EventContract.transition(state, put_in(accepted.data[:evidence][:risk_assurance][:assurance_outcome], "unresolved"))
+  end
+
+  test "review acceptance requires a stored review projection from its predecessor" do
+    accepted = event("e4", 4, "review_accepted", "e3")
+    identity = accepted.data.identity
+
+    state = %EventContract.State{current: "candidate_ready", revision: 3, last_sequence: 3, last_id: "e3", identity: identity}
+
+    assert {:error, :missing_risk_assurance} = EventContract.transition(state, accepted)
+
+    malformed = %{state | risk_assurance: %{stage: "review", assurance_outcome: "unresolved"}}
+    assert {:error, :missing_risk_assurance} = EventContract.transition(malformed, accepted)
   end
 
   test "rejects privacy-prohibited payloads and illegal state changes" do
