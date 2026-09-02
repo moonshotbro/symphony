@@ -29,6 +29,8 @@ defmodule SymphonyElixir.MixProject do
           SymphonyElixir.Codex.AppServer,
           SymphonyElixir.Codex.TaskLaunchContract,
           SymphonyElixir.Codex.TaskAccountabilityRegistry,
+          SymphonyElixir.Toscanini.ControlCLI,
+          SymphonyElixir.Toscanini.ControlPlane,
           SymphonyElixir.Toscanini.EventContract,
           SymphonyElixir.Codex.DynamicTool,
           SymphonyElixir.HttpServer,
@@ -45,7 +47,8 @@ defmodule SymphonyElixir.MixProject do
           SymphonyElixirWeb.StaticAssetController,
           SymphonyElixirWeb.StaticAssets,
           SymphonyElixirWeb.Router,
-          SymphonyElixirWeb.Router.Helpers
+          SymphonyElixirWeb.Router.Helpers,
+          Mix.Tasks.Toscanini.Capabilities
         ]
       ],
       test_ignore_filters: [

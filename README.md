@@ -14,6 +14,13 @@ The Elixir reference can optionally place mutating task coordination behind a du
 privacy-bounded [action ledger](elixir/docs/action_ledger.md). It supplements the existing
 orchestrator with idempotency and restart reconciliation without creating a second scheduler.
 
+The bounded Toscanini facade is available without an MCP server through
+`mix toscanini.capabilities`. It reports the single supported control-plane
+surface; task contracts, pressure selection, lifecycle envelopes, recovery
+inspection, and exact-head merge operations remain delegated to their existing
+deterministic runtime modules. The facade does not start the orchestrator or
+grant execution authority by itself.
+
 ## Running Symphony
 
 ### Requirements
