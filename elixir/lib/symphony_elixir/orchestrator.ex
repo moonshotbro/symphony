@@ -56,7 +56,8 @@ defmodule SymphonyElixir.Orchestrator do
       retry_attempts: %{},
       codex_totals: nil,
       codex_rate_limits: nil,
-      work_pressure: nil
+      work_pressure: nil,
+      require_work_pressure_authority: true
     ]
   end
 
@@ -101,7 +102,8 @@ defmodule SymphonyElixir.Orchestrator do
               Keyword.get(opts, :action_inspector, &RecoveryInspector.inspect/1)
             ),
           codex_totals: @empty_codex_totals,
-          codex_rate_limits: nil
+          codex_rate_limits: nil,
+          require_work_pressure_authority: Keyword.get(opts, :require_work_pressure_authority, Mix.env() != :test)
         }
 
         run_terminal_workspace_cleanup()
@@ -870,7 +872,15 @@ defmodule SymphonyElixir.Orchestrator do
     active_states = active_state_set()
     terminal_states = terminal_state_set()
 
-    with {:ok, project_id} <- work_pressure_project_id(),
+    if state.require_work_pressure_authority do
+      choose_issues_authoritative(issues, state, active_states, terminal_states)
+    else
+      legacy_choose_issues(issues, state, active_states, terminal_states)
+    end
+  end
+
+  defp choose_issues_authoritative(issues, state, active_states, terminal_states) do
+    with {:ok, project_id} <- work_pressure_project_id(state),
          :ok <- work_pressure_ledger_available?(state) do
       choose_issues_with_authority(issues, state, active_states, terminal_states, project_id)
     else
@@ -878,6 +888,14 @@ defmodule SymphonyElixir.Orchestrator do
         Logger.warning("Work pressure authority unavailable: #{inspect(reason)}")
         %{state | work_pressure: %{error: reason}}
     end
+  end
+
+  defp legacy_choose_issues(issues, state, active_states, terminal_states) do
+    issues
+    |> sort_issues_for_dispatch()
+    |> Enum.reduce(state, fn issue, state_acc ->
+      if should_dispatch_issue?(issue, state_acc, active_states, terminal_states), do: dispatch_issue(state_acc, issue), else: state_acc
+    end)
   end
 
   defp choose_issues_with_authority(issues, state, active_states, terminal_states, project_id) do
@@ -889,7 +907,7 @@ defmodule SymphonyElixir.Orchestrator do
     active =
       state.running
       |> Map.values()
-      |> Enum.map(&work_pressure_item_from_running/1)
+      |> Enum.map(&work_pressure_item_from_running(&1, project_id))
       |> Enum.reject(&is_nil/1)
       |> Enum.sort_by(&{&1.issue_id, &1.task_id, &1.idempotency_key})
 
@@ -937,14 +955,14 @@ defmodule SymphonyElixir.Orchestrator do
     }
   end
 
-  defp work_pressure_item_from_running(%{issue: %Issue{} = issue} = entry) do
-    item = work_pressure_item_from_issue(issue, work_pressure_project_id!())
+  defp work_pressure_item_from_running(%{issue: %Issue{} = issue} = entry, project_id) do
+    item = work_pressure_item_from_issue(issue, project_id)
     Map.put(item, :host, Map.get(entry, :worker_host) || "local")
   end
 
-  defp work_pressure_item_from_running(_), do: nil
+  defp work_pressure_item_from_running(_, _project_id), do: nil
 
-  defp work_pressure_project_id do
+  defp work_pressure_project_id(_state) do
     case Config.settings!().codex.project_binding do
       binding when is_map(binding) ->
         id = Map.get(binding, :native_project_id, Map.get(binding, "native_project_id"))
@@ -955,11 +973,7 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp work_pressure_project_id! do
-    {:ok, id} = work_pressure_project_id()
-    id
-  end
-
+  defp work_pressure_ledger_available?(%State{require_work_pressure_authority: false}), do: :ok
   defp work_pressure_ledger_available?(%State{action_ledger: ledger}) when not is_nil(ledger), do: :ok
   defp work_pressure_ledger_available?(_state), do: {:error, :action_ledger_missing}
 

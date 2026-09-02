@@ -10,6 +10,30 @@ defmodule SymphonyElixir.AgentRunner do
 
   @type worker_host :: String.t() | nil
 
+  @doc """
+  Steer the active turn owned by a worker runner.
+
+  The runner validates that the turn is still active and accepts at most one
+  steering request for that turn. The returned result is authoritative: a
+  provider rejection remains an error.
+  """
+  @spec steer(pid(), String.t(), timeout()) :: {:ok, term()} | {:error, term()}
+  def steer(runner_pid, input, timeout \\ 5_000)
+
+  def steer(runner_pid, input, timeout)
+      when is_pid(runner_pid) and is_binary(input) and byte_size(input) > 0 do
+    ref = make_ref()
+    send(runner_pid, {:symphony_steer, self(), ref, input})
+
+    receive do
+      {:symphony_steer_result, ^ref, result} -> result
+    after
+      timeout -> {:error, :steer_timeout}
+    end
+  end
+
+  def steer(_runner_pid, _input, _timeout), do: {:error, :invalid_steer_request}
+
   @doc false
   @spec continue_with_issue_for_test(Issue.t(), ([String.t()] -> term())) ::
           {:continue, Issue.t()} | {:done, Issue.t()} | {:error, term()}
@@ -76,7 +100,8 @@ defmodule SymphonyElixir.AgentRunner do
       {:worker_runtime_info, issue_id,
        %{
          worker_host: worker_host,
-         workspace_path: workspace
+         workspace_path: workspace,
+         runner_pid: self()
        }}
     )
 
