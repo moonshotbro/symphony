@@ -29,6 +29,7 @@ defmodule SymphonyElixir.MixProject do
           SymphonyElixir.Codex.AppServer,
           SymphonyElixir.Codex.TaskLaunchContract,
           SymphonyElixir.Codex.TaskAccountabilityRegistry,
+          SymphonyElixir.Toscanini.EventContract,
           SymphonyElixir.Codex.DynamicTool,
           SymphonyElixir.HttpServer,
           SymphonyElixir.StatusDashboard,
