@@ -8,6 +8,39 @@ defmodule SymphonyElixir.Toscanini.EventContractTest do
 
   @head String.duplicate("a", 40)
 
+  defmodule TransitionFailingLedger do
+    use GenServer
+    alias SymphonyElixir.ActionLedger.Action
+
+    def start_link, do: GenServer.start_link(__MODULE__, nil)
+    def init(state), do: {:ok, state}
+
+    def handle_call({:plan, _intent}, _from, state) do
+      now = DateTime.utc_now() |> DateTime.to_iso8601()
+
+      action = %Action{
+        id: "action-failing-ledger",
+        idempotency_key: "op-failing-ledger",
+        lineage_key: "lineage-failing-ledger",
+        kind: "task_messaging",
+        source: %{},
+        target: %{},
+        purpose_hash: String.duplicate("a", 64),
+        checkpoint: String.duplicate("a", 40),
+        expected_postcondition: "event_recorded",
+        policy_fingerprint: String.duplicate("b", 64),
+        state: :planned,
+        inserted_at: now,
+        updated_at: now
+      }
+
+      {:reply, {:ok, action, :new}, state}
+    end
+
+    def handle_call({:transition, _id, :dispatched, _effect}, _from, state),
+      do: {:reply, {:error, :forced_transition_failure}, state}
+  end
+
   defp risk_assurance(overrides \\ %{}) do
     Map.merge(
       %{
@@ -124,16 +157,28 @@ defmodule SymphonyElixir.Toscanini.EventContractTest do
   defp nested_known_map(0, leaf), do: leaf
   defp nested_known_map(depth, leaf), do: %{kind: nested_known_map(depth - 1, leaf)}
 
+  defp command_envelope(id \\ "c1") do
+    {:ok, envelope} = EventContract.new(event("e1", 1, "task_accepted"))
+
+    %{
+      event(id, 1, "task_accepted")
+      | type: "sysmiq.command.start.v1",
+        data:
+          envelope.data
+          |> Map.put(:kind, "command")
+          |> Map.put(:message_id, id)
+          |> put_in([:lifecycle, :requested_action], "start")
+          |> put_in([:identity, :idempotency], "op-#{String.pad_leading(id, 32, "0")}")
+          |> put_in([:delivery, :idempotency_key], "op-#{String.pad_leading(id, 32, "0")}")
+    }
+  end
+
   test "validates normalized event and keeps commands separate" do
     assert {:ok, envelope} = EventContract.new(event("e1", 1, "task_accepted"))
     assert EventContract.event?(envelope)
     assert :ok = EventContract.validate(envelope)
 
-    command = %{
-      event("c1", 1, "task_accepted")
-      | type: "sysmiq.command.start.v1",
-        data: envelope.data |> Map.put(:kind, "command") |> Map.put(:message_id, "c1") |> put_in([:lifecycle, :requested_action], "start")
-    }
+    command = command_envelope()
 
     assert {:ok, command} = EventContract.new(command)
     assert {:error, :commands_are_not_factual_events} = EventContract.transition(EventContract.initial_state(), command)
@@ -556,5 +601,45 @@ defmodule SymphonyElixir.Toscanini.EventContractTest do
     assert {:ok, state, _action} = LifecycleLedger.event(ledger, first, EventContract.initial_state())
     assert {:error, :causation_mismatch} = LifecycleLedger.event(ledger, event("e3", 3, "durable_progress"), state)
     assert {:already_satisfied, _action} = LifecycleLedger.event(ledger, first, EventContract.initial_state())
+  end
+
+  test "lifecycle ledger exposes command aliases, event projection, replay, and diagnostics" do
+    path = Path.join(System.tmp_dir!(), "toscanini-lifecycle-api-#{System.unique_integer([:positive])}.jsonl")
+    {:ok, ledger} = ActionLedger.start_link(name: nil, path: path)
+
+    on_exit(fn ->
+      if Process.alive?(ledger), do: GenServer.stop(ledger)
+      File.rm(path)
+    end)
+
+    command = command_envelope("c2")
+    effect = fn -> {:ok, :delivered, %{"disposition" => "command_delivered"}} end
+
+    assert {:ok, :delivered, _action} = LifecycleLedger.command(ledger, command, effect)
+    assert {:already_satisfied, _action} = LifecycleLedger.dispatch_command(ledger, command, effect)
+    assert {:error, :command_required} = LifecycleLedger.command(ledger, event("e4", 1, "task_accepted"), effect)
+    assert {:error, _reason} = LifecycleLedger.command(ledger, %{}, effect)
+
+    factual = event("e5", 1, "task_accepted")
+    assert {:ok, ^factual, _action} = LifecycleLedger.record_event(ledger, factual)
+    assert {:already_satisfied, _action} = LifecycleLedger.event(ledger, factual)
+    assert {:error, :event_required} = LifecycleLedger.event(ledger, command)
+    assert {:error, _reason} = LifecycleLedger.event(ledger, %{})
+
+    assert {:ok, replayed} = LifecycleLedger.replay([factual])
+    assert replayed.current == "task_accepted"
+
+    assert %{
+             pending: 0,
+             retryable: 0,
+             quarantined: 0,
+             needs_input: 0,
+             total_unresolved: 0
+           } = LifecycleLedger.diagnostics(ledger)
+  end
+
+  test "lifecycle ledger returns durable transition failures" do
+    {:ok, ledger} = TransitionFailingLedger.start_link()
+    assert {:error, :forced_transition_failure} = LifecycleLedger.event(ledger, event("e6", 1, "task_accepted"))
   end
 end

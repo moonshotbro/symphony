@@ -714,15 +714,30 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
 
   defp normalize_risk_assurance(_), do: :invalid
 
+  @risk_assurance_keys ~w(
+    artifact_url assurance_outcome assurance_receipt_digest evidence_manifest_digest
+    head_sha matrix_revision repository required_gate_ids risk_receipt_digest schema stage
+  )
+
   defp valid_risk_assurance?(nil, _repository, _head, role), do: role not in [:independent_review, :landing]
 
-  defp valid_risk_assurance?(projection, repository, head, role) when is_map(projection) and role in [:independent_review, :landing] do
-    Map.keys(projection) |> Enum.sort() ==
-      ~w(artifact_url assurance_outcome assurance_receipt_digest evidence_manifest_digest head_sha matrix_revision repository required_gate_ids risk_receipt_digest schema stage) and
-      projection["schema"] == "sysmiq.symphony.risk-assurance.v1" and projection["repository"] == repository and
-      projection["head_sha"] == head and receipt_digest?(projection["risk_receipt_digest"]) and receipt_digest?(projection["assurance_receipt_digest"]) and
-      receipt_digest?(projection["evidence_manifest_digest"]) and nonblank_string?(projection["matrix_revision"]) and valid_required_gate_ids?(projection["required_gate_ids"]) and
-      artifact_url?(projection["artifact_url"], repository, head) and valid_risk_assurance_stage?(projection, role)
+  defp valid_risk_assurance?(projection, repository, head, role)
+       when is_map(projection) and role in [:independent_review, :landing] do
+    checks = [
+      Enum.sort(Map.keys(projection)) == Enum.sort(@risk_assurance_keys),
+      projection["schema"] == "sysmiq.symphony.risk-assurance.v1",
+      projection["repository"] == repository,
+      projection["head_sha"] == head,
+      receipt_digest?(projection["risk_receipt_digest"]),
+      receipt_digest?(projection["assurance_receipt_digest"]),
+      receipt_digest?(projection["evidence_manifest_digest"]),
+      nonblank_string?(projection["matrix_revision"]),
+      valid_required_gate_ids?(projection["required_gate_ids"]),
+      artifact_url?(projection["artifact_url"], repository, head),
+      valid_risk_assurance_stage?(projection, role)
+    ]
+
+    Enum.all?(checks)
   end
 
   defp valid_risk_assurance?(_, _, _, _), do: false
@@ -730,24 +745,38 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
   defp valid_risk_assurance_stage?(%{"stage" => "landing", "assurance_outcome" => "pass"}, :landing), do: true
   defp valid_risk_assurance_stage?(_, _), do: false
   defp receipt_digest?(value), do: is_binary(value) and Regex.match?(~r/^[0-9a-f]{64}$/, value)
-  defp valid_required_gate_ids?(value), do: is_list(value) and value != [] and length(value) <= 32 and Enum.all?(value, &(is_binary(&1) and Regex.match?(~r/^[A-Za-z][A-Za-z0-9_.:-]{0,127}$/, &1)))
+
+  defp valid_required_gate_ids?(value) do
+    is_list(value) and value != [] and length(value) <= 32 and Enum.all?(value, &valid_gate_id?/1)
+  end
+
+  defp valid_gate_id?(value),
+    do: is_binary(value) and Regex.match?(~r/^[A-Za-z][A-Za-z0-9_.:-]{0,127}$/, value)
 
   defp artifact_url?(url, repository, _head) when is_binary(url) do
     uri = URI.parse(url)
 
-    uri.scheme == "https" and uri.host == "github.com" and is_nil(uri.userinfo) and is_nil(uri.query) and is_nil(uri.fragment) and
-      case String.split(uri.path || "", "/", trim: true) do
-        [owner, repo, "actions", "runs", run_id, "artifacts"] ->
-          owner <> "/" <> repo == repository and run_id =~ ~r/^\d+$/
-
-        _ ->
-          false
-      end
+    valid_artifact_uri?(uri) and valid_artifact_path?(uri.path, repository)
   rescue
     _ -> false
   end
 
   defp artifact_url?(_, _, _), do: false
+
+  defp valid_artifact_uri?(uri) do
+    uri.scheme == "https" and uri.host == "github.com" and is_nil(uri.userinfo) and
+      is_nil(uri.query) and is_nil(uri.fragment)
+  end
+
+  defp valid_artifact_path?(path, repository) do
+    case String.split(path || "", "/", trim: true) do
+      [owner, repo, "actions", "runs", run_id, "artifacts"] ->
+        owner <> "/" <> repo == repository and run_id =~ ~r/^\d+$/
+
+      _ ->
+        false
+    end
+  end
 
   defp valid_commissioning?(nil), do: true
 

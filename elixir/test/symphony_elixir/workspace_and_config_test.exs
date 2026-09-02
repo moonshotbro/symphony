@@ -5,6 +5,10 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
   alias SymphonyElixir.Config.Schema.{Codex, StringOrMap}
   alias SymphonyElixir.Linear.Client
 
+  test "nil role-specific stall limits normalize to an empty map" do
+    assert Schema.normalize_stall_timeout_limits(nil) == %{}
+  end
+
   test "workspace bootstrap can be implemented in after_create hook" do
     test_root =
       Path.join(

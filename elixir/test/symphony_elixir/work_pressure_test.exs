@@ -62,5 +62,18 @@ defmodule SymphonyElixir.WorkPressureTest do
     assert {:error, :item_unknown_key} = WorkPressure.select([Map.put(item("a"), :prompt, "bad")], [], @limits, "graph-1")
     assert {:error, :duplicate_writer} = WorkPressure.select([], [item("a", write_domain: "same"), item("b", write_domain: "same")], @limits, "graph-1")
     assert {:error, :limits_invalid} = WorkPressure.select([], [], Map.put(@limits, :global, -1), "graph-1")
+    assert {:error, :input_invalid} = WorkPressure.select(:invalid, [], @limits, "graph-1")
+    assert {:error, :duplicate_item} = WorkPressure.select([item("a"), item("a")], [], @limits, "graph-1")
+    assert {:error, :item_invalid} = WorkPressure.select([:invalid], [], @limits, "graph-1")
+    assert {:error, :item_text_invalid} = WorkPressure.select([%{item("a") | role: ""}], [], @limits, "graph-1")
+    assert {:error, :item_text_invalid} = WorkPressure.select([%{item("a") | role: 1}], [], @limits, "graph-1")
+    assert {:error, :global_limit_invalid} = WorkPressure.select([], [], Map.put(@limits, :global, %{}), "graph-1")
+  end
+
+  test "dimension maps hold work at their configured boundary" do
+    limits = %{@limits | host: %{"host-1" => 0}, project: %{}, repository: %{}, write_domain: %{}}
+    assert {:ok, result} = WorkPressure.select([item("a", host: "host-1")], [], limits, "graph-map")
+    assert [%{reason: :dimension_held}] = result.held
+    assert result.selected == []
   end
 end

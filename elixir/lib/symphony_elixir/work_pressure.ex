@@ -50,9 +50,8 @@ defmodule SymphonyElixir.WorkPressure do
          :ok <- validate_limits(limits),
          :ok <- validate_revision(decision_revision),
          :ok <- reject_duplicate_ownership(active),
-         {:ok, target} <- target(limits),
-         active_count = length(active),
-         available = max(target - active_count, 0) do
+         {:ok, target} <- target(limits) do
+      available = max(target - length(active), 0)
       ordered = Enum.sort_by(ready, &ordering_key/1)
       {selected, held} = choose(ordered, active, available, limits)
 
@@ -81,16 +80,18 @@ defmodule SymphonyElixir.WorkPressure do
       {:error, :items_too_many}
     else
       items
-      |> Enum.reduce_while({:ok, MapSet.new()}, fn item, {:ok, seen} ->
-        case validate_item(item, seen) do
-          {:ok, next_seen} -> {:cont, {:ok, next_seen}}
-          error -> {:halt, error}
-        end
-      end)
+      |> Enum.reduce_while({:ok, MapSet.new()}, &validate_next_item/2)
       |> case do
         {:ok, _seen} -> :ok
         error -> error
       end
+    end
+  end
+
+  defp validate_next_item(item, {:ok, seen}) do
+    case validate_item(item, seen) do
+      {:ok, next_seen} -> {:cont, {:ok, next_seen}}
+      error -> {:halt, error}
     end
   end
 
@@ -106,7 +107,6 @@ defmodule SymphonyElixir.WorkPressure do
     else
       true -> {:error, :duplicate_item}
       {:error, _} = error -> error
-      _ -> {:error, :item_invalid}
     end
   end
 
@@ -168,9 +168,6 @@ defmodule SymphonyElixir.WorkPressure do
 
     Enum.reduce(ordered, {[], []}, fn item, {selected, held} ->
       cond do
-        item_identity(item) in Enum.map(selected, &item_identity/1) ->
-          {selected, held}
-
         MapSet.member?(occupied, ownership_key(item)) ->
           {selected, held ++ [%{item: item, reason: :write_domain_held}]}
 
@@ -178,11 +175,14 @@ defmodule SymphonyElixir.WorkPressure do
           {selected ++ [item], held}
 
         true ->
-          reason = if length(selected) >= available, do: :capacity_held, else: :dimension_held
+          reason = held_reason(selected, available)
           {selected, held ++ [%{item: item, reason: reason}]}
       end
     end)
   end
+
+  defp held_reason(selected, available) when length(selected) >= available, do: :capacity_held
+  defp held_reason(_selected, _available), do: :dimension_held
 
   defp ordering_key(item), do: {-Map.get(item, :priority, 0), item.issue_id, item.idempotency_key}
 
@@ -204,15 +204,15 @@ defmodule SymphonyElixir.WorkPressure do
     Map.get(value, dimension) || Map.get(value, to_string(dimension))
   end
 
-  defp limit_for(_value, _dimension), do: nil
-
   defp count_dimension(items, key, value), do: Enum.count(items, &(Map.get(&1, key) == value))
 
   defp item_identity(item), do: {item.issue_id, item.task_id, item.idempotency_key}
   defp ownership_key(item), do: {item.repository, item.write_domain}
 
   defp constructor_id(revision, ready, active, limits) do
-    payload = :erlang.term_to_binary({revision, Enum.sort_by(ready, &ordering_key/1), Enum.sort_by(active, &ordering_key/1), limits})
+    ordered_ready = Enum.sort_by(ready, &ordering_key/1)
+    ordered_active = Enum.sort_by(active, &ordering_key/1)
+    payload = :erlang.term_to_binary({revision, ordered_ready, ordered_active, limits})
     "constructor-" <> Base.encode16(:crypto.hash(:sha256, payload), case: :lower)
   end
 
