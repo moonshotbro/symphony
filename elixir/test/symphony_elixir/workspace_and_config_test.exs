@@ -1002,6 +1002,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       codex_turn_timeout_ms: nil,
       codex_read_timeout_ms: nil,
       codex_stall_timeout_ms: nil,
+      codex_stall_timeout_ms_by_role: nil,
       tracker_api_token: nil,
       tracker_project_slug: nil
     )
@@ -1041,6 +1042,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert config.codex.turn_timeout_ms == 3_600_000
     assert config.codex.read_timeout_ms == 5_000
     assert config.codex.stall_timeout_ms == 300_000
+    assert config.codex.stall_timeout_ms_by_role == %{}
 
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_required_labels: [" Symphony ", "SYMPHONY", "JavaScript"]
@@ -1112,6 +1114,25 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     write_workflow_file!(Workflow.workflow_file_path(), codex_stall_timeout_ms: "bad")
     assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
     assert message =~ "codex.stall_timeout_ms"
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      codex_stall_timeout_ms_by_role: %{
+        "Implementation Worker" => 120_000,
+        "independent review" => 0
+      }
+    )
+
+    assert Config.settings!().codex.stall_timeout_ms_by_role == %{
+             "implementation worker" => 120_000,
+             "independent review" => 0
+           }
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      codex_stall_timeout_ms_by_role: %{"implementation worker" => -1}
+    )
+
+    assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
+    assert message =~ "codex.stall_timeout_ms_by_role"
 
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_active_states: %{todo: true},
