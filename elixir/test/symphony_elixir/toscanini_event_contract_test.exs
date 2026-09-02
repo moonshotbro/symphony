@@ -406,7 +406,7 @@ defmodule SymphonyElixir.Toscanini.EventContractTest do
       | effective_route: "luna",
         attempted_routes: ["sol"],
         failure_class: "capacity",
-        response_started: false,
+        response_started: true,
         effect_uncertain: true,
         lifecycle: "abandoned",
         outcome: "failed",
@@ -420,7 +420,7 @@ defmodule SymphonyElixir.Toscanini.EventContractTest do
       base.data.recovery
       | effective_route: "held",
         failure_class: "capacity",
-        response_started: false,
+        response_started: true,
         effect_uncertain: true,
         lifecycle: "attention",
         outcome: "attention",
@@ -437,5 +437,21 @@ defmodule SymphonyElixir.Toscanini.EventContractTest do
     assert {:error, :malformed_data} = EventContract.new(put_in(base.data[:sender][:role], "Customer_Jane_Doe_medical_diagnosis"))
     bad = base |> put_in([:data, :identity, :idempotency], "Customer_Jane_Doe_medical_diagnosis") |> put_in([:data, :delivery, :idempotency_key], "Customer_Jane_Doe_medical_diagnosis")
     assert {:error, :malformed_data} = EventContract.new(bad)
+  end
+
+  test "freezes every declared terminal snapshot against progress recovery and terminal rewrites" do
+    for terminal <- ~w(cleanup_complete superseded failed cancelled complete archived dead_letter), later <- ~w(durable_progress attention failed superseded) do
+      state = %EventContract.State{current: terminal}
+      assert {:error, :terminal_state} = EventContract.transition(state, event("e1", 1, later))
+    end
+  end
+
+  test "accepts controlled structural domains and rejects disguised prose across all generated identifiers" do
+    assert {:ok, _} = EventContract.new(event("e1", 1, "task_accepted"))
+    assert {:ok, _} = EventContract.new(put_in(event("e1", 1, "task_accepted").data[:identity][:programme], "toscanini-build-51"))
+
+    for path <- [[:data, :identity, :task], [:data, :sender, :id], [:data, :identity, :idempotency], [:data, :delivery, :idempotency_key]] do
+      assert {:error, :malformed_data} = EventContract.new(put_in(event("e1", 1, "task_accepted"), path, "Customer_Jane_Doe_medical_diagnosis"))
+    end
   end
 end
