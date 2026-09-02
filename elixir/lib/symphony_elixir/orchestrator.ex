@@ -14,8 +14,8 @@ defmodule SymphonyElixir.Orchestrator do
     CoordinationAdapter,
     StatusDashboard,
     Tracker,
-    Workspace,
-    WorkPressure
+    WorkPressure,
+    Workspace
   }
 
   alias SymphonyElixir.Codex.{AppServer, CoordinationEffects, RecoveryInspector, TaskLaunchContract}
@@ -696,59 +696,78 @@ defmodule SymphonyElixir.Orchestrator do
     elapsed_ms = stall_elapsed_ms(running_entry, now)
 
     if is_integer(elapsed_ms) and elapsed_ms > timeout_ms do
-      identifier = Map.get(running_entry, :identifier, issue_id)
-      session_id = running_entry_session_id(running_entry)
-
-      if input_required_blocker?(running_entry) do
-        error = blocker_error(running_entry, "stalled for #{elapsed_ms}ms after Codex requested operator input")
-
-        Logger.warning("Issue blocked: issue_id=#{issue_id} issue_identifier=#{identifier} session_id=#{session_id} elapsed_ms=#{elapsed_ms}; #{error}")
-
-        state
-        |> record_session_completion_totals(running_entry)
-        |> stop_and_block_issue(issue_id, running_entry, error)
-      else
-        case {Map.get(running_entry, :recovery_enabled, false), Map.get(running_entry, :recovery_stage)} do
-          {false, _} ->
-            # Preserve the legacy test/integration shape for externally
-            # injected entries that predate the staged controller.
-            retry_stalled_issue(state, issue_id, running_entry, identifier, elapsed_ms)
-
-          {true, stage} when stage in [nil, :observing] ->
-            # First expiry is an observation checkpoint. Do not kill a worker
-            # before we have attempted the bounded recovery protocol.
-            inspection = stalled_worker_inspection(running_entry)
-            Logger.warning("Issue stalled; recording inspection checkpoint: issue_id=#{issue_id} issue_identifier=#{identifier} elapsed_ms=#{elapsed_ms} inspection=#{inspect(inspection)}")
-            emit_recovery_event(:inspected, issue_id, running_entry)
-
-            state.running[issue_id]
-            |> Map.merge(%{recovery_stage: :inspected, recovery_started_at: DateTime.utc_now(), inspection: inspection})
-            |> then(&%{state | running: Map.put(state.running, issue_id, &1)})
-
-          {true, :inspected} ->
-            case Map.get(running_entry, :pid) do
-              pid when is_pid(pid) ->
-                steer_stalled_worker(state, running_entry, pid, issue_id, identifier)
-
-              _ ->
-                retry_stalled_issue(state, issue_id, running_entry, identifier, elapsed_ms)
-            end
-
-          {true, :steered} when is_pid(running_entry.pid) ->
-            if Process.alive?(running_entry.pid) and not recovery_window_expired?(running_entry, now, timeout_ms) do
-              Logger.warning("Holding stalled issue until steered worker is terminal: issue_id=#{issue_id} issue_identifier=#{identifier}")
-              state
-            else
-              retry_stalled_issue(state, issue_id, running_entry, identifier, elapsed_ms)
-            end
-
-          {true, _} ->
-            retry_stalled_issue(state, issue_id, running_entry, identifier, elapsed_ms)
-        end
-      end
+      handle_stalled_issue(state, issue_id, running_entry, now, timeout_ms, elapsed_ms)
     else
       state
     end
+  end
+
+  defp handle_stalled_issue(state, issue_id, running_entry, now, timeout_ms, elapsed_ms) do
+    identifier = Map.get(running_entry, :identifier, issue_id)
+
+    if input_required_blocker?(running_entry) do
+      block_stalled_issue(state, issue_id, running_entry, identifier, elapsed_ms)
+    else
+      recover_stalled_issue(state, issue_id, running_entry, identifier, now, timeout_ms, elapsed_ms)
+    end
+  end
+
+  defp block_stalled_issue(state, issue_id, running_entry, identifier, elapsed_ms) do
+    session_id = running_entry_session_id(running_entry)
+    error = blocker_error(running_entry, "stalled for #{elapsed_ms}ms after Codex requested operator input")
+
+    Logger.warning(
+      "Issue blocked: issue_id=#{issue_id} issue_identifier=#{identifier} " <>
+        "session_id=#{session_id} elapsed_ms=#{elapsed_ms}; #{error}"
+    )
+
+    state
+    |> record_session_completion_totals(running_entry)
+    |> stop_and_block_issue(issue_id, running_entry, error)
+  end
+
+  defp recover_stalled_issue(state, issue_id, running_entry, identifier, now, timeout_ms, elapsed_ms) do
+    recovery = {Map.get(running_entry, :recovery_enabled, false), Map.get(running_entry, :recovery_stage)}
+    apply_stall_recovery(recovery, state, issue_id, running_entry, identifier, now, timeout_ms, elapsed_ms)
+  end
+
+  defp apply_stall_recovery({false, _}, state, issue_id, entry, identifier, _now, _timeout, elapsed_ms) do
+    retry_stalled_issue(state, issue_id, entry, identifier, elapsed_ms)
+  end
+
+  defp apply_stall_recovery({true, stage}, state, issue_id, entry, identifier, _now, _timeout, _elapsed)
+       when stage in [nil, :observing] do
+    inspection = stalled_worker_inspection(entry)
+
+    Logger.warning(
+      "Issue stalled; recording inspection checkpoint: issue_id=#{issue_id} " <>
+        "issue_identifier=#{identifier} inspection=#{inspect(inspection)}"
+    )
+
+    emit_recovery_event(:inspected, issue_id, entry)
+    updated = Map.merge(entry, %{recovery_stage: :inspected, recovery_started_at: DateTime.utc_now(), inspection: inspection})
+    %{state | running: Map.put(state.running, issue_id, updated)}
+  end
+
+  defp apply_stall_recovery({true, :inspected}, state, issue_id, entry, identifier, _now, _timeout, elapsed_ms) do
+    case Map.get(entry, :pid) do
+      pid when is_pid(pid) -> steer_stalled_worker(state, entry, pid, issue_id, identifier)
+      _ -> retry_stalled_issue(state, issue_id, entry, identifier, elapsed_ms)
+    end
+  end
+
+  defp apply_stall_recovery({true, :steered}, state, issue_id, entry, identifier, now, timeout_ms, elapsed_ms)
+       when is_pid(entry.pid) do
+    if Process.alive?(entry.pid) and not recovery_window_expired?(entry, now, timeout_ms) do
+      Logger.warning("Holding stalled issue until steered worker is terminal: issue_id=#{issue_id}")
+      state
+    else
+      retry_stalled_issue(state, issue_id, entry, identifier, elapsed_ms)
+    end
+  end
+
+  defp apply_stall_recovery({true, _}, state, issue_id, entry, identifier, _now, _timeout, elapsed_ms) do
+    retry_stalled_issue(state, issue_id, entry, identifier, elapsed_ms)
   end
 
   defp steer_stalled_worker(state, _running_entry, pid, issue_id, identifier) do
@@ -982,7 +1001,11 @@ defmodule SymphonyElixir.Orchestrator do
     issues
     |> sort_issues_for_dispatch()
     |> Enum.reduce(state, fn issue, state_acc ->
-      if should_dispatch_issue?(issue, state_acc, active_states, terminal_states), do: dispatch_issue(state_acc, issue), else: state_acc
+      if should_dispatch_issue?(issue, state_acc, active_states, terminal_states) do
+        dispatch_issue(state_acc, issue)
+      else
+        state_acc
+      end
     end)
   end
 
@@ -1013,11 +1036,7 @@ defmodule SymphonyElixir.Orchestrator do
             state = %{state | work_pressure: result}
             selected_ids = MapSet.new(result.selected, & &1.issue_id)
 
-            Enum.reduce(ready, state, fn issue, state_acc ->
-              if MapSet.member?(selected_ids, issue.id) and should_dispatch_issue?(issue, state_acc, active_states, terminal_states),
-                do: dispatch_issue(state_acc, issue),
-                else: state_acc
-            end)
+            dispatch_selected(ready, state, selected_ids, active_states, terminal_states)
 
           {:error, state} ->
             %{state | work_pressure: %{error: :constructor_not_durable, decision_revision: decision_revision}}
@@ -1027,6 +1046,14 @@ defmodule SymphonyElixir.Orchestrator do
         Logger.error("Work pressure selection failed: #{inspect(reason)}")
         %{state | work_pressure: %{error: reason, decision_revision: decision_revision}}
     end
+  end
+
+  defp dispatch_selected(ready, state, selected_ids, active_states, terminal_states) do
+    Enum.reduce(ready, state, fn issue, state_acc ->
+      selected? = MapSet.member?(selected_ids, issue.id)
+      dispatchable? = should_dispatch_issue?(issue, state_acc, active_states, terminal_states)
+      if selected? and dispatchable?, do: dispatch_issue(state_acc, issue), else: state_acc
+    end)
   end
 
   defp work_pressure_item_from_issue(%Issue{} = issue, project_id) do
@@ -1101,34 +1128,25 @@ defmodule SymphonyElixir.Orchestrator do
       policy_fingerprint: ActionLedger.policy_fingerprint("symphony.work-pressure.v1")
     }
 
-    case ActionLedger.plan(state.action_ledger, intent) do
-      {:ok, action, disposition} ->
-        case action.state do
-          :planned ->
-            case ActionLedger.transition(state.action_ledger, action.id, :dispatched, %{"disposition" => "selected"}) do
-              {:ok, _} ->
-                case ActionLedger.transition(state.action_ledger, action.id, :succeeded, %{"disposition" => "selected"}) do
-                  {:ok, _} ->
-                    if disposition == :new, do: emit_work_pressure_decision(result)
-                    {:ok, state}
-
-                  {:error, reason} ->
-                    Logger.warning("Unable to settle work pressure constructor: #{inspect(reason)}")
-                    {:error, state}
-                end
-
-              {:error, reason} ->
-                Logger.warning("Unable to settle work pressure constructor: #{inspect(reason)}")
-                {:error, state}
-            end
-
-          _ ->
-            {:ok, state}
-        end
-
+    with {:ok, action, disposition} <- ActionLedger.plan(state.action_ledger, intent),
+         :ok <- settle_work_pressure_action(state.action_ledger, action) do
+      if action.state == :planned and disposition == :new, do: emit_work_pressure_decision(result)
+      {:ok, state}
+    else
       {:error, reason} ->
         Logger.warning("Unable to record work pressure constructor: #{inspect(reason)}")
         {:error, state}
+    end
+  end
+
+  defp settle_work_pressure_action(_ledger, %{state: state}) when state != :planned, do: :ok
+
+  defp settle_work_pressure_action(ledger, action) do
+    effect = %{"disposition" => "selected"}
+
+    with {:ok, _} <- ActionLedger.transition(ledger, action.id, :dispatched, effect),
+         {:ok, _} <- ActionLedger.transition(ledger, action.id, :succeeded, effect) do
+      :ok
     end
   end
 
@@ -1958,6 +1976,21 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  def handle_call(:request_refresh, _from, state) do
+    now_ms = System.monotonic_time(:millisecond)
+    already_due? = is_integer(state.next_poll_due_at_ms) and state.next_poll_due_at_ms <= now_ms
+    coalesced = state.poll_check_in_progress == true or already_due?
+    state = if coalesced, do: state, else: schedule_tick(state, 0)
+
+    {:reply,
+     %{
+       queued: true,
+       coalesced: coalesced,
+       requested_at: DateTime.utc_now(),
+       operations: ["poll", "reconcile"]
+     }, state}
+  end
+
   def handle_call(:snapshot, _from, state) do
     state = refresh_runtime_config(state)
     now = DateTime.utc_now()
@@ -2064,21 +2097,6 @@ defmodule SymphonyElixir.Orchestrator do
     do: %{error: reason, decision_revision: revision}
 
   defp work_pressure_snapshot(_), do: nil
-
-  def handle_call(:request_refresh, _from, state) do
-    now_ms = System.monotonic_time(:millisecond)
-    already_due? = is_integer(state.next_poll_due_at_ms) and state.next_poll_due_at_ms <= now_ms
-    coalesced = state.poll_check_in_progress == true or already_due?
-    state = if coalesced, do: state, else: schedule_tick(state, 0)
-
-    {:reply,
-     %{
-       queued: true,
-       coalesced: coalesced,
-       requested_at: DateTime.utc_now(),
-       operations: ["poll", "reconcile"]
-     }, state}
-  end
 
   defp find_goal_action(state, action_id_or_issue_id) do
     case Enum.find(state.blocked, fn {issue_id, metadata} ->

@@ -32,6 +32,7 @@ defmodule SymphonyElixir.Toscanini.LifecycleLedger do
   end
 
   @doc "Alias with an explicit delivery-oriented name for command callers."
+  @spec dispatch_command(GenServer.server(), term(), (-> term()), keyword()) :: result()
   def dispatch_command(ledger, envelope, effect_fun, opts \\ []),
     do: command(ledger, envelope, effect_fun, opts)
 
@@ -64,6 +65,7 @@ defmodule SymphonyElixir.Toscanini.LifecycleLedger do
   end
 
   @doc "Alias with an explicit persistence-oriented name for event callers."
+  @spec record_event(GenServer.server(), term()) :: result()
   def record_event(ledger, envelope), do: event(ledger, envelope)
 
   @spec replay([term()], EventContract.state()) :: EventContract.result(EventContract.state())

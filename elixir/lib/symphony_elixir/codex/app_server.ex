@@ -864,6 +864,8 @@ defmodule SymphonyElixir.Codex.AppServer do
     )
   end
 
+  # The protocol loop keeps transport state explicit so recursive transitions cannot lose a field.
+  # credo:disable-for-next-line Credo.Check.Refactor.FunctionArity
   defp receive_loop(port, thread_id, turn_id, owner, on_message, timeout_ms, pending_line, tool_executor, auto_approve_requests, steer_used) do
     receive do
       {:symphony_steer, caller, ref, input} when is_pid(caller) and is_reference(ref) ->
@@ -875,11 +877,35 @@ defmodule SymphonyElixir.Codex.AppServer do
           end
 
         send(caller, {:symphony_steer_result, ref, result})
-        receive_loop(port, thread_id, turn_id, owner, on_message, timeout_ms, pending_line, tool_executor, auto_approve_requests, true)
+
+        receive_loop(
+          port,
+          thread_id,
+          turn_id,
+          owner,
+          on_message,
+          timeout_ms,
+          pending_line,
+          tool_executor,
+          auto_approve_requests,
+          true
+        )
 
       {^port, {:data, {:eol, chunk}}} ->
         complete_line = pending_line <> to_string(chunk)
-        handle_incoming(port, thread_id, turn_id, owner, on_message, complete_line, timeout_ms, tool_executor, auto_approve_requests, steer_used)
+
+        handle_incoming(
+          port,
+          thread_id,
+          turn_id,
+          owner,
+          on_message,
+          complete_line,
+          timeout_ms,
+          tool_executor,
+          auto_approve_requests,
+          steer_used
+        )
 
       {^port, {:data, {:noeol, chunk}}} ->
         receive_loop(
@@ -903,6 +929,7 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
+  # credo:disable-for-next-line Credo.Check.Refactor.FunctionArity
   defp handle_incoming(port, thread_id, turn_id, owner, on_message, data, timeout_ms, tool_executor, auto_approve_requests, steer_used) do
     payload_string = to_string(data)
 
@@ -963,7 +990,18 @@ defmodule SymphonyElixir.Codex.AppServer do
           metadata_from_message(port, payload)
         )
 
-        receive_loop(port, thread_id, turn_id, owner, on_message, timeout_ms, "", tool_executor, auto_approve_requests, steer_used)
+        receive_loop(
+          port,
+          thread_id,
+          turn_id,
+          owner,
+          on_message,
+          timeout_ms,
+          "",
+          tool_executor,
+          auto_approve_requests,
+          steer_used
+        )
 
       {:error, _reason} ->
         log_non_json_stream_line(payload_string, "turn stream")
@@ -980,7 +1018,18 @@ defmodule SymphonyElixir.Codex.AppServer do
           )
         end
 
-        receive_loop(port, thread_id, turn_id, owner, on_message, timeout_ms, "", tool_executor, auto_approve_requests, steer_used)
+        receive_loop(
+          port,
+          thread_id,
+          turn_id,
+          owner,
+          on_message,
+          timeout_ms,
+          "",
+          tool_executor,
+          auto_approve_requests,
+          steer_used
+        )
     end
   end
 
@@ -997,6 +1046,7 @@ defmodule SymphonyElixir.Codex.AppServer do
     )
   end
 
+  # credo:disable-for-next-line Credo.Check.Refactor.FunctionArity
   defp handle_turn_method(
          port,
          thread_id,
@@ -1034,7 +1084,18 @@ defmodule SymphonyElixir.Codex.AppServer do
         {:error, {:turn_input_required, payload}}
 
       :approved ->
-        receive_loop(port, thread_id, turn_id, owner, on_message, timeout_ms, "", tool_executor, auto_approve_requests, steer_used)
+        receive_loop(
+          port,
+          thread_id,
+          turn_id,
+          owner,
+          on_message,
+          timeout_ms,
+          "",
+          tool_executor,
+          auto_approve_requests,
+          steer_used
+        )
 
       :approval_required ->
         emit_message(
@@ -1068,7 +1129,19 @@ defmodule SymphonyElixir.Codex.AppServer do
           )
 
           Logger.debug("Codex notification: #{inspect(method)}")
-          receive_loop(port, thread_id, turn_id, owner, on_message, timeout_ms, "", tool_executor, auto_approve_requests, steer_used)
+
+          receive_loop(
+            port,
+            thread_id,
+            turn_id,
+            owner,
+            on_message,
+            timeout_ms,
+            "",
+            tool_executor,
+            auto_approve_requests,
+            steer_used
+          )
         end
     end
   end
