@@ -1682,6 +1682,10 @@ defmodule SymphonyElixir.AppServerTest do
     assert_instruction_sources_hold(",\"instructionSources\":[]")
   end
 
+  test "persisted thread ID mismatch retains the created ID without starting a turn" do
+    assert_read_id_mismatch_hold()
+  end
+
   test "app server launches over ssh for remote workers" do
     test_root =
       Path.join(
@@ -1953,6 +1957,50 @@ defmodule SymphonyElixir.AppServerTest do
       assert {:error, {:project_bound_thread_unverified, ^expected}} = AppServer.run(workspace, "bound", issue, task_contract: contract)
 
       assert File.read!(trace) |> String.split("\n", trim: true) |> length() == 3
+    after
+      File.rm_rf(root)
+    end
+  end
+
+  defp assert_read_id_mismatch_hold do
+    root = Path.join(System.tmp_dir!(), "symphony-read-id-hold-#{System.unique_integer([:positive])}")
+    workspace = Path.join(root, "workspaces/SYS-50")
+    binary = Path.join(root, "fake-codex")
+    trace = Path.join(root, "trace")
+    File.mkdir_p!(workspace)
+
+    try do
+      File.write!(binary, """
+      #!/bin/sh
+      count=0
+      while IFS= read -r line; do
+        count=$((count + 1)); printf '%s\\n' "$line" >> #{trace}
+        case "$count" in
+          1) printf '%s\\n' '{"id":1,"result":{}}' ;;
+          2) ;;
+          3) printf '%s\\n' '{"id":2,"result":{"model":"gpt-5.6-terra","reasoningEffort":"medium","instructionSources":["project"],"thread":{"id":"created-A","sessionId":"session-A","projectId":"01a04aab-c77c-79b0-ab09-65187353bb4b","cwd":"WORKSPACE","ephemeral":false}}}' | sed "s|WORKSPACE|$PWD|" ;;
+          4) printf '%s\\n' '{"id":6,"result":{}}' ;;
+          5) printf '%s\\n' '{"id":4,"result":{"thread":{"id":"persisted-B","sessionId":"session-A","projectId":"01a04aab-c77c-79b0-ab09-65187353bb4b","cwd":"WORKSPACE","name":"Implementation SYS-50: bound","ephemeral":false}}}' | sed "s|WORKSPACE|$PWD|" ;;
+          6) printf '%s\\n' '{"id":5,"result":{"data":[]}}' ;;
+          *) exit 29 ;;
+        esac
+      done
+      """)
+
+      File.chmod!(binary, 0o755)
+      write_workflow_file!(Workflow.workflow_file_path(), workspace_root: Path.join(root, "workspaces"), codex_command: "#{binary} app-server")
+
+      contract = %SymphonyElixir.Codex.TaskLaunchContract{
+        title: "Implementation SYS-50: bound",
+        executing_identity: %{model: :"gpt-5.6-terra", effort: :medium, role: :implementation, title: "Implementation SYS-50: bound"},
+        project: %{native_project_id: "01a04aab-c77c-79b0-ab09-65187353bb4b"}
+      }
+
+      issue = %Issue{id: "sys-50", identifier: "SYS-50", title: "bound", state: "In Progress"}
+      expected = %{thread_id: "created-A", verification_reason: :thread_read_id_mismatch}
+      assert {:error, {:project_bound_thread_unverified, ^expected}} = AppServer.run(workspace, "bound", issue, task_contract: contract)
+      refute File.read!(trace) =~ "turn/start"
+      assert File.read!(trace) |> String.split("\n", trim: true) |> length() == 6
     after
       File.rm_rf(root)
     end
