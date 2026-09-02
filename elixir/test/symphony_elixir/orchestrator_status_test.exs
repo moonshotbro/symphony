@@ -988,7 +988,22 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert Orchestrator.stall_elapsed_ms_for_test(updated, ~U[2026-01-01 00:01:00Z]) == 60_000
   end
 
-  test "durable Codex events advance the progress clock" do
+  test "completed turns advance the durable progress clock" do
+    started_at = ~U[2026-01-01 00:00:00Z]
+    entry = %{started_at: started_at, last_durable_progress_at: started_at, session_id: nil}
+
+    {updated, _tokens} =
+      Orchestrator.integrate_codex_update_for_test(entry, %{
+        event: :turn_completed,
+        timestamp: ~U[2026-01-01 00:00:30Z],
+        message: %{method: "tool/complete"}
+      })
+
+    assert updated.last_durable_progress_at == ~U[2026-01-01 00:00:30Z]
+    assert Orchestrator.stall_elapsed_ms_for_test(updated, ~U[2026-01-01 00:01:00Z]) == 30_000
+  end
+
+  test "tool completion alone does not advance the durable progress clock" do
     started_at = ~U[2026-01-01 00:00:00Z]
     entry = %{started_at: started_at, last_durable_progress_at: started_at, session_id: nil}
 
@@ -999,8 +1014,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
         message: %{method: "tool/complete"}
       })
 
-    assert updated.last_durable_progress_at == ~U[2026-01-01 00:00:30Z]
-    assert Orchestrator.stall_elapsed_ms_for_test(updated, ~U[2026-01-01 00:01:00Z]) == 30_000
+    assert updated.last_durable_progress_at == started_at
   end
 
   test "stall timeout uses the normalized task role budget" do

@@ -160,7 +160,7 @@ defmodule SymphonyElixir.AgentRunner do
     max_turns = Keyword.get(opts, :max_turns, Config.settings!().agent.max_turns)
     issue_state_fetcher = Keyword.get(opts, :issue_state_fetcher, &Tracker.fetch_issues_by_ids/1)
 
-    with {:ok, contract} <- TaskLaunchContract.from_runtime(issue, workspace, opts),
+    with {:ok, contract} <- launch_contract(issue, workspace, opts),
          {:ok, session} <-
            AppServer.start_session(workspace, worker_host: worker_host, task_contract: contract) do
       try do
@@ -168,6 +168,14 @@ defmodule SymphonyElixir.AgentRunner do
       after
         AppServer.stop_session(session)
       end
+    end
+  end
+
+  defp launch_contract(issue, workspace, opts) do
+    case Keyword.fetch(opts, :task_contract) do
+      {:ok, nil} -> {:ok, nil}
+      {:ok, contract} -> TaskLaunchContract.verify(contract)
+      :error -> TaskLaunchContract.from_runtime(issue, workspace, opts)
     end
   end
 

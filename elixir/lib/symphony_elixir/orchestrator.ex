@@ -28,7 +28,7 @@ defmodule SymphonyElixir.Orchestrator do
   @poll_transition_render_delay_ms 20
   # Provider notifications and polling chatter are diagnostic activity, not
   # proof that the worker has made durable progress.
-  @durable_progress_events [:turn_started, :turn_completed, :tool_call_completed, :task_completed]
+  @durable_progress_events [:turn_completed, :task_completed]
   @empty_codex_totals %{
     input_tokens: 0,
     output_tokens: 0,
@@ -1033,7 +1033,7 @@ defmodule SymphonyElixir.Orchestrator do
       project_id: project_id,
       repository: issue_repository(issue),
       write_domain: issue.branch_name || issue.identifier,
-      role: "implementation",
+      role: "implementation worker",
       authority_revision: issue_checkpoint(issue),
       idempotency_key: "dispatch-#{issue.id}-#{issue_checkpoint(issue)}",
       priority: 6 - priority_rank(issue.priority)
@@ -1069,9 +1069,9 @@ defmodule SymphonyElixir.Orchestrator do
     %{
       global: config.agent.max_concurrent_agents,
       host: if(is_integer(host_limit) and host_limit > 0, do: host_limit, else: %{}),
-      project: %{},
-      repository: %{},
-      write_domain: %{}
+      project: config.agent.max_concurrent_agents,
+      repository: config.agent.max_concurrent_agents,
+      write_domain: 1
     }
   end
 
@@ -1430,6 +1430,7 @@ defmodule SymphonyElixir.Orchestrator do
       last_durable_progress_at: DateTime.utc_now(),
       recovery_stage: :observing,
       recovery_enabled: true,
+      role: "implementation worker",
       codex_app_server_pid: nil,
       codex_input_tokens: 0,
       codex_output_tokens: 0,
