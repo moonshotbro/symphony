@@ -59,6 +59,7 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
           role: role(),
           issue_or_pr: String.t(),
           exact_revision: String.t(),
+          risk_assurance: map() | nil,
           attempt: non_neg_integer(),
           fence: String.t(),
           project: saved_project_binding(),
@@ -100,6 +101,7 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
           attempt: non_neg_integer(),
           fence: String.t(),
           exact_revision: String.t(),
+          risk_assurance: map() | nil,
           write_boundary: atom(),
           evidence: [String.t()],
           model: atom(),
@@ -132,6 +134,7 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
     :attempt,
     :fence,
     :exact_revision,
+    :risk_assurance,
     :write_boundary,
     :evidence,
     :model,
@@ -184,6 +187,7 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
         :attempt,
         :fence,
         :exact_revision,
+        :risk_assurance,
         :write_boundary,
         :evidence,
         :model,
@@ -340,6 +344,7 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
          attempt: values["attempt"],
          fence: values["fence"],
          exact_revision: values["exact_revision"],
+         risk_assurance: values["risk_assurance"],
          write_boundary: values["write_boundary"],
          evidence: values["evidence"],
          model: values["model"],
@@ -401,6 +406,7 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
         |> Map.put("commissioning_identity", normalize_commissioning(attrs["commissioning_identity"]))
         |> Map.put("escalation", normalize_escalation(attrs["escalation"]))
         |> Map.put("supersedes", normalize_supersession(attrs["supersedes"]))
+        |> Map.put("risk_assurance", normalize_risk_assurance(attrs["risk_assurance"]))
 
       role = normalize_atom(attrs["role"])
       trigger = normalize_atom(attrs["trigger"] || "bounded")
@@ -422,6 +428,7 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
              "goal_policy" => goal,
              "write_boundary" => boundary,
              "attempt" => attempt,
+             "risk_assurance" => attrs["risk_assurance"],
              "evidence" => normalize_evidence(attrs["evidence"]),
              "dependencies" => attrs["dependencies"],
              "permissions" => attrs["permissions"],
@@ -455,6 +462,7 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
     |> add_unless(boundary in @write_domains, {:unsupported_write_boundary, boundary})
     |> add_unless(is_integer(attempt) and attempt >= 0, :invalid_attempt)
     |> add_unless(is_binary(attrs["exact_revision"]) and Regex.match?(~r/^[0-9a-f]{40}$/, attrs["exact_revision"]), :invalid_exact_revision)
+    |> add_unless(valid_risk_assurance?(attrs["risk_assurance"], attrs["repository"], attrs["exact_revision"], role), :invalid_risk_assurance)
     |> add_unless(string_list?(attrs["dependencies"]), :invalid_dependencies)
     |> add_unless(string_list?(attrs["permissions"]), :invalid_permissions)
     |> add_unless(string_list?(attrs["evidence_gates"]), :invalid_evidence_gates)
@@ -557,6 +565,7 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
           values["role"],
           values["task"],
           values["exact_revision"],
+          values["risk_assurance"],
           values["attempt"],
           values["write_boundary"],
           values["fence"],
@@ -633,7 +642,7 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
     length(keys) != length(Enum.uniq(normalized)) or
       Enum.any?(
         normalized,
-        &(&1 not in ~w(programme repository issue_or_pr role task attempt fence execution_fence exact_revision write_boundary evidence model effort trigger goal_policy dependencies permissions evidence_gates stall_policy closeout_policy idempotency_identity conflict_identity commissioning_identity escalation supersedes project registry_id registry_version primary_role domain_alias authority_revision canonical_digest work_character permission_envelope execution_principal reviewer_principal integrator_principal candidate_id verdict_candidate_id verdict_attempt verdict_exact_revision verdict_fence accepted_verdict receipt_identity receipt_fence handoff))
+        &(&1 not in ~w(programme repository issue_or_pr role task attempt fence execution_fence exact_revision risk_assurance write_boundary evidence model effort trigger goal_policy dependencies permissions evidence_gates stall_policy closeout_policy idempotency_identity conflict_identity commissioning_identity escalation supersedes project registry_id registry_version primary_role domain_alias authority_revision canonical_digest work_character permission_envelope execution_principal reviewer_principal integrator_principal candidate_id verdict_candidate_id verdict_attempt verdict_exact_revision verdict_fence accepted_verdict receipt_identity receipt_fence handoff))
       )
   end
 
@@ -673,6 +682,44 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
   defp normalize_supersession(nil), do: nil
   defp normalize_supersession(value) when is_map(value), do: stringify_keys(value)
   defp normalize_supersession(_), do: :invalid
+  defp normalize_risk_assurance(nil), do: nil
+  defp normalize_risk_assurance(value) when is_map(value), do: stringify_keys(value)
+  defp normalize_risk_assurance(_), do: :invalid
+
+  defp valid_risk_assurance?(nil, _repository, _head, role), do: role not in [:independent_review, :landing]
+
+  defp valid_risk_assurance?(projection, repository, head, role) when is_map(projection) and role in [:independent_review, :landing] do
+    Map.keys(projection) |> Enum.sort() ==
+      ~w(artifact_url assurance_outcome assurance_receipt_digest evidence_manifest_digest head_sha matrix_revision repository required_gates risk_receipt_digest schema stage) and
+      projection["schema"] == "sysmiq.symphony.risk-assurance.v1" and projection["repository"] == repository and
+      projection["head_sha"] == head and receipt_digest?(projection["risk_receipt_digest"]) and receipt_digest?(projection["assurance_receipt_digest"]) and
+      receipt_digest?(projection["evidence_manifest_digest"]) and nonblank_string?(projection["matrix_revision"]) and valid_required_gates?(projection["required_gates"]) and
+      artifact_url?(projection["artifact_url"], repository, head) and valid_risk_assurance_stage?(projection, role)
+  end
+
+  defp valid_risk_assurance?(_, _, _, _), do: false
+  defp valid_risk_assurance_stage?(%{"stage" => "review", "assurance_outcome" => "unresolved"}, :independent_review), do: true
+  defp valid_risk_assurance_stage?(%{"stage" => "landing", "assurance_outcome" => "pass"}, :landing), do: true
+  defp valid_risk_assurance_stage?(_, _), do: false
+  defp receipt_digest?(value), do: is_binary(value) and Regex.match?(~r/^[0-9a-f]{64}$/, value)
+  defp valid_required_gates?(value), do: is_list(value) and value != [] and length(value) <= 32 and Enum.all?(value, &(is_binary(&1) and Regex.match?(~r/^[A-Za-z][A-Za-z0-9_.:-]{0,127}$/, &1)))
+
+  defp artifact_url?(url, repository, _head) when is_binary(url) do
+    uri = URI.parse(url)
+
+    uri.scheme == "https" and uri.host == "github.com" and is_nil(uri.userinfo) and is_nil(uri.query) and is_nil(uri.fragment) and
+      case String.split(uri.path || "", "/", trim: true) do
+        [owner, repo, "actions", "runs", run_id, "artifacts", artifact_id] ->
+          owner <> "/" <> repo == repository and run_id =~ ~r/^\d+$/ and artifact_id =~ ~r/^\d+$/
+
+        _ ->
+          false
+      end
+  rescue
+    _ -> false
+  end
+
+  defp artifact_url?(_, _, _), do: false
 
   defp valid_commissioning?(nil), do: true
 
@@ -800,6 +847,7 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
          attempt: attempt,
          fence: "#{identifier}:#{attempt}:#{revision}",
          exact_revision: revision,
+         risk_assurance: Keyword.get(opts, :risk_assurance),
          write_boundary: :product,
          evidence: ["change_record", "test_or_quality_evidence"],
          model: model,
