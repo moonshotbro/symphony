@@ -71,6 +71,19 @@ defmodule SymphonyElixir.Toscanini.EventContractTest do
     assert {:error, :unsupported_message_type} = EventContract.new(suffix)
   end
 
+  test "rejects conflicting atom and string field aliases at every contract boundary" do
+    base = event("e1", 1, "accepted")
+
+    assert {:error, :conflicting_field_alias} = EventContract.new(Map.put(base, "id", "other"))
+    assert {:error, :conflicting_field_alias} = EventContract.new(put_in(base.data["kind"], "command"))
+
+    assert {:error, :conflicting_field_alias} =
+             EventContract.new(put_in(base.data[:authority_ref]["repository"], "other/repo"))
+
+    assert {:error, :conflicting_field_alias} =
+             EventContract.new(put_in(base.data[:evidence]["refs"], []))
+  end
+
   test "does not create atoms for attacker-controlled keys" do
     key = "attacker_#{System.unique_integer([:positive])}"
     assert {:error, :unknown_field} = EventContract.new(put_in(event("e1", 1, "accepted").data[key], true))
@@ -118,5 +131,16 @@ defmodule SymphonyElixir.Toscanini.EventContractTest do
     assert {:error, :unknown_field} = EventContract.new(%{event("e1", 1, "accepted") | data: %{bad: fn -> :ok end}})
     assert {:error, :malformed_state} = EventContract.transition(%{}, envelope)
     assert {:error, :malformed_replay} = EventContract.replay([envelope | :tail])
+  end
+
+  test "rejects oversized input at the list limit before processing another element" do
+    evidence_ref = %{url: "https://github.com/moonshotbro/symphony/issues/51", kind: "issue"}
+    oversized_evidence = List.duplicate(evidence_ref, 33)
+
+    assert {:error, :malformed_data} =
+             EventContract.new(put_in(event("e1", 1, "accepted").data[:evidence][:refs], oversized_evidence))
+
+    replay = Enum.map(1..32, &event("e#{&1}", &1, "cancelled")) ++ [self()]
+    assert {:error, :malformed_replay} = EventContract.replay(replay, %EventContract.State{current: "running"})
   end
 end

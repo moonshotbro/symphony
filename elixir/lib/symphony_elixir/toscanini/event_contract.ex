@@ -85,20 +85,21 @@ defmodule SymphonyElixir.Toscanini.EventContract do
 
   defp transition_value(_, _), do: {:error, :malformed_state}
 
-  defp replay_value(values, %State{} = state) when is_list(values), do: replay_events(values, state)
+  defp replay_value(values, %State{} = state) when is_list(values), do: replay_events(values, state, @limits.list)
 
   defp replay_value(_, _), do: {:error, :malformed_replay}
 
-  defp replay_events([], state), do: {:ok, state}
+  defp replay_events([], state, _remaining), do: {:ok, state}
 
-  defp replay_events([value | tail], state) when is_list(tail) do
+  defp replay_events([value | tail], state, remaining) when remaining > 0 do
     case transition_value(state, value) do
-      {:ok, next} -> replay_events(tail, next)
+      {:ok, next} -> replay_events(tail, next, remaining - 1)
       error -> error
     end
   end
 
-  defp replay_events(_, _), do: {:error, :malformed_replay}
+  defp replay_events([_ | _], _state, 0), do: {:error, :malformed_replay}
+  defp replay_events(_, _, _), do: {:error, :malformed_replay}
 
   defp normalize(attrs) do
     with :ok <- keys(attrs, @top), {:ok, data} <- map(attrs[:data] || attrs["data"] || %{}) do
@@ -114,44 +115,78 @@ defmodule SymphonyElixir.Toscanini.EventContract do
   end
 
   defp map(value) when is_map(value) and map_size(value) <= @limits.entries do
-    Enum.reduce_while(value, {:ok, %{}}, fn {key, child}, {:ok, acc} ->
+    Enum.reduce_while(value, {:ok, %{}, MapSet.new()}, fn {key, child}, {:ok, acc, seen} ->
       with {:ok, atom} <- key(key),
+           false <- MapSet.member?(seen, atom),
            {:ok, normalized} <- value(child),
-           do: {:cont, {:ok, Map.put(acc, atom, normalized)}},
+           do: {:cont, {:ok, Map.put(acc, atom, normalized), MapSet.put(seen, atom)}},
            else: (
              :error -> {:halt, {:error, :unknown_field}}
+             true -> {:halt, {:error, :conflicting_field_alias}}
              error -> {:halt, error}
            )
     end)
+    |> case do
+      {:ok, normalized, _seen} -> {:ok, normalized}
+      error -> error
+    end
   end
 
   defp map(_), do: {:error, :malformed_data}
   defp value(value) when is_map(value), do: map(value)
 
-  defp value(value) when is_list(value), do: normalize_list(value, [])
+  defp value(value) when is_list(value), do: normalize_list(value, [], @limits.list)
 
   defp value(value) when is_binary(value) or is_integer(value) or is_float(value) or is_boolean(value) or is_nil(value), do: {:ok, value}
 
   defp value(_), do: {:error, :malformed_data}
 
-  defp normalize_list([], acc), do: {:ok, Enum.reverse(acc)}
+  defp normalize_list([], acc, _remaining), do: {:ok, Enum.reverse(acc)}
 
-  defp normalize_list([item | tail], acc) when is_list(tail) do
+  defp normalize_list([item | tail], acc, remaining) when remaining > 0 do
     case value(item) do
-      {:ok, normalized} -> normalize_list(tail, [normalized | acc])
+      {:ok, normalized} -> normalize_list(tail, [normalized | acc], remaining - 1)
       error -> error
     end
   end
 
-  defp normalize_list(_, _), do: {:error, :malformed_data}
+  defp normalize_list([_ | _], _acc, 0), do: {:error, :malformed_data}
+  defp normalize_list(_, _, _), do: {:error, :malformed_data}
   defp key(value) when is_atom(value), do: if(value in @keys, do: {:ok, value}, else: :error)
   defp key(value) when is_binary(value), do: Enum.find_value(@keys, :error, fn atom -> if value == Atom.to_string(atom), do: {:ok, atom} end)
   defp key(_), do: :error
 
-  defp keys(map, allowed) when is_map(map),
-    do: if(Enum.all?(Map.keys(map), fn k -> (is_atom(k) and Atom.to_string(k) in allowed) or (is_binary(k) and k in allowed) end), do: :ok, else: {:error, :unknown_field})
+  defp keys(map, allowed) when is_map(map) and map_size(map) <= @limits.entries do
+    Enum.reduce_while(map, MapSet.new(), fn {key, _value}, seen ->
+      case key(key) do
+        {:ok, atom} ->
+          if Atom.to_string(atom) in allowed do
+            if MapSet.member?(seen, atom), do: {:halt, {:error, :conflicting_field_alias}}, else: {:cont, MapSet.put(seen, atom)}
+          else
+            {:halt, {:error, :unknown_field}}
+          end
 
-  defp fetch(map, key, aliases), do: Enum.find_value([key, Atom.to_string(key) | aliases], fn candidate -> Map.get(map, candidate) end)
+        _ ->
+          {:halt, {:error, :unknown_field}}
+      end
+    end)
+    |> case do
+      %MapSet{} -> :ok
+      error -> error
+    end
+  end
+
+  defp keys(_, _), do: {:error, :unknown_field}
+
+  defp fetch(map, key, aliases) do
+    Enum.reduce_while([key, Atom.to_string(key) | aliases], nil, fn candidate, _acc ->
+      case Map.fetch(map, candidate) do
+        {:ok, value} -> {:halt, value}
+        :error -> {:cont, nil}
+      end
+    end)
+  end
+
   defp ensure(%__MODULE__{} = e), do: {:ok, e}
   defp ensure(map) when is_map(map), do: new_value(map)
   defp ensure(_), do: {:error, :malformed_envelope}
