@@ -972,6 +972,44 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert remaining_ms <= 10_500
   end
 
+  test "diagnostic Codex chatter does not reset the durable progress clock" do
+    started_at = ~U[2026-01-01 00:00:00Z]
+    entry = %{started_at: started_at, last_durable_progress_at: started_at, session_id: nil}
+
+    {updated, _tokens} =
+      Orchestrator.integrate_codex_update_for_test(entry, %{
+        event: :notification,
+        timestamp: ~U[2026-01-01 00:00:30Z],
+        message: %{method: "tools/list"}
+      })
+
+    assert updated.last_codex_timestamp == ~U[2026-01-01 00:00:30Z]
+    assert updated.last_durable_progress_at == started_at
+    assert Orchestrator.stall_elapsed_ms_for_test(updated, ~U[2026-01-01 00:01:00Z]) == 60_000
+  end
+
+  test "durable Codex events advance the progress clock" do
+    started_at = ~U[2026-01-01 00:00:00Z]
+    entry = %{started_at: started_at, last_durable_progress_at: started_at, session_id: nil}
+
+    {updated, _tokens} =
+      Orchestrator.integrate_codex_update_for_test(entry, %{
+        event: :tool_call_completed,
+        timestamp: ~U[2026-01-01 00:00:30Z],
+        message: %{method: "tool/complete"}
+      })
+
+    assert updated.last_durable_progress_at == ~U[2026-01-01 00:00:30Z]
+    assert Orchestrator.stall_elapsed_ms_for_test(updated, ~U[2026-01-01 00:01:00Z]) == 30_000
+  end
+
+  test "stall timeout uses the normalized task role budget" do
+    config = %{stall_timeout_ms: 300_000, stall_timeout_ms_by_role: %{"implementation worker" => 45_000}}
+
+    assert Orchestrator.stall_timeout_for_test(%{role: " Implementation Worker "}, config) == 45_000
+    assert Orchestrator.stall_timeout_for_test(%{role: "reviewer"}, config) == 300_000
+  end
+
   test "orchestrator blocks stalled workers that are waiting on MCP elicitation" do
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_kind: "memory",

@@ -665,9 +665,10 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp reconcile_stalled_running_issues(%State{} = state) do
     codex_config = Config.settings!().codex
+    default_timeout_ms = codex_config.stall_timeout_ms
 
     cond do
-      codex_config.stall_timeout_ms <= 0 ->
+      default_timeout_ms <= 0 and map_size(codex_config.stall_timeout_ms_by_role || %{}) == 0 ->
         state
 
       map_size(state.running) == 0 ->
@@ -745,7 +746,7 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp steer_stalled_worker(state, running_entry, pid, issue_id, identifier) do
+  defp steer_stalled_worker(state, _running_entry, pid, issue_id, identifier) do
     case AgentRunner.steer(pid, "Continue from the current state; make one durable progress step and report the result.") do
       {:ok, _provider_result} ->
         Logger.info("Issued one bounded stall recovery steer: issue_id=#{issue_id} issue_identifier=#{identifier}")
@@ -1825,6 +1826,18 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  @doc false
+  @spec stall_elapsed_ms_for_test(map(), DateTime.t()) :: non_neg_integer() | nil
+  def stall_elapsed_ms_for_test(running_entry, now), do: stall_elapsed_ms(running_entry, now)
+
+  @doc false
+  @spec integrate_codex_update_for_test(map(), map()) :: {map(), map()}
+  def integrate_codex_update_for_test(running_entry, update), do: integrate_codex_update(running_entry, update)
+
+  @doc false
+  @spec stall_timeout_for_test(map(), map()) :: non_neg_integer()
+  def stall_timeout_for_test(running_entry, codex_config), do: stall_timeout_for(running_entry, codex_config)
+
   @impl true
   def handle_call({:fork_thread, intent, workspace, opts}, _from, state)
       when is_map(intent) and is_binary(workspace) and is_list(opts) do
@@ -2063,7 +2076,7 @@ defmodule SymphonyElixir.Orchestrator do
     }
   end
 
-  defp durable_progress_timestamp(running_entry, event, timestamp)
+  defp durable_progress_timestamp(_running_entry, event, timestamp)
        when event in @durable_progress_events and is_struct(timestamp, DateTime), do: timestamp
 
   defp durable_progress_timestamp(running_entry, _event, _timestamp),
