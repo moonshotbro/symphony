@@ -1610,9 +1610,9 @@ defmodule SymphonyElixir.AppServerTest do
             case "$line" in *'"model":"gpt-5.6-terra"'*) ;; *) exit 11;; esac
             case "$line" in *'"model_reasoning_effort":"medium"'*) ;; *) exit 12;; esac
             case "$line" in *'"effort"'*) exit 10;; esac
-            printf '%s\\n' '{"id":2,"result":{"model":"gpt-5.6-terra","reasoningEffort":"medium","thread":{"id":"bound-thread","sessionId":"bound-session","projectId":"01a04aab-c77c-79b0-ab09-65187353bb4b","cwd":"WORKSPACE","ephemeral":false,"instructionSources":["project"]}}}' | sed "s|WORKSPACE|$PWD|" ;;
+            printf '%s\\n' '{"id":2,"result":{"model":"gpt-5.6-terra","reasoningEffort":"medium","instructionSources":["project"],"thread":{"id":"bound-thread","sessionId":"bound-session","projectId":"01a04aab-c77c-79b0-ab09-65187353bb4b","cwd":"WORKSPACE","ephemeral":false}}}' | sed "s|WORKSPACE|$PWD|" ;;
           4) printf '%s\\n' '{"id":6,"result":{}}' ;;
-          5) printf '%s\\n' '{"id":4,"result":{"thread":{"id":"bound-thread","sessionId":"bound-session","projectId":"01a04aab-c77c-79b0-ab09-65187353bb4b","cwd":"WORKSPACE","name":"Implementation SYS-50: bound","ephemeral":false,"instructionSources":["project"]}}}' | sed "s|WORKSPACE|$PWD|" ;;
+          5) printf '%s\\n' '{"id":4,"result":{"thread":{"id":"bound-thread","sessionId":"bound-session","projectId":"01a04aab-c77c-79b0-ab09-65187353bb4b","cwd":"WORKSPACE","name":"Implementation SYS-50: bound","ephemeral":false}}}' | sed "s|WORKSPACE|$PWD|" ;;
           6) printf '%s\\n' '{"id":5,"result":{"data":[]}}' ;;
           7) printf '%s\\n' '{"id":3,"result":{"turn":{"id":"bound-turn"}}}'; printf '%s\\n' '{"method":"turn/completed"}' ;;
         esac
@@ -1650,7 +1650,7 @@ defmodule SymphonyElixir.AppServerTest do
         case "$count" in
           1) printf '%s\\n' '{"id":1,"result":{}}' ;;
           2) ;;
-          3) printf '%s\\n' '{"id":2,"result":{"model":"gpt-5.6-terra","reasoningEffort":"medium","thread":{"id":"bound-thread","sessionId":"bound-session","projectId":null,"cwd":"WORKSPACE","ephemeral":false,"instructionSources":["project"]}}}' | sed "s|WORKSPACE|$PWD|" ;;
+          3) printf '%s\\n' '{"id":2,"result":{"model":"gpt-5.6-terra","reasoningEffort":"medium","instructionSources":["project"],"thread":{"id":"bound-thread","sessionId":"bound-session","projectId":null,"cwd":"WORKSPACE","ephemeral":false}}}' | sed "s|WORKSPACE|$PWD|" ;;
           *) exit 19 ;;
         esac
       done

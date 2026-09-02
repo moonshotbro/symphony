@@ -572,6 +572,7 @@ defmodule SymphonyElixir.Codex.AppServer do
     cond do
       Map.get(response, "model") != Atom.to_string(contract.executing_identity.model) -> {:error, :start_model_mismatch}
       Map.get(response, "reasoningEffort") != Atom.to_string(contract.executing_identity.effort) -> {:error, :start_effort_mismatch}
+      not instruction_sources?(response) -> {:error, :instruction_sources_missing}
       true -> verify_thread_authority(thread, workspace, nil, contract, false)
     end
   end
@@ -590,7 +591,6 @@ defmodule SymphonyElixir.Codex.AppServer do
       cwd != workspace -> {:error, :cwd_mismatch}
       Map.get(thread, "projectId") != contract.project.native_project_id -> {:error, :native_project_mismatch}
       Map.get(thread, "ephemeral") == true -> {:error, :ephemeral_thread}
-      not instruction_sources?(thread) -> {:error, :instruction_sources_missing}
       require_name and name != contract.title -> {:error, :title_mismatch}
       not is_nil(session_id) and Map.get(thread, "sessionId") != session_id -> {:error, :session_id_mismatch}
       true -> :ok
