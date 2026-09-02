@@ -550,8 +550,11 @@ defmodule SymphonyElixir.Codex.AppServer do
          :ok <- verify_thread_readback(thread, workspace, session_id, contract) do
       {:ok, thread_id}
     else
-      {:ok, other} -> {:error, {:invalid_thread_readback, other}}
-      {:error, reason} -> {:error, {:project_bound_thread_unverified, reason}}
+      {:ok, other} ->
+        {:error, {:invalid_thread_readback, other}}
+
+      {:error, reason} ->
+        {:error, {:project_bound_thread_unverified, %{thread_id: thread_id, verification_reason: reason}}}
     end
   end
 

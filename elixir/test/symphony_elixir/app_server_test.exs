@@ -1666,7 +1666,9 @@ defmodule SymphonyElixir.AppServerTest do
       }
 
       issue = %Issue{id: "sys-50", identifier: "SYS-50", title: "bound", state: "In Progress"}
-      assert {:error, {:project_bound_thread_unverified, :native_project_mismatch}} = AppServer.run(workspace, "bound", issue, task_contract: contract)
+
+      assert {:error, {:project_bound_thread_unverified, %{thread_id: "bound-thread", verification_reason: :native_project_mismatch}}} =
+               AppServer.run(workspace, "bound", issue, task_contract: contract)
     after
       File.rm_rf(root)
     end
