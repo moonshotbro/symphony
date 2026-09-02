@@ -26,6 +26,9 @@ defmodule SymphonyElixir.Orchestrator do
   @failure_retry_base_ms 10_000
   # Slightly above the dashboard render interval so "checking now…" can render.
   @poll_transition_render_delay_ms 20
+  # Provider notifications and polling chatter are diagnostic activity, not
+  # proof that the worker has made durable progress.
+  @durable_progress_events [:turn_started, :turn_completed, :tool_call_completed, :task_completed]
   @empty_codex_totals %{
     input_tokens: 0,
     output_tokens: 0,
@@ -661,10 +664,10 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp reconcile_stalled_running_issues(%State{} = state) do
-    timeout_ms = Config.settings!().codex.stall_timeout_ms
+    codex_config = Config.settings!().codex
 
     cond do
-      timeout_ms <= 0 ->
+      codex_config.stall_timeout_ms <= 0 ->
         state
 
       map_size(state.running) == 0 ->
@@ -674,6 +677,7 @@ defmodule SymphonyElixir.Orchestrator do
         now = DateTime.utc_now()
 
         Enum.reduce(state.running, state, fn {issue_id, running_entry}, state_acc ->
+          timeout_ms = stall_timeout_for(running_entry, codex_config)
           maybe_restart_stalled_issue(state_acc, issue_id, running_entry, now, timeout_ms)
         end)
     end
@@ -703,22 +707,78 @@ defmodule SymphonyElixir.Orchestrator do
         |> record_session_completion_totals(running_entry)
         |> stop_and_block_issue(issue_id, running_entry, error)
       else
-        Logger.warning("Issue stalled: issue_id=#{issue_id} issue_identifier=#{identifier} session_id=#{session_id} elapsed_ms=#{elapsed_ms}; restarting with backoff")
+        case {Map.get(running_entry, :recovery_enabled, false), Map.get(running_entry, :recovery_stage)} do
+          {false, _} ->
+            # Preserve the legacy test/integration shape for externally
+            # injected entries that predate the staged controller.
+            retry_stalled_issue(state, issue_id, running_entry, identifier, elapsed_ms)
 
-        next_attempt = next_retry_attempt_from_running(running_entry)
+          {true, stage} when stage in [nil, :observing] ->
+            # First expiry is an observation checkpoint. Do not kill a worker
+            # before we have attempted the bounded recovery protocol.
+            Logger.warning("Issue stalled; recording inspection checkpoint: issue_id=#{issue_id} issue_identifier=#{identifier} elapsed_ms=#{elapsed_ms}")
+            put_in(state.running[issue_id][:recovery_stage], :inspected)
 
-        state
-        |> terminate_running_issue(issue_id, false)
-        |> schedule_issue_retry(issue_id, next_attempt, %{
-          identifier: identifier,
-          issue_url: running_entry.issue.url,
-          error: "stalled for #{elapsed_ms}ms without codex activity"
-        })
+          {true, :inspected} ->
+            case Map.get(running_entry, :pid) do
+              pid when is_pid(pid) ->
+                steer_stalled_worker(state, running_entry, pid, issue_id, identifier)
+
+              _ ->
+                retry_stalled_issue(state, issue_id, running_entry, identifier, elapsed_ms)
+            end
+
+          {true, :steered} when is_pid(running_entry.pid) ->
+            if Process.alive?(running_entry.pid) do
+              Logger.warning("Holding stalled issue until steered worker is terminal: issue_id=#{issue_id} issue_identifier=#{identifier}")
+              state
+            else
+              retry_stalled_issue(state, issue_id, running_entry, identifier, elapsed_ms)
+            end
+
+          {true, _} ->
+            retry_stalled_issue(state, issue_id, running_entry, identifier, elapsed_ms)
+        end
       end
     else
       state
     end
   end
+
+  defp steer_stalled_worker(state, running_entry, pid, issue_id, identifier) do
+    case AgentRunner.steer(pid, "Continue from the current state; make one durable progress step and report the result.") do
+      {:ok, _provider_result} ->
+        Logger.info("Issued one bounded stall recovery steer: issue_id=#{issue_id} issue_identifier=#{identifier}")
+        put_in(state.running[issue_id][:recovery_stage], :steered)
+
+      {:error, reason} ->
+        Logger.warning("Stall recovery steer was rejected or unavailable: issue_id=#{issue_id} reason=#{inspect(reason)}")
+        state
+    end
+  end
+
+  defp retry_stalled_issue(state, issue_id, running_entry, identifier, elapsed_ms) do
+    session_id = running_entry_session_id(running_entry)
+    Logger.warning("Issue stalled: issue_id=#{issue_id} issue_identifier=#{identifier} session_id=#{session_id} elapsed_ms=#{elapsed_ms}; restarting with backoff")
+
+    next_attempt = next_retry_attempt_from_running(running_entry)
+
+    state
+    |> terminate_running_issue(issue_id, false)
+    |> schedule_issue_retry(issue_id, next_attempt, %{
+      identifier: identifier,
+      issue_url: running_entry.issue.url,
+      error: "stalled for #{elapsed_ms}ms without codex activity"
+    })
+  end
+
+  defp stall_timeout_for(running_entry, %{stall_timeout_ms: default, stall_timeout_ms_by_role: by_role}) do
+    role = running_entry |> Map.get(:role, Map.get(running_entry, :task_role)) |> normalize_role()
+    Map.get(by_role || %{}, role, default)
+  end
+
+  defp normalize_role(role) when is_binary(role), do: role |> String.trim() |> String.downcase()
+  defp normalize_role(_), do: nil
 
   defp stall_elapsed_ms(running_entry, now) do
     running_entry
@@ -733,7 +793,7 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp last_activity_timestamp(running_entry) when is_map(running_entry) do
-    Map.get(running_entry, :last_codex_timestamp) || Map.get(running_entry, :started_at)
+    Map.get(running_entry, :last_durable_progress_at) || Map.get(running_entry, :started_at)
   end
 
   defp last_activity_timestamp(_running_entry), do: nil
@@ -1229,21 +1289,30 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp default_worker_starter(task_supervisor, issue, attempt, recipient, worker_host) do
-    task_fun = fn ->
-      AgentRunner.run(issue, recipient, attempt: attempt, worker_host: worker_host)
-    end
+    launch_opts = [attempt: attempt, worker_host: worker_host, repository_task: true]
 
-    case Task.Supervisor.start_child(task_supervisor, task_fun) do
-      {:ok, pid} ->
-        {:ok, pid,
-         %{
-           "worker_host" => worker_host,
-           "workspace_key" => Workspace.workspace_key(issue),
-           "disposition" => "worker_spawned"
-         }}
+    case AgentRunner.prepare_launch(issue, worker_host, launch_opts) do
+      {:ok, prepared_launch} ->
+        task_fun = fn ->
+          AgentRunner.run(issue, recipient, launch_opts ++ [prepared_launch: prepared_launch])
+        end
+
+        case Task.Supervisor.start_child(task_supervisor, task_fun) do
+          {:ok, pid} ->
+            {:ok, pid,
+             %{
+               "worker_host" => worker_host,
+               "workspace_key" => Workspace.workspace_key(issue),
+               "disposition" => "worker_spawned"
+             }}
+
+          {:error, reason} ->
+            {:error, reason, :retryable_failure}
+        end
 
       {:error, reason} ->
-        {:error, reason, :retryable_failure}
+        Logger.warning("Launch contract preflight rejected #{issue_context(issue)}: #{inspect(reason)}")
+        {:error, {:launch_contract_preflight_failed, reason}, :retryable_failure}
     end
   end
 
@@ -1325,6 +1394,9 @@ defmodule SymphonyElixir.Orchestrator do
       last_codex_message: nil,
       last_codex_timestamp: nil,
       last_codex_event: nil,
+      last_durable_progress_at: DateTime.utc_now(),
+      recovery_stage: :observing,
+      recovery_enabled: true,
       codex_app_server_pid: nil,
       codex_input_tokens: 0,
       codex_output_tokens: 0,
@@ -1972,6 +2044,7 @@ defmodule SymphonyElixir.Orchestrator do
     {
       Map.merge(running_entry, %{
         last_codex_timestamp: timestamp,
+        last_durable_progress_at: durable_progress_timestamp(running_entry, event, timestamp),
         last_codex_message: summarize_codex_update(update),
         session_id: session_id_for_update(running_entry.session_id, update),
         thread_id: correlation_value(running_entry, update, :thread_id),
@@ -1989,6 +2062,12 @@ defmodule SymphonyElixir.Orchestrator do
       token_delta
     }
   end
+
+  defp durable_progress_timestamp(running_entry, event, timestamp)
+       when event in @durable_progress_events and is_struct(timestamp, DateTime), do: timestamp
+
+  defp durable_progress_timestamp(running_entry, _event, _timestamp),
+    do: Map.get(running_entry, :last_durable_progress_at)
 
   defp codex_app_server_pid_for_update(_existing, %{codex_app_server_pid: pid})
        when is_binary(pid),

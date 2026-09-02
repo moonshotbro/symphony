@@ -227,6 +227,23 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
 
   def verify(_), do: {:error, :invalid_task_launch_contract}
 
+  @doc "Verifies that the prepared workspace still carries the contract revision."
+  @spec verify_workspace(t() | nil, Path.t()) :: :ok | {:error, term()}
+  def verify_workspace(nil, _workspace), do: :ok
+
+  def verify_workspace(%__MODULE__{} = contract, workspace) when is_binary(workspace) do
+    with {:ok, revision} <- workspace_revision(workspace),
+         true <- revision == contract.exact_revision,
+         :ok <- repository_matches?(workspace, contract.repository) do
+      :ok
+    else
+      {:error, _} = error -> error
+      _ -> {:error, :workspace_contract_mismatch}
+    end
+  end
+
+  def verify_workspace(_, _), do: {:error, :invalid_workspace_contract}
+
   @doc false
   @spec verify_fork_binding(t(), map(), Path.t(), String.t() | nil) :: :ok | {:error, :fork_authority_mismatch}
   def verify_fork_binding(%__MODULE__{} = contract, intent, workspace, worker_host)

@@ -74,6 +74,42 @@ defmodule SymphonyElixir.Codex.TaskLaunchContractTest do
              TaskLaunchContract.from_runtime(issue, System.tmp_dir!(), repository_task: true)
   end
 
+  test "workspace verification rejects a prepared contract after the exact head changes" do
+    root = Path.join(System.tmp_dir!(), "symphony-contract-head-#{System.unique_integer([:positive])}")
+    File.mkdir_p!(root)
+    {_, 0} = System.cmd("git", ["init", "-q", root])
+    {_, 0} = System.cmd("git", ["-C", root, "config", "user.email", "test@example.test"])
+    {_, 0} = System.cmd("git", ["-C", root, "config", "user.name", "Test"])
+    {_, 0} = System.cmd("git", ["-C", root, "remote", "add", "origin", "https://github.com/moonshotbro/sysmiq-symphony.git"])
+    File.write!(Path.join(root, "README.md"), "one\n")
+    {_, 0} = System.cmd("git", ["-C", root, "add", "."])
+    {_, 0} = System.cmd("git", ["-C", root, "commit", "-qm", "one"])
+
+    try do
+      write_workflow_file!(Workflow.workflow_file_path(),
+        codex_project_binding: %{
+          enabled: true,
+          programme: "build-toscanini",
+          saved_project_id: "b12752f9-9a65-4194-bc49-77808b21d767",
+          native_project_id: "01a04aab-c77c-79b0-ab09-65187353bb4b",
+          repository: "moonshotbro/sysmiq-symphony",
+          root: root
+        }
+      )
+
+      issue = %SymphonyElixir.Tracker.Issue{identifier: "SYS-52", title: "Prepared worker"}
+      assert {:ok, contract} = TaskLaunchContract.from_runtime(issue, root)
+      assert :ok = TaskLaunchContract.verify_workspace(contract, root)
+
+      File.write!(Path.join(root, "README.md"), "two\n")
+      {_, 0} = System.cmd("git", ["-C", root, "add", "."])
+      {_, 0} = System.cmd("git", ["-C", root, "commit", "-qm", "two"])
+      assert {:error, :workspace_contract_mismatch} = TaskLaunchContract.verify_workspace(contract, root)
+    after
+      File.rm_rf(root)
+    end
+  end
+
   test "escalation and post-resolution links are typed and immutable" do
     prior = "tlc-" <> String.duplicate("a", 64)
 
