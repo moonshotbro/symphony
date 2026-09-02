@@ -151,6 +151,28 @@ defmodule SymphonyElixir.Codex.CoordinationEffectsTest do
                :fork,
                provider(fn _ -> {:ok, child()} end)
              )
+
+    early_intent =
+      put_in(
+        intent("early-authority-mismatch"),
+        [:source],
+        Map.merge(intent("early-authority-mismatch").source, %{
+          workspace_path: "/tmp/issue-39",
+          worker_host: "worker-1"
+        })
+      )
+
+    {:ok, early_action, :new} = ActionLedger.plan(ledger, early_intent)
+    {:ok, _} = ActionLedger.transition(ledger, early_action.id, :dispatched)
+    {:ok, _} = ActionLedger.transition(ledger, early_action.id, :uncertain, %{"fork_thread_id" => "child-early"})
+
+    assert {:error, {:uncertain_action_quarantined, _}} =
+             CoordinationEffects.dispatch(
+               ledger,
+               early_intent,
+               :fork,
+               provider(fn _ -> raise "must not fork" end, fn "child-early" -> {:ok, %{id: "child-early", forked_from_id: "source-1", cwd: "/wrong-workspace"}} end)
+             )
   end
 
   test "classifies provider duplicate, unsupported, invalid, and transport outcomes", %{ledger: ledger} do
@@ -215,6 +237,94 @@ defmodule SymphonyElixir.Codex.CoordinationEffectsTest do
                intent("ambiguous"),
                :fork,
                provider(fn _ -> {:ok, child()} end, fn _ -> :malformed end)
+             )
+  end
+
+  test "settles an uncertain fork when the persisted child exactly matches authority", %{ledger: ledger} do
+    recovered_intent =
+      put_in(intent("exact"), [:source], Map.merge(intent("exact").source, %{workspace_path: "/tmp/issue-39", worker_host: "worker-1"}))
+
+    {:ok, action, :new} = ActionLedger.plan(ledger, recovered_intent)
+    {:ok, _} = ActionLedger.transition(ledger, action.id, :dispatched)
+
+    {:ok, _} =
+      ActionLedger.transition(ledger, action.id, :uncertain, %{
+        "fork_thread_id" => "child-exact",
+        "session_correlation_id" => "corr-exact",
+        "workspace_key" => "/tmp/issue-39"
+      })
+
+    parent = self()
+
+    provider =
+      provider(
+        fn _ ->
+          send(parent, :forked)
+          {:ok, child()}
+        end,
+        fn "child-exact" ->
+          {:ok,
+           %{
+             id: "child-exact",
+             forked_from_id: "source-1",
+             cwd: "/tmp/issue-39",
+             project_id: "project-39",
+             ephemeral: false,
+             session_id: "corr-exact",
+             worker_host: "worker-1",
+             git_info: %{sha: "abc1234", origin_url: "https://github.com/moonshotbro/symphony.git"}
+           }}
+        end
+      )
+
+    assert {:already_satisfied, satisfied} =
+             CoordinationEffects.dispatch(ledger, recovered_intent, :fork, provider)
+
+    assert satisfied.state == :already_satisfied
+    refute_received :forked
+  end
+
+  test "quarantines a recovered child when authority facts short-circuit", %{ledger: ledger} do
+    recovered_intent =
+      put_in(
+        intent("authority-mismatch"),
+        [:source],
+        Map.merge(intent("authority-mismatch").source, %{
+          workspace_path: "/tmp/issue-39",
+          worker_host: "worker-1"
+        })
+      )
+
+    {:ok, action, :new} = ActionLedger.plan(ledger, recovered_intent)
+    {:ok, _} = ActionLedger.transition(ledger, action.id, :dispatched)
+
+    {:ok, _} =
+      ActionLedger.transition(ledger, action.id, :uncertain, %{
+        "fork_thread_id" => "child-mismatch",
+        "session_correlation_id" => "corr-mismatch"
+      })
+
+    assert {:error, {:uncertain_action_quarantined, _}} =
+             CoordinationEffects.dispatch(
+               ledger,
+               recovered_intent,
+               :fork,
+               provider(
+                 fn _ -> raise "must not fork" end,
+                 fn "child-mismatch" ->
+                   {:ok,
+                    %{
+                      id: "child-mismatch",
+                      forked_from_id: "source-1",
+                      cwd: "/tmp/issue-39",
+                      project_id: "project-39",
+                      ephemeral: false,
+                      session_id: "corr-mismatch",
+                      worker_host: "worker-1",
+                      git_info: %{sha: "abc1234", origin_url: :invalid}
+                    }}
+                 end
+               )
              )
   end
 
