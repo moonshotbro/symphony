@@ -19,7 +19,9 @@ defmodule SymphonyElixir.AgentRunner do
   """
   @spec prepare_launch(Issue.t(), worker_host(), keyword()) ::
           {:ok, %{workspace: String.t(), task_contract: TaskLaunchContract.t() | nil}} | {:error, term()}
-  def prepare_launch(%Issue{} = issue, worker_host, opts \\ []) when is_list(opts) do
+  def prepare_launch(issue, worker_host, opts \\ [])
+
+  def prepare_launch(%Issue{} = issue, worker_host, opts) when is_list(opts) do
     with {:ok, workspace} <- Workspace.create_for_issue(issue, worker_host),
          {:ok, contract} <- TaskLaunchContract.from_runtime(issue, workspace, opts) do
       {:ok, %{workspace: workspace, task_contract: contract}}

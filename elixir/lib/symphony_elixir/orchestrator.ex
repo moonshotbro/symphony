@@ -1314,7 +1314,15 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp default_worker_starter(task_supervisor, issue, attempt, recipient, worker_host) do
-    launch_opts = [attempt: attempt, worker_host: worker_host, repository_task: true]
+    # Operational repository dispatch is already gated by the required project
+    # binding in the authoritative work-pressure path. Keep the historical
+    # non-operational/test runner available when that binding is deliberately
+    # disabled.
+    launch_opts = [
+      attempt: attempt,
+      worker_host: worker_host,
+      repository_task: TaskLaunchContract.project_binding_enabled?()
+    ]
 
     case AgentRunner.prepare_launch(issue, worker_host, launch_opts) do
       {:ok, prepared_launch} ->
