@@ -35,7 +35,7 @@ defmodule SymphonyElixir.Codex.TaskLaunchContractTest do
                  trigger: :integration_design,
                  commissioning_identity: %{kind: "human", authority: "programme"},
                  risk_receipt_ref: runtime_ref,
-                 authority_digest: String.duplicate("c", 64)
+                 risk_receipt_resolver: fn ^runtime_ref -> runtime_ref end
                )
 
       assert contract.executing_identity.model == :"gpt-5.6-terra"
@@ -46,7 +46,7 @@ defmodule SymphonyElixir.Codex.TaskLaunchContractTest do
       assert {:error, :risk_receipt_authority_mismatch} =
                TaskLaunchContract.from_runtime(issue, root,
                  risk_receipt_ref: runtime_ref,
-                 authority_digest: String.duplicate("d", 64)
+                 risk_receipt_resolver: fn ref -> Map.put(ref, "authority_digest", String.duplicate("d", 64)) end
                )
 
       assert {:error, :risk_receipt_authority_unavailable} =
@@ -240,7 +240,7 @@ defmodule SymphonyElixir.Codex.TaskLaunchContractTest do
 
   defp risk_receipt_ref do
     ref = %{
-      "schema" => "sysmiq.risk-receipt.v1",
+      "schema" => "sysmiq.symphony.risk-receipt.v1",
       "digest" => "pending",
       "repository" => "moonshotbro/sysmiq-symphony",
       "base_sha" => String.duplicate("b", 40),
@@ -268,8 +268,9 @@ defmodule SymphonyElixir.Codex.TaskLaunchContractTest do
   defp receipt_digest(ref) do
     ref
     |> Map.delete("digest")
-    |> Enum.sort()
-    |> :erlang.term_to_binary()
+    |> Enum.sort_by(fn {key, _value} -> key end)
+    |> Jason.OrderedObject.new()
+    |> Jason.encode!()
     |> then(&:crypto.hash(:sha256, &1))
     |> Base.encode16(case: :lower)
   end

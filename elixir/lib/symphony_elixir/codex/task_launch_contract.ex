@@ -31,7 +31,7 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
   @luna_triggers ~w(bounded implementation tests documentation hygiene mechanical_review gate_repair)a
   @terra_triggers ~w(ambiguous_diagnosis integration_design repository_wide_judgment recovery privacy_telemetry_semantics provider_boundary_reasoning scope_discovery)a
   @sol_triggers ~w(security_architecture consequential_production_customer_billing difficult_cross_repository_incident final_high_risk_review)a
-  @risk_receipt_schema "sysmiq.risk-receipt.v1"
+  @risk_receipt_schema "sysmiq.symphony.risk-receipt.v1"
 
   @type role ::
           :programme
@@ -738,7 +738,8 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
   defp risk_receipt_shape?(ref, keys), do: Map.keys(ref) |> Enum.sort() == Enum.sort(keys)
 
   defp risk_receipt_values?(ref) do
-    risk_receipt_digests?(ref) and risk_receipt_strings?(ref) and risk_receipt_tier?(ref)
+    ref["digest"] == risk_receipt_digest(ref) and risk_receipt_digests?(ref) and
+      risk_receipt_strings?(ref) and risk_receipt_tier?(ref)
   end
 
   defp risk_receipt_digests?(ref), do: digest?(ref["digest"]) and digest?(ref["authority_digest"]) and digest?(ref["policy_digest"])
@@ -943,26 +944,43 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
   defp runtime_receipt_authority(%{risk_receipt_ref: nil}, _opts), do: :ok
 
   defp runtime_receipt_authority(%{risk_receipt_ref: ref}, opts) do
-    accepted = Keyword.get(opts, :authority_digest)
+    resolver = Keyword.get(opts, :risk_receipt_resolver)
 
-    cond do
-      not digest?(accepted) -> {:error, :risk_receipt_authority_unavailable}
-      ref["authority_digest"] != accepted -> {:error, :risk_receipt_authority_mismatch}
-      ref["digest"] != risk_receipt_digest(ref) -> {:error, :risk_receipt_digest_mismatch}
-      true -> :ok
-    end
+    if is_function(resolver, 1),
+      do: resolve_runtime_receipt(resolver, ref),
+      else: {:error, :risk_receipt_authority_unavailable}
   end
 
   defp runtime_receipt_authority(_, _opts), do: {:error, :invalid_risk_receipt_ref}
 
+  defp resolve_runtime_receipt(resolver, ref) do
+    case resolver.(ref) do
+      {:ok, canonical} when is_map(canonical) ->
+        if canonical == ref, do: :ok, else: {:error, :risk_receipt_authority_mismatch}
+
+      canonical when is_map(canonical) ->
+        if canonical == ref, do: :ok, else: {:error, :risk_receipt_authority_mismatch}
+
+      _ ->
+        {:error, :risk_receipt_authority_unavailable}
+    end
+  rescue
+    _ -> {:error, :risk_receipt_authority_unavailable}
+  end
+
   defp risk_receipt_digest(ref) do
     ref
     |> Map.delete("digest")
-    |> Enum.sort()
-    |> :erlang.term_to_binary()
+    |> jcs_encode!()
     |> then(&:crypto.hash(:sha256, &1))
     |> Base.encode16(case: :lower)
   end
+
+  defp jcs_encode!(value) when is_map(value), do: value |> jcs_value() |> Jason.encode!()
+
+  defp jcs_value(value) when is_map(value), do: Jason.OrderedObject.new(Enum.map(Enum.sort_by(value, fn {key, _} -> key end), fn {key, child} -> {key, jcs_value(child)} end))
+  defp jcs_value(value) when is_list(value), do: Enum.map(value, &jcs_value/1)
+  defp jcs_value(value), do: value
 
   defp model_for_trigger(trigger) when trigger in @terra_triggers, do: {:"gpt-5.6-terra", :medium}
   defp model_for_trigger(trigger) when trigger in @sol_triggers, do: {:"gpt-5.6-sol", :high}

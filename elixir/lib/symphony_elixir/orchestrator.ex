@@ -92,7 +92,10 @@ defmodule SymphonyElixir.Orchestrator do
           task_supervisor: Keyword.get(opts, :task_supervisor, SymphonyElixir.TaskSupervisor),
           action_ledger: Keyword.get(opts, :action_ledger),
           action_inspector: Keyword.get(opts, :action_inspector, &RecoveryInspector.inspect/1),
-          worker_starter: Keyword.get(opts, :worker_starter, &default_worker_starter/5),
+          worker_starter:
+            Keyword.get(opts, :worker_starter, fn supervisor, issue, attempt, recipient, host ->
+              default_worker_starter(supervisor, issue, attempt, recipient, host, opts)
+            end),
           claimed:
             recovered_action_claims(
               Keyword.get(opts, :action_ledger),
@@ -1059,9 +1062,14 @@ defmodule SymphonyElixir.Orchestrator do
     state.worker_starter.(state.task_supervisor, issue, attempt, recipient, worker_host)
   end
 
-  defp default_worker_starter(task_supervisor, issue, attempt, recipient, worker_host) do
+  defp default_worker_starter(task_supervisor, issue, attempt, recipient, worker_host, opts) do
     task_fun = fn ->
-      AgentRunner.run(issue, recipient, attempt: attempt, worker_host: worker_host)
+      AgentRunner.run(issue, recipient,
+        attempt: attempt,
+        worker_host: worker_host,
+        risk_receipt_ref: Keyword.get(opts, :risk_receipt_ref),
+        risk_receipt_resolver: Keyword.get(opts, :risk_receipt_resolver)
+      )
     end
 
     case Task.Supervisor.start_child(task_supervisor, task_fun) do
