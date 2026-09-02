@@ -8,7 +8,9 @@ defmodule SymphonyElixir.Codex.TaskAccountabilityRegistryTest do
   test "compiles the canonical production role and software alias" do
     assert {:ok, compiled} =
              TaskAccountabilityRegistry.compile(%{
+               registry_id: "SYS-LIB-ROLE-REGISTRY-001",
                registry_version: "1.0",
+               canonical_digest: "a88eb4f4d35806679e7df9dde7885ae25a1b362306a08efd187b16717cf28fc2",
                primary_role: "execution_production",
                domain_alias: "implementation worker",
                authority_revision: "7cce0ffd5a7ebb6980b6754b996b81fed108023b",
@@ -28,6 +30,10 @@ defmodule SymphonyElixir.Codex.TaskAccountabilityRegistryTest do
                domain: "document operations",
                alias: "document operations",
                primary_role: "execution_production",
+               registry_id: "SYS-LIB-ROLE-REGISTRY-001",
+               registry_version: "1.0",
+               authority_revision: "7cce0ffd5a7ebb6980b6754b996b81fed108023b",
+               canonical_digest: "a88eb4f4d35806679e7df9dde7885ae25a1b362306a08efd187b16717cf28fc2",
                permission_envelope: ["write_bound_scope"],
                evidence: @evidence
              })
@@ -37,7 +43,15 @@ defmodule SymphonyElixir.Codex.TaskAccountabilityRegistryTest do
   end
 
   test "fails closed for unknown version, widened permissions, missing evidence, and unsafe handoff" do
-    base = %{registry_version: "1.0", primary_role: "execution_production", permission_envelope: ["write_bound_scope"], evidence: @evidence}
+    base = %{
+      registry_id: "SYS-LIB-ROLE-REGISTRY-001",
+      registry_version: "1.0",
+      authority_revision: "7cce0ffd5a7ebb6980b6754b996b81fed108023b",
+      canonical_digest: "a88eb4f4d35806679e7df9dde7885ae25a1b362306a08efd187b16717cf28fc2",
+      primary_role: "execution_production",
+      permission_envelope: ["write_bound_scope"],
+      evidence: @evidence
+    }
 
     assert {:error, {:unknown_registry_version, "9.0"}} =
              TaskAccountabilityRegistry.compile(%{base | registry_version: "9.0"})
@@ -50,7 +64,16 @@ defmodule SymphonyElixir.Codex.TaskAccountabilityRegistryTest do
   end
 
   test "fails closed for unknown roles and reviewer self-review" do
-    base = %{registry_version: "1.0", primary_role: "verification_assessment", permission_envelope: ["read_candidate_and_test_scope"], evidence: []}
+    base = %{
+      registry_id: "SYS-LIB-ROLE-REGISTRY-001",
+      registry_version: "1.0",
+      authority_revision: "7cce0ffd5a7ebb6980b6754b996b81fed108023b",
+      canonical_digest: "a88eb4f4d35806679e7df9dde7885ae25a1b362306a08efd187b16717cf28fc2",
+      primary_role: "verification_assessment",
+      permission_envelope: ["read_candidate_and_test_scope"],
+      evidence: ["verdict", "reproduction_basis"]
+    }
+
     assert {:error, {:unknown_registry_role, "mystery"}} = TaskAccountabilityRegistry.compile(%{base | primary_role: "mystery"})
     assert {:error, :independence_violation} = TaskAccountabilityRegistry.compile(Map.put(base, :prior_role, "verification_assessment"))
   end
@@ -58,7 +81,16 @@ defmodule SymphonyElixir.Codex.TaskAccountabilityRegistryTest do
   test "rejects malformed packs, aliases, permissions, and prohibited actions" do
     assert {:error, :invalid_domain_pack} = TaskAccountabilityRegistry.compile_domain_pack(%{})
 
-    base = %{registry_version: "1.0", primary_role: "execution_production", permission_envelope: ["write_bound_scope"], evidence: @evidence}
+    base = %{
+      registry_id: "SYS-LIB-ROLE-REGISTRY-001",
+      registry_version: "1.0",
+      authority_revision: "7cce0ffd5a7ebb6980b6754b996b81fed108023b",
+      canonical_digest: "a88eb4f4d35806679e7df9dde7885ae25a1b362306a08efd187b16717cf28fc2",
+      primary_role: "execution_production",
+      permission_envelope: ["write_bound_scope"],
+      evidence: @evidence
+    }
+
     assert {:error, {:unknown_domain_alias, "unknown alias"}} = TaskAccountabilityRegistry.compile(Map.put(base, :domain_alias, "unknown alias"))
     assert {:error, :domain_alias_role_mismatch} = TaskAccountabilityRegistry.compile(Map.put(base, :domain_alias, "exact-head reviewer"))
 
@@ -67,5 +99,68 @@ defmodule SymphonyElixir.Codex.TaskAccountabilityRegistryTest do
 
     assert {:error, :prohibited_action} = TaskAccountabilityRegistry.compile(Map.put(base, :prohibited_actions, ["approve_own_work"]))
     assert {:error, :prohibited_action} = TaskAccountabilityRegistry.compile(Map.put(base, :prohibited_actions, :approve_own_work))
+  end
+
+  test "binds independent review and landing to one candidate without self-review" do
+    revision = String.duplicate("a", 40)
+
+    review = %{
+      registry_id: "SYS-LIB-ROLE-REGISTRY-001",
+      registry_version: "1.0",
+      authority_revision: "7cce0ffd5a7ebb6980b6754b996b81fed108023b",
+      canonical_digest: "a88eb4f4d35806679e7df9dde7885ae25a1b362306a08efd187b16717cf28fc2",
+      primary_role: "verification_assessment",
+      domain_alias: "independent review",
+      permission_envelope: ["read_candidate_and_test_scope"],
+      evidence: ["verdict", "reproduction_basis"],
+      handoff: "independent_review",
+      execution_principal: "worker",
+      reviewer_principal: "reviewer",
+      candidate_id: "candidate-1",
+      verdict_candidate_id: "candidate-1",
+      attempt: 0,
+      verdict_attempt: 0,
+      fence: "fence-1",
+      exact_revision: revision,
+      verdict_exact_revision: revision
+    }
+
+    assert {:ok, compiled} = TaskAccountabilityRegistry.compile(review)
+    assert compiled.primary_role == "verification_assessment"
+    assert {:error, :independence_violation} = TaskAccountabilityRegistry.compile(Map.put(review, :reviewer_principal, "worker"))
+
+    landing =
+      Map.merge(review, %{
+        primary_role: "integration_closeout",
+        domain_alias: "landing owner",
+        permission_envelope: ["land_bound_destination"],
+        evidence: ["accepted_verdict", "destination_receipt", "clean_state"],
+        integrator_principal: "integrator",
+        accepted_verdict: %{"accepted" => true, "role" => "verification_assessment"},
+        receipt_identity: "receipt-1"
+      })
+
+    assert {:ok, _} = TaskAccountabilityRegistry.compile(landing)
+    assert {:error, :missing_accepted_verdict} = TaskAccountabilityRegistry.compile(Map.delete(landing, :accepted_verdict))
+    assert {:error, :missing_accepted_verdict} = TaskAccountabilityRegistry.compile(Map.put(landing, :verdict_attempt, 1))
+    assert {:error, :missing_accepted_verdict} = TaskAccountabilityRegistry.compile(Map.put(landing, :integrator_principal, "worker"))
+  end
+
+  test "requires exact authority identity and role-specific evidence" do
+    base = %{
+      registry_id: "SYS-LIB-ROLE-REGISTRY-001",
+      registry_version: "1.0",
+      authority_revision: "7cce0ffd5a7ebb6980b6754b996b81fed108023b",
+      canonical_digest: "a88eb4f4d35806679e7df9dde7885ae25a1b362306a08efd187b16717cf28fc2",
+      primary_role: "response_recovery",
+      permission_envelope: ["write_recovery_scope"],
+      evidence: ["incident_timeline", "recovery_record"]
+    }
+
+    assert {:ok, compiled} = TaskAccountabilityRegistry.compile(base)
+    assert compiled.required_evidence == ["incident_timeline", "recovery_record"]
+    assert {:error, :missing_required_evidence} = TaskAccountabilityRegistry.compile(%{base | evidence: []})
+    assert {:error, :invalid_registry_authority} = TaskAccountabilityRegistry.compile(%{base | canonical_digest: "bad"})
+    assert {:error, :invalid_registry_authority} = TaskAccountabilityRegistry.compile(Map.delete(base, :registry_id))
   end
 end

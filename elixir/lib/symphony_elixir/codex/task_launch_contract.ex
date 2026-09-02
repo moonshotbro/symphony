@@ -479,7 +479,8 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
           registry.domain_alias,
           registry.authority_revision,
           registry.work_character,
-          registry.permission_envelope
+          registry.permission_envelope,
+          registry
         ]
         |> :erlang.term_to_binary()
 
@@ -513,7 +514,7 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
     length(keys) != length(Enum.uniq(normalized)) or
       Enum.any?(
         normalized,
-        &(&1 not in ~w(programme repository issue_or_pr role task attempt fence exact_revision write_boundary evidence model effort trigger goal_policy dependencies permissions evidence_gates stall_policy closeout_policy idempotency_identity conflict_identity commissioning_identity escalation supersedes project registry_id registry_version primary_role domain_alias authority_revision work_character permission_envelope))
+        &(&1 not in ~w(programme repository issue_or_pr role task attempt fence exact_revision write_boundary evidence model effort trigger goal_policy dependencies permissions evidence_gates stall_policy closeout_policy idempotency_identity conflict_identity commissioning_identity escalation supersedes project registry_id registry_version primary_role domain_alias authority_revision canonical_digest work_character permission_envelope execution_principal reviewer_principal integrator_principal candidate_id verdict_candidate_id verdict_attempt verdict_exact_revision accepted_verdict receipt_identity handoff))
       )
   end
 
@@ -699,11 +700,22 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
          project: Map.put(project, :root, workspace),
          registry_id: TaskAccountabilityRegistry.identity().registry_id,
          registry_version: TaskAccountabilityRegistry.identity().registry_version,
+         canonical_digest: "a88eb4f4d35806679e7df9dde7885ae25a1b362306a08efd187b16717cf28fc2",
          primary_role: Atom.to_string(role),
-         domain_alias: Keyword.get(opts, :domain_alias, if(role == :implementation, do: "implementation worker", else: Atom.to_string(role))),
+         domain_alias: Keyword.get(opts, :domain_alias, default_domain_alias(role)),
          authority_revision: TaskAccountabilityRegistry.identity().authority_revision,
          work_character: Keyword.get(opts, :work_character, "bounded"),
-         permission_envelope: Keyword.get(opts, :permission_envelope, ["write_bound_scope"])
+         permission_envelope: Keyword.get(opts, :permission_envelope, ["write_bound_scope"]),
+         execution_principal: Keyword.get(opts, :execution_principal),
+         reviewer_principal: Keyword.get(opts, :reviewer_principal),
+         integrator_principal: Keyword.get(opts, :integrator_principal),
+         candidate_id: Keyword.get(opts, :candidate_id, identifier),
+         verdict_candidate_id: Keyword.get(opts, :verdict_candidate_id),
+         verdict_attempt: Keyword.get(opts, :verdict_attempt),
+         verdict_exact_revision: Keyword.get(opts, :verdict_exact_revision),
+         accepted_verdict: Keyword.get(opts, :accepted_verdict),
+         receipt_identity: Keyword.get(opts, :receipt_identity),
+         handoff: Keyword.get(opts, :handoff)
        }}
     else
       {:error, :invalid_issue_authority}
@@ -713,4 +725,15 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
   defp model_for_trigger(trigger) when trigger in @terra_triggers, do: {:"gpt-5.6-terra", :medium}
   defp model_for_trigger(trigger) when trigger in @sol_triggers, do: {:"gpt-5.6-sol", :high}
   defp model_for_trigger(_), do: {:"gpt-5.6-luna", :medium}
+
+  defp default_domain_alias(:implementation), do: "implementation worker"
+  defp default_domain_alias(:independent_review), do: "independent review"
+  defp default_domain_alias(:landing), do: "landing"
+  defp default_domain_alias(:recovery), do: "recovery owner"
+  defp default_domain_alias(:monitor), do: "monitor"
+  defp default_domain_alias(:telemetry), do: "telemetry"
+  defp default_domain_alias(:research), do: "research"
+  defp default_domain_alias(:programme), do: "programme"
+  defp default_domain_alias(:acceptance), do: "acceptance"
+  defp default_domain_alias(role), do: Atom.to_string(role)
 end
