@@ -1,0 +1,7 @@
+#!/bin/sh
+set -eu
+cd "$(dirname "$0")/../elixir"
+if command -v mix >/dev/null 2>&1; then
+  exec mix run --no-start -e 'SymphonyElixir.Toscanini.ControlCLI.main(System.argv())' -- "$@"
+fi
+exec mise exec -- mix run --no-start -e 'SymphonyElixir.Toscanini.ControlCLI.main(System.argv())' -- "$@"

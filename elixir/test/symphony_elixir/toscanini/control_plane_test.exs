@@ -2,6 +2,7 @@ defmodule SymphonyElixir.Toscanini.ControlPlaneTest do
   use ExUnit.Case, async: true
 
   alias SymphonyElixir.Toscanini.ControlPlane
+  alias SymphonyElixir.Toscanini.ControlCLI
 
   test "exposes one bounded facade over existing operations" do
     capabilities = ControlPlane.capabilities()
@@ -41,5 +42,24 @@ defmodule SymphonyElixir.Toscanini.ControlPlaneTest do
 
   test "malformed envelopes are rejected before the ledger boundary" do
     assert {:error, :unsupported_version} = ControlPlane.validate_envelope(%{})
+  end
+
+  test "fixed stdio bridge echoes identity and keeps provider effects parent-owned" do
+    request = {:ok, %{"repository" => "moonshotbro/symphony", "project_id" => "p", "fence" => "f", "task_id" => "task-1", "expected_sha" => String.duplicate("a", 40)}}
+    result = ControlCLI.invoke("review_exact_head", request)
+
+    assert result["ok"] == false
+    assert result["error"] == "parent_owned_operation"
+    assert result["repository"] == "moonshotbro/symphony"
+    assert result["project_id"] == "p"
+    assert result["fence"] == "f"
+    assert result["task_id"] == "task-1"
+    assert result["head_sha"] == String.duplicate("a", 40)
+  end
+
+  test "fixed bridge rejects unknown operations" do
+    assert {:ok, _} = Jason.decode(Jason.encode!(%{"ok" => false, "error" => "operation_required"}))
+    assert "construct_task" in ControlCLI.operations()
+    refute "execute" in ControlCLI.operations()
   end
 end
