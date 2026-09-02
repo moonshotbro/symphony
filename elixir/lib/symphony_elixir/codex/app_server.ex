@@ -550,13 +550,22 @@ defmodule SymphonyElixir.Codex.AppServer do
          :ok <- verify_thread_readback(thread, workspace, session_id, contract) do
       {:ok, thread_id}
     else
-      {:ok, other} -> {:error, {:invalid_thread_readback, other}}
-      {:error, reason} -> {:error, {:project_bound_thread_unverified, reason}}
+      {:ok, %{"id" => _other_id}} -> project_bound_thread_hold(thread_id, :thread_read_id_mismatch)
+      {:ok, _other} -> project_bound_thread_hold(thread_id, :invalid_thread_readback)
+      {:error, reason} -> project_bound_thread_hold(thread_id, reason)
     end
   end
 
   defp verify_started_thread(_port, _thread, _response, _workspace, _contract),
     do: {:error, {:invalid_thread_payload, :missing_thread_id}}
+
+  defp project_bound_thread_hold(thread_id, reason) do
+    handle = %{thread_id: thread_id, verification_reason: bounded_verification_reason(reason)}
+    {:error, {:project_bound_thread_unverified, handle}}
+  end
+
+  defp bounded_verification_reason(reason) when is_atom(reason), do: reason
+  defp bounded_verification_reason(_reason), do: :verification_failed
 
   defp set_thread_name(port, thread_id, name) do
     send_message(port, %{"method" => "thread/name/set", "id" => @thread_name_set_id, "params" => %{"threadId" => thread_id, "name" => name}})
@@ -572,6 +581,7 @@ defmodule SymphonyElixir.Codex.AppServer do
     cond do
       Map.get(response, "model") != Atom.to_string(contract.executing_identity.model) -> {:error, :start_model_mismatch}
       Map.get(response, "reasoningEffort") != Atom.to_string(contract.executing_identity.effort) -> {:error, :start_effort_mismatch}
+      not instruction_sources?(response) -> {:error, :instruction_sources_missing}
       true -> verify_thread_authority(thread, workspace, nil, contract, false)
     end
   end
@@ -590,7 +600,6 @@ defmodule SymphonyElixir.Codex.AppServer do
       cwd != workspace -> {:error, :cwd_mismatch}
       Map.get(thread, "projectId") != contract.project.native_project_id -> {:error, :native_project_mismatch}
       Map.get(thread, "ephemeral") == true -> {:error, :ephemeral_thread}
-      not instruction_sources?(thread) -> {:error, :instruction_sources_missing}
       require_name and name != contract.title -> {:error, :title_mismatch}
       not is_nil(session_id) and Map.get(thread, "sessionId") != session_id -> {:error, :session_id_mismatch}
       true -> :ok

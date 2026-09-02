@@ -1610,9 +1610,9 @@ defmodule SymphonyElixir.AppServerTest do
             case "$line" in *'"model":"gpt-5.6-terra"'*) ;; *) exit 11;; esac
             case "$line" in *'"model_reasoning_effort":"medium"'*) ;; *) exit 12;; esac
             case "$line" in *'"effort"'*) exit 10;; esac
-            printf '%s\\n' '{"id":2,"result":{"model":"gpt-5.6-terra","reasoningEffort":"medium","thread":{"id":"bound-thread","sessionId":"bound-session","projectId":"01a04aab-c77c-79b0-ab09-65187353bb4b","cwd":"WORKSPACE","ephemeral":false,"instructionSources":["project"]}}}' | sed "s|WORKSPACE|$PWD|" ;;
+            printf '%s\\n' '{"id":2,"result":{"model":"gpt-5.6-terra","reasoningEffort":"medium","instructionSources":["project"],"thread":{"id":"bound-thread","sessionId":"bound-session","projectId":"01a04aab-c77c-79b0-ab09-65187353bb4b","cwd":"WORKSPACE","ephemeral":false}}}' | sed "s|WORKSPACE|$PWD|" ;;
           4) printf '%s\\n' '{"id":6,"result":{}}' ;;
-          5) printf '%s\\n' '{"id":4,"result":{"thread":{"id":"bound-thread","sessionId":"bound-session","projectId":"01a04aab-c77c-79b0-ab09-65187353bb4b","cwd":"WORKSPACE","name":"Implementation SYS-50: bound","ephemeral":false,"instructionSources":["project"]}}}' | sed "s|WORKSPACE|$PWD|" ;;
+          5) printf '%s\\n' '{"id":4,"result":{"thread":{"id":"bound-thread","sessionId":"bound-session","projectId":"01a04aab-c77c-79b0-ab09-65187353bb4b","cwd":"WORKSPACE","name":"Implementation SYS-50: bound","ephemeral":false}}}' | sed "s|WORKSPACE|$PWD|" ;;
           6) printf '%s\\n' '{"id":5,"result":{"data":[]}}' ;;
           7) printf '%s\\n' '{"id":3,"result":{"turn":{"id":"bound-turn"}}}'; printf '%s\\n' '{"method":"turn/completed"}' ;;
         esac
@@ -1650,7 +1650,7 @@ defmodule SymphonyElixir.AppServerTest do
         case "$count" in
           1) printf '%s\\n' '{"id":1,"result":{}}' ;;
           2) ;;
-          3) printf '%s\\n' '{"id":2,"result":{"model":"gpt-5.6-terra","reasoningEffort":"medium","thread":{"id":"bound-thread","sessionId":"bound-session","projectId":null,"cwd":"WORKSPACE","ephemeral":false,"instructionSources":["project"]}}}' | sed "s|WORKSPACE|$PWD|" ;;
+          3) printf '%s\\n' '{"id":2,"result":{"model":"gpt-5.6-terra","reasoningEffort":"medium","instructionSources":["project"],"thread":{"id":"bound-thread","sessionId":"bound-session","projectId":null,"cwd":"WORKSPACE","ephemeral":false}}}' | sed "s|WORKSPACE|$PWD|" ;;
           *) exit 19 ;;
         esac
       done
@@ -1666,10 +1666,24 @@ defmodule SymphonyElixir.AppServerTest do
       }
 
       issue = %Issue{id: "sys-50", identifier: "SYS-50", title: "bound", state: "In Progress"}
-      assert {:error, {:project_bound_thread_unverified, :native_project_mismatch}} = AppServer.run(workspace, "bound", issue, task_contract: contract)
+
+      expected = %{thread_id: "bound-thread", verification_reason: :native_project_mismatch}
+      assert {:error, {:project_bound_thread_unverified, ^expected}} = AppServer.run(workspace, "bound", issue, task_contract: contract)
     after
       File.rm_rf(root)
     end
+  end
+
+  test "missing top-level start instruction sources holds the created thread before follow-up RPCs" do
+    assert_instruction_sources_hold("")
+  end
+
+  test "empty top-level start instruction sources holds the created thread before follow-up RPCs" do
+    assert_instruction_sources_hold(",\"instructionSources\":[]")
+  end
+
+  test "persisted thread ID mismatch retains the created ID without starting a turn" do
+    assert_read_id_mismatch_hold()
   end
 
   test "app server launches over ssh for remote workers" do
@@ -1903,6 +1917,92 @@ defmodule SymphonyElixir.AppServerTest do
         restore_env("SYMP_TEST_REMOTE_CANONICAL_MODE", previous_mode)
         File.rm_rf(test_root)
       end
+    end
+  end
+
+  defp assert_instruction_sources_hold(sources_fragment) do
+    root = Path.join(System.tmp_dir!(), "symphony-sources-hold-#{System.unique_integer([:positive])}")
+    workspace = Path.join(root, "workspaces/SYS-50")
+    binary = Path.join(root, "fake-codex")
+    trace = Path.join(root, "trace")
+    File.mkdir_p!(workspace)
+
+    try do
+      File.write!(binary, """
+      #!/bin/sh
+      count=0
+      while IFS= read -r line; do
+        count=$((count + 1)); printf '%s\\n' "$line" >> #{trace}
+        case "$count" in
+          1) printf '%s\\n' '{"id":1,"result":{}}' ;;
+          2) ;;
+          3) printf '%s\\n' '{"id":2,"result":{"model":"gpt-5.6-terra","reasoningEffort":"medium"#{sources_fragment},"thread":{"id":"held-thread","sessionId":"held-session","projectId":"01a04aab-c77c-79b0-ab09-65187353bb4b","cwd":"WORKSPACE","ephemeral":false}}}' | sed "s|WORKSPACE|$PWD|" ;;
+          *) exit 23 ;;
+        esac
+      done
+      """)
+
+      File.chmod!(binary, 0o755)
+      write_workflow_file!(Workflow.workflow_file_path(), workspace_root: Path.join(root, "workspaces"), codex_command: "#{binary} app-server")
+
+      contract = %SymphonyElixir.Codex.TaskLaunchContract{
+        title: "Implementation SYS-50: bound",
+        executing_identity: %{model: :"gpt-5.6-terra", effort: :medium, role: :implementation, title: "Implementation SYS-50: bound"},
+        project: %{native_project_id: "01a04aab-c77c-79b0-ab09-65187353bb4b"}
+      }
+
+      issue = %Issue{id: "sys-50", identifier: "SYS-50", title: "bound", state: "In Progress"}
+
+      expected = %{thread_id: "held-thread", verification_reason: :instruction_sources_missing}
+      assert {:error, {:project_bound_thread_unverified, ^expected}} = AppServer.run(workspace, "bound", issue, task_contract: contract)
+
+      assert File.read!(trace) |> String.split("\n", trim: true) |> length() == 3
+    after
+      File.rm_rf(root)
+    end
+  end
+
+  defp assert_read_id_mismatch_hold do
+    root = Path.join(System.tmp_dir!(), "symphony-read-id-hold-#{System.unique_integer([:positive])}")
+    workspace = Path.join(root, "workspaces/SYS-50")
+    binary = Path.join(root, "fake-codex")
+    trace = Path.join(root, "trace")
+    File.mkdir_p!(workspace)
+
+    try do
+      File.write!(binary, """
+      #!/bin/sh
+      count=0
+      while IFS= read -r line; do
+        count=$((count + 1)); printf '%s\\n' "$line" >> #{trace}
+        case "$count" in
+          1) printf '%s\\n' '{"id":1,"result":{}}' ;;
+          2) ;;
+          3) printf '%s\\n' '{"id":2,"result":{"model":"gpt-5.6-terra","reasoningEffort":"medium","instructionSources":["project"],"thread":{"id":"created-A","sessionId":"session-A","projectId":"01a04aab-c77c-79b0-ab09-65187353bb4b","cwd":"WORKSPACE","ephemeral":false}}}' | sed "s|WORKSPACE|$PWD|" ;;
+          4) printf '%s\\n' '{"id":6,"result":{}}' ;;
+          5) printf '%s\\n' '{"id":4,"result":{"thread":{"id":"persisted-B","sessionId":"session-A","projectId":"01a04aab-c77c-79b0-ab09-65187353bb4b","cwd":"WORKSPACE","name":"Implementation SYS-50: bound","ephemeral":false}}}' | sed "s|WORKSPACE|$PWD|" ;;
+          6) printf '%s\\n' '{"id":5,"result":{"data":[]}}' ;;
+          *) exit 29 ;;
+        esac
+      done
+      """)
+
+      File.chmod!(binary, 0o755)
+      write_workflow_file!(Workflow.workflow_file_path(), workspace_root: Path.join(root, "workspaces"), codex_command: "#{binary} app-server")
+
+      contract = %SymphonyElixir.Codex.TaskLaunchContract{
+        title: "Implementation SYS-50: bound",
+        executing_identity: %{model: :"gpt-5.6-terra", effort: :medium, role: :implementation, title: "Implementation SYS-50: bound"},
+        project: %{native_project_id: "01a04aab-c77c-79b0-ab09-65187353bb4b"}
+      }
+
+      issue = %Issue{id: "sys-50", identifier: "SYS-50", title: "bound", state: "In Progress"}
+      expected = %{thread_id: "created-A", verification_reason: :thread_read_id_mismatch}
+      assert {:error, {:project_bound_thread_unverified, ^expected}} = AppServer.run(workspace, "bound", issue, task_contract: contract)
+      refute File.read!(trace) =~ "turn/start"
+      assert File.read!(trace) |> String.split("\n", trim: true) |> length() == 6
+    after
+      File.rm_rf(root)
     end
   end
 end
