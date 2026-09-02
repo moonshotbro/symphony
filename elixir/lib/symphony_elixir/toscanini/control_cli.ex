@@ -84,38 +84,32 @@ defmodule SymphonyElixir.Toscanini.ControlCLI do
     expected_issue = Map.get(request, "issue_identifier") || issue_identifier(request)
     expected_head = Map.get(request, "head_sha", Map.get(request, "expected_sha"))
 
-    cond do
-      contract.repository != Map.get(request, "repository") ->
-        {:error, "repository_mismatch"}
-
-      saved_project_id != expected_project ->
-        {:error, "project_id_mismatch"}
-
-      contract.fence != expected_fence ->
-        {:error, "fence_mismatch"}
-
-      contract.issue_or_pr != expected_issue ->
-        {:error, "issue_identity_mismatch"}
-
-      not is_nil(expected_head) and contract.exact_revision != expected_head ->
-        {:error, "head_mismatch"}
-
-      true ->
-        {:ok,
-         %{
-           "operation" => "construct_task",
-           "repository" => contract.repository,
-           "project_id" => saved_project_id,
-           "fence" => contract.fence,
-           "task_id" => Map.get(request, "task_id"),
-           "head_sha" => contract.exact_revision,
-           "issue_identifier" => contract.issue_or_pr,
-           "workspace_path" => Map.get(request, "workspace_path")
-         }
-         |> Enum.reject(fn {_key, value} -> is_nil(value) end)
-         |> Map.new()}
+    with :ok <- exact(contract.repository, Map.get(request, "repository"), "repository_mismatch"),
+         :ok <- exact(saved_project_id, expected_project, "project_id_mismatch"),
+         :ok <- exact(contract.fence, expected_fence, "fence_mismatch"),
+         :ok <- exact(contract.issue_or_pr, expected_issue, "issue_identity_mismatch"),
+         :ok <- optional_exact(contract.exact_revision, expected_head, "head_mismatch") do
+      {:ok,
+       %{
+         "operation" => "construct_task",
+         "repository" => contract.repository,
+         "project_id" => saved_project_id,
+         "fence" => contract.fence,
+         "task_id" => Map.get(request, "task_id"),
+         "head_sha" => contract.exact_revision,
+         "issue_identifier" => contract.issue_or_pr,
+         "workspace_path" => Map.get(request, "workspace_path")
+       }
+       |> Enum.reject(fn {_key, value} -> is_nil(value) end)
+       |> Map.new()}
     end
   end
+
+  defp exact(value, value, _error), do: :ok
+  defp exact(_actual, _expected, error), do: {:error, error}
+
+  defp optional_exact(_actual, nil, _error), do: :ok
+  defp optional_exact(actual, expected, error), do: exact(actual, expected, error)
 
   defp issue_identifier(%{"issue" => issue}) when is_integer(issue), do: "SYMPHONY-#{issue}"
   defp issue_identifier(_request), do: nil

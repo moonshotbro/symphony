@@ -1,8 +1,8 @@
 defmodule SymphonyElixir.Toscanini.ControlPlaneTest do
   use SymphonyElixir.TestSupport
 
-  alias SymphonyElixir.Toscanini.ControlPlane
   alias SymphonyElixir.Toscanini.ControlCLI
+  alias SymphonyElixir.Toscanini.ControlPlane
 
   test "exposes one bounded facade over existing operations" do
     capabilities = ControlPlane.capabilities()

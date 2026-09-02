@@ -4,9 +4,11 @@ defmodule Mix.Tasks.Toscanini.Capabilities do
 
   use Mix.Task
 
+  alias SymphonyElixir.Toscanini.ControlPlane
+
   @spec run([String.t()]) :: :ok
   def run([]) do
-    IO.puts(Jason.encode!(SymphonyElixir.Toscanini.ControlPlane.capabilities()))
+    IO.puts(Jason.encode!(ControlPlane.capabilities()))
   end
 
   def run(_args) do
