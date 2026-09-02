@@ -100,7 +100,7 @@ defmodule SymphonyElixir.Toscanini.EventContract do
            last_sequence: sequence(e),
            last_id: e.id,
            identity: state.identity || identity(e),
-           risk_assurance: state.risk_assurance || risk_assurance(e)
+           risk_assurance: risk_assurance(e) || state.risk_assurance
        }}
     end
   end
@@ -331,8 +331,8 @@ defmodule SymphonyElixir.Toscanini.EventContract do
 
     uri.scheme == "https" and uri.host == "github.com" and is_nil(uri.userinfo) and is_nil(uri.query) and is_nil(uri.fragment) and
       case String.split(uri.path || "", "/", trim: true) do
-        [owner, repo, "actions", "runs", run_id, "artifacts", artifact_id] ->
-          owner <> "/" <> repo == identity.repo and run_id =~ ~r/^\d+$/ and artifact_id =~ ~r/^\d+$/
+        [owner, repo, "actions", "runs", run_id, "artifacts"] ->
+          owner <> "/" <> repo == identity.repo and run_id =~ ~r/^\d+$/
 
         _ ->
           false
@@ -575,16 +575,18 @@ defmodule SymphonyElixir.Toscanini.EventContract do
     projection = Map.get(evidence, :risk_assurance)
 
     cond do
-      lifecycle in ["review_accepted", "landed"] and is_nil(projection) -> {:error, :missing_risk_assurance}
-      lifecycle == "review_accepted" and {projection.stage, projection.assurance_outcome} != {"review", "unresolved"} -> {:error, :risk_assurance_stage_invalid}
+      lifecycle in ["candidate_ready", "review_accepted", "landed"] and is_nil(projection) -> {:error, :missing_risk_assurance}
+      lifecycle == "candidate_ready" and {projection.stage, projection.assurance_outcome} != {"review", "unresolved"} -> {:error, :risk_assurance_stage_invalid}
+      lifecycle == "review_accepted" and {projection.stage, projection.assurance_outcome} != {"landing", "pass"} -> {:error, :risk_assurance_stage_invalid}
       lifecycle == "landed" and {projection.stage, projection.assurance_outcome} != {"landing", "pass"} -> {:error, :risk_assurance_stage_invalid}
-      (lifecycle == "landed" and state.risk_assurance) && risk_assurance_binding(projection) != risk_assurance_binding(state.risk_assurance) -> {:error, :risk_assurance_mismatch}
+      (lifecycle == "review_accepted" and state.risk_assurance) && risk_assurance_binding(projection) != risk_assurance_binding(state.risk_assurance) -> {:error, :risk_assurance_mismatch}
+      lifecycle == "landed" and projection != state.risk_assurance -> {:error, :risk_assurance_mismatch}
       true -> :ok
     end
   end
 
   defp risk_assurance(%{data: %{evidence: evidence}}), do: Map.get(evidence, :risk_assurance)
-  defp risk_assurance_binding(projection), do: Map.take(projection, [:repository, :head_sha, :risk_receipt_digest, :evidence_manifest_digest, :matrix_revision, :required_gates, :artifact_url])
+  defp risk_assurance_binding(projection), do: Map.take(projection, [:repository, :head_sha, :matrix_revision, :required_gates])
 
   defp sequential(%State{last_sequence: last}, e) do
     case sequence(e) do

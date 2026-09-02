@@ -18,7 +18,7 @@ defmodule SymphonyElixir.Toscanini.EventContractTest do
         evidence_manifest_digest: String.duplicate("d", 64),
         matrix_revision: "risk-matrix-v1",
         required_gates: ["G-EXACT-HEAD-REVIEW"],
-        artifact_url: "https://github.com/moonshotbro/symphony/actions/runs/51/artifacts/85",
+        artifact_url: "https://github.com/moonshotbro/symphony/actions/runs/51/artifacts",
         stage: "review",
         assurance_outcome: "unresolved"
       },
@@ -29,7 +29,33 @@ defmodule SymphonyElixir.Toscanini.EventContractTest do
   defp event(id, seq, name, from \\ nil) do
     causation_id = from || if(seq == 1, do: nil, else: "e#{seq - 1}")
     refs = if(name in ["cleanup_complete", "superseded", "failed", "cancelled"], do: [%{url: "https://github.com/moonshotbro/symphony/issues/51", digest: nil, kind: "issue"}], else: [])
-    projection = if(name == "review_accepted", do: risk_assurance(), else: if(name == "landed", do: risk_assurance(%{stage: "landing", assurance_outcome: "pass"}), else: nil))
+
+    projection =
+      case name do
+        "candidate_ready" ->
+          risk_assurance()
+
+        "review_accepted" ->
+          risk_assurance(%{
+            stage: "landing",
+            assurance_outcome: "pass",
+            assurance_receipt_digest: String.duplicate("e", 64),
+            evidence_manifest_digest: String.duplicate("f", 64),
+            artifact_url: "https://github.com/moonshotbro/symphony/actions/runs/52/artifacts"
+          })
+
+        "landed" ->
+          risk_assurance(%{
+            stage: "landing",
+            assurance_outcome: "pass",
+            assurance_receipt_digest: String.duplicate("e", 64),
+            evidence_manifest_digest: String.duplicate("f", 64),
+            artifact_url: "https://github.com/moonshotbro/symphony/actions/runs/52/artifacts"
+          })
+
+        _ ->
+          nil
+      end
 
     %{
       specversion: "1.0",
@@ -129,27 +155,31 @@ defmodule SymphonyElixir.Toscanini.EventContractTest do
     assert {:error, :causation_mismatch} = EventContract.transition(EventContract.initial_state(), event("e2", 2, "durable_progress"))
   end
 
-  test "binds risk assurance to the exact review and landing head" do
+  test "binds staged risk assurance to the exact review and landing head" do
+    candidate = event("e3", 3, "candidate_ready", "e2")
     accepted = event("e4", 4, "review_accepted", "e3")
     landed = event("e5", 5, "landed", "e4")
-    previous = [event("e1", 1, "task_accepted"), event("e2", 2, "durable_progress"), event("e3", 3, "candidate_ready")]
+    previous = [event("e1", 1, "task_accepted"), event("e2", 2, "durable_progress")]
 
     assert {:error, :missing_risk_assurance} =
-             EventContract.replay(previous ++ [put_in(accepted.data[:evidence], %{refs: []})])
+             EventContract.replay(previous ++ [put_in(candidate.data[:evidence], %{refs: []})])
 
     assert {:error, :malformed_data} =
-             EventContract.new(put_in(accepted.data[:evidence][:risk_assurance][:repository], "other/repository"))
+             EventContract.new(put_in(candidate.data[:evidence][:risk_assurance][:repository], "other/repository"))
 
     assert {:error, :malformed_data} =
-             EventContract.new(put_in(accepted.data[:evidence][:risk_assurance][:head_sha], String.duplicate("e", 40)))
-
-    assert {:ok, state} = EventContract.replay(previous ++ [accepted])
-
-    assert {:error, :risk_assurance_mismatch} =
-             EventContract.transition(state, put_in(landed.data[:evidence][:risk_assurance][:risk_receipt_digest], String.duplicate("f", 64)))
+             EventContract.new(put_in(candidate.data[:evidence][:risk_assurance][:head_sha], String.duplicate("e", 40)))
 
     assert {:error, :risk_assurance_stage_invalid} =
-             EventContract.transition(state, put_in(landed.data[:evidence][:risk_assurance][:assurance_outcome], "unresolved"))
+             EventContract.replay(previous ++ [put_in(candidate.data[:evidence][:risk_assurance][:assurance_outcome], "pass")])
+
+    assert {:ok, state} = EventContract.replay(previous ++ [candidate, accepted])
+
+    assert {:error, :risk_assurance_mismatch} =
+             EventContract.transition(state, put_in(landed.data[:evidence][:risk_assurance][:assurance_receipt_digest], String.duplicate("d", 64)))
+
+    assert {:error, :risk_assurance_stage_invalid} =
+             EventContract.transition(state, put_in(accepted.data[:evidence][:risk_assurance][:assurance_outcome], "unresolved"))
   end
 
   test "rejects privacy-prohibited payloads and illegal state changes" do

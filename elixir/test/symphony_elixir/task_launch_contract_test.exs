@@ -14,7 +14,7 @@ defmodule SymphonyElixir.Codex.TaskLaunchContractTest do
         evidence_manifest_digest: String.duplicate("c", 64),
         matrix_revision: "risk-matrix-v1",
         required_gates: ["G-EXACT-HEAD-REVIEW"],
-        artifact_url: "https://github.com/moonshotbro/sysmiq-symphony/actions/runs/50/artifacts/85",
+        artifact_url: "https://github.com/moonshotbro/sysmiq-symphony/actions/runs/50/artifacts",
         stage: "review",
         assurance_outcome: "unresolved"
       },

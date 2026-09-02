@@ -709,8 +709,8 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
 
     uri.scheme == "https" and uri.host == "github.com" and is_nil(uri.userinfo) and is_nil(uri.query) and is_nil(uri.fragment) and
       case String.split(uri.path || "", "/", trim: true) do
-        [owner, repo, "actions", "runs", run_id, "artifacts", artifact_id] ->
-          owner <> "/" <> repo == repository and run_id =~ ~r/^\d+$/ and artifact_id =~ ~r/^\d+$/
+        [owner, repo, "actions", "runs", run_id, "artifacts"] ->
+          owner <> "/" <> repo == repository and run_id =~ ~r/^\d+$/
 
         _ ->
           false
