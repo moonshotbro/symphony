@@ -480,7 +480,19 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
           registry.authority_revision,
           registry.work_character,
           registry.permission_envelope,
-          registry
+          registry,
+          values["execution_principal"],
+          values["reviewer_principal"],
+          values["integrator_principal"],
+          values["candidate_id"],
+          values["verdict_candidate_id"],
+          values["verdict_attempt"],
+          values["verdict_exact_revision"],
+          values["verdict_fence"],
+          values["accepted_verdict"],
+          values["receipt_identity"],
+          values["receipt_fence"],
+          values["handoff"]
         ]
         |> :erlang.term_to_binary()
 
@@ -514,7 +526,7 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
     length(keys) != length(Enum.uniq(normalized)) or
       Enum.any?(
         normalized,
-        &(&1 not in ~w(programme repository issue_or_pr role task attempt fence exact_revision write_boundary evidence model effort trigger goal_policy dependencies permissions evidence_gates stall_policy closeout_policy idempotency_identity conflict_identity commissioning_identity escalation supersedes project registry_id registry_version primary_role domain_alias authority_revision canonical_digest work_character permission_envelope execution_principal reviewer_principal integrator_principal candidate_id verdict_candidate_id verdict_attempt verdict_exact_revision accepted_verdict receipt_identity handoff))
+        &(&1 not in ~w(programme repository issue_or_pr role task attempt fence exact_revision write_boundary evidence model effort trigger goal_policy dependencies permissions evidence_gates stall_policy closeout_policy idempotency_identity conflict_identity commissioning_identity escalation supersedes project registry_id registry_version primary_role domain_alias authority_revision canonical_digest work_character permission_envelope execution_principal reviewer_principal integrator_principal candidate_id verdict_candidate_id verdict_attempt verdict_exact_revision verdict_fence accepted_verdict receipt_identity receipt_fence handoff))
       )
   end
 
@@ -700,7 +712,7 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
          project: Map.put(project, :root, workspace),
          registry_id: TaskAccountabilityRegistry.identity().registry_id,
          registry_version: TaskAccountabilityRegistry.identity().registry_version,
-         canonical_digest: "a88eb4f4d35806679e7df9dde7885ae25a1b362306a08efd187b16717cf28fc2",
+         canonical_digest: TaskAccountabilityRegistry.identity().canonical_digest,
          primary_role: Atom.to_string(role),
          domain_alias: Keyword.get(opts, :domain_alias, default_domain_alias(role)),
          authority_revision: TaskAccountabilityRegistry.identity().authority_revision,
@@ -713,8 +725,10 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
          verdict_candidate_id: Keyword.get(opts, :verdict_candidate_id),
          verdict_attempt: Keyword.get(opts, :verdict_attempt),
          verdict_exact_revision: Keyword.get(opts, :verdict_exact_revision),
+         verdict_fence: Keyword.get(opts, :verdict_fence),
          accepted_verdict: Keyword.get(opts, :accepted_verdict),
          receipt_identity: Keyword.get(opts, :receipt_identity),
+         receipt_fence: Keyword.get(opts, :receipt_fence),
          handoff: Keyword.get(opts, :handoff)
        }}
     else

@@ -122,7 +122,8 @@ defmodule SymphonyElixir.Codex.TaskAccountabilityRegistryTest do
       verdict_attempt: 0,
       fence: "fence-1",
       exact_revision: revision,
-      verdict_exact_revision: revision
+      verdict_exact_revision: revision,
+      verdict_fence: "verdict-fence-1"
     }
 
     assert {:ok, compiled} = TaskAccountabilityRegistry.compile(review)
@@ -136,13 +137,15 @@ defmodule SymphonyElixir.Codex.TaskAccountabilityRegistryTest do
         permission_envelope: ["land_bound_destination"],
         evidence: ["accepted_verdict", "destination_receipt", "clean_state"],
         integrator_principal: "integrator",
-        accepted_verdict: %{"accepted" => true, "role" => "verification_assessment"},
-        receipt_identity: "receipt-1"
+        accepted_verdict: %{"accepted" => true, "role" => "verification_assessment", "fence" => "verdict-fence-1"},
+        receipt_identity: "receipt-1",
+        receipt_fence: "verdict-fence-1"
       })
 
     assert {:ok, _} = TaskAccountabilityRegistry.compile(landing)
     assert {:error, :missing_accepted_verdict} = TaskAccountabilityRegistry.compile(Map.delete(landing, :accepted_verdict))
     assert {:error, :missing_accepted_verdict} = TaskAccountabilityRegistry.compile(Map.put(landing, :verdict_attempt, 1))
+    assert {:error, :missing_accepted_verdict} = TaskAccountabilityRegistry.compile(Map.put(landing, :verdict_fence, "replayed-fence"))
     assert {:error, :missing_accepted_verdict} = TaskAccountabilityRegistry.compile(Map.put(landing, :integrator_principal, "worker"))
   end
 
@@ -162,5 +165,55 @@ defmodule SymphonyElixir.Codex.TaskAccountabilityRegistryTest do
     assert {:error, :missing_required_evidence} = TaskAccountabilityRegistry.compile(%{base | evidence: []})
     assert {:error, :invalid_registry_authority} = TaskAccountabilityRegistry.compile(%{base | canonical_digest: "bad"})
     assert {:error, :invalid_registry_authority} = TaskAccountabilityRegistry.compile(Map.delete(base, :registry_id))
+  end
+
+  test "maps every legacy runtime role explicitly and preserves canonical profile fields" do
+    authority = %{
+      registry_id: "SYS-LIB-ROLE-REGISTRY-001",
+      registry_version: "1.0",
+      authority_revision: "7cce0ffd5a7ebb6980b6754b996b81fed108023b",
+      canonical_digest: "a88eb4f4d35806679e7df9dde7885ae25a1b362306a08efd187b16717cf28fc2"
+    }
+
+    for {legacy, alias_name, canonical, evidence} <- [
+          {"recovery", "recovery owner", "response_recovery", ["incident_timeline", "recovery_record"]},
+          {"monitor", "monitor", "verification_assessment", ["verdict", "reproduction_basis"]},
+          {"telemetry", "telemetry", "investigation_evidence", ["sources", "uncertainty"]}
+        ] do
+      identity =
+        if canonical == "verification_assessment" do
+          %{
+            handoff: "independent_review",
+            execution_principal: "worker",
+            reviewer_principal: "reviewer",
+            candidate_id: "candidate",
+            verdict_candidate_id: "candidate",
+            attempt: 0,
+            verdict_attempt: 0,
+            fence: "fence",
+            exact_revision: String.duplicate("a", 40),
+            verdict_exact_revision: String.duplicate("a", 40),
+            verdict_fence: "verdict-fence"
+          }
+        else
+          %{}
+        end
+
+      assert {:ok, compiled} =
+               TaskAccountabilityRegistry.compile(
+                 Map.merge(
+                   authority,
+                   Map.merge(identity, %{primary_role: legacy, domain_alias: alias_name, permission_envelope: TaskAccountabilityRegistry.profiles()[canonical].permissions, evidence: evidence})
+                 )
+               )
+
+      assert compiled.primary_role == canonical
+      assert is_binary(compiled.completion_predicate)
+      assert is_list(compiled.protocols)
+      assert is_list(compiled.safety_invariants)
+      assert is_list(compiled.escalation_stop_rules)
+    end
+
+    assert TaskAccountabilityRegistry.profiles()["investigation_evidence"].required_evidence == ["sources", "uncertainty"]
   end
 end
