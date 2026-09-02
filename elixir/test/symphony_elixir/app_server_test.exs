@@ -1674,6 +1674,14 @@ defmodule SymphonyElixir.AppServerTest do
     end
   end
 
+  test "missing top-level start instruction sources holds the created thread before follow-up RPCs" do
+    assert_instruction_sources_hold("")
+  end
+
+  test "empty top-level start instruction sources holds the created thread before follow-up RPCs" do
+    assert_instruction_sources_hold(",\"instructionSources\":[]")
+  end
+
   test "app server launches over ssh for remote workers" do
     test_root =
       Path.join(
@@ -1905,6 +1913,48 @@ defmodule SymphonyElixir.AppServerTest do
         restore_env("SYMP_TEST_REMOTE_CANONICAL_MODE", previous_mode)
         File.rm_rf(test_root)
       end
+    end
+  end
+
+  defp assert_instruction_sources_hold(sources_fragment) do
+    root = Path.join(System.tmp_dir!(), "symphony-sources-hold-#{System.unique_integer([:positive])}")
+    workspace = Path.join(root, "workspaces/SYS-50")
+    binary = Path.join(root, "fake-codex")
+    trace = Path.join(root, "trace")
+    File.mkdir_p!(workspace)
+
+    try do
+      File.write!(binary, """
+      #!/bin/sh
+      count=0
+      while IFS= read -r line; do
+        count=$((count + 1)); printf '%s\\n' "$line" >> #{trace}
+        case "$count" in
+          1) printf '%s\\n' '{"id":1,"result":{}}' ;;
+          2) ;;
+          3) printf '%s\\n' '{"id":2,"result":{"model":"gpt-5.6-terra","reasoningEffort":"medium"#{sources_fragment},"thread":{"id":"held-thread","sessionId":"held-session","projectId":"01a04aab-c77c-79b0-ab09-65187353bb4b","cwd":"WORKSPACE","ephemeral":false}}}' | sed "s|WORKSPACE|$PWD|" ;;
+          *) exit 23 ;;
+        esac
+      done
+      """)
+
+      File.chmod!(binary, 0o755)
+      write_workflow_file!(Workflow.workflow_file_path(), workspace_root: Path.join(root, "workspaces"), codex_command: "#{binary} app-server")
+
+      contract = %SymphonyElixir.Codex.TaskLaunchContract{
+        title: "Implementation SYS-50: bound",
+        executing_identity: %{model: :"gpt-5.6-terra", effort: :medium, role: :implementation, title: "Implementation SYS-50: bound"},
+        project: %{native_project_id: "01a04aab-c77c-79b0-ab09-65187353bb4b"}
+      }
+
+      issue = %Issue{id: "sys-50", identifier: "SYS-50", title: "bound", state: "In Progress"}
+
+      assert {:error, {:project_bound_thread_unverified, %{thread_id: "held-thread", verification_reason: :instruction_sources_missing}}} =
+               AppServer.run(workspace, "bound", issue, task_contract: contract)
+
+      assert File.read!(trace) |> String.split("\n", trim: true) |> length() == 3
+    after
+      File.rm_rf(root)
     end
   end
 end
