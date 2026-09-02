@@ -163,6 +163,112 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
   @spec project_binding_enabled?() :: boolean()
   def project_binding_enabled?, do: binding_enabled?(Config.settings!().codex.project_binding)
 
+  @doc """
+  Recompiles an already-shaped contract and compares its immutable identity.
+
+  A struct tag is not authority: callers at an effect boundary must use this
+  check before deriving provider parameters from a contract supplied by another
+  process.
+  """
+  @spec verify(t()) :: {:ok, t()} | {:error, :invalid_task_launch_contract}
+  def verify(%__MODULE__{} = contract) do
+    attrs =
+      contract
+      |> Map.from_struct()
+      |> Map.take([
+        :programme,
+        :repository,
+        :issue_or_pr,
+        :role,
+        :task,
+        :attempt,
+        :fence,
+        :exact_revision,
+        :write_boundary,
+        :evidence,
+        :model,
+        :effort,
+        :trigger,
+        :goal_policy,
+        :dependencies,
+        :permissions,
+        :evidence_gates,
+        :stall_policy,
+        :closeout_policy,
+        :idempotency_identity,
+        :conflict_identity,
+        :commissioning_identity,
+        :escalation,
+        :supersedes,
+        :project
+      ])
+      |> Map.merge(Map.take(contract.accountability || %{}, ~w(
+        registry_id registry_version primary_role domain_alias authority_revision
+        canonical_digest work_character permission_envelope execution_principal
+        reviewer_principal integrator_principal candidate_id verdict_candidate_id
+        verdict_attempt execution_fence verdict_exact_revision verdict_fence
+        accepted_verdict receipt_identity receipt_fence handoff
+      )))
+
+    with {:ok, compiled} <- compile(attrs),
+         true <-
+           compiled.contract_id == contract.contract_id and
+             compiled.executing_identity == contract.executing_identity and
+             compiled.project == contract.project do
+      {:ok, compiled}
+    else
+      _ -> {:error, :invalid_task_launch_contract}
+    end
+  end
+
+  def verify(_), do: {:error, :invalid_task_launch_contract}
+
+  @doc false
+  @spec verify_fork_binding(t(), map(), Path.t(), String.t() | nil) :: :ok | {:error, :fork_authority_mismatch}
+  def verify_fork_binding(%__MODULE__{} = contract, intent, workspace, worker_host)
+      when is_map(intent) and is_binary(workspace) do
+    source = Map.get(intent, :source, Map.get(intent, "source"))
+    target = Map.get(intent, :target, Map.get(intent, "target"))
+    host = worker_host || "local"
+
+    expected = %{
+      "task_id" => contract.task,
+      "issue_identifier" => contract.issue_or_pr,
+      "repository" => contract.repository,
+      "revision" => contract.exact_revision,
+      "native_project_id" => contract.project.native_project_id,
+      "fence" => contract.fence,
+      "attempt" => Integer.to_string(contract.attempt),
+      "contract_id" => contract.contract_id,
+      "title" => contract.title,
+      "workspace_path" => workspace,
+      "worker_host" => host
+    }
+
+    if is_map(source) and is_map(target) and is_binary(Map.get(source, :issue_id, Map.get(source, "issue_id"))) and
+         Enum.all?(expected, fn {key, value} -> source_value(source, key) == value end) and
+         Map.get(target, :worker_host, Map.get(target, "worker_host")) == host do
+      :ok
+    else
+      {:error, :fork_authority_mismatch}
+    end
+  end
+
+  def verify_fork_binding(_, _, _, _), do: {:error, :fork_authority_mismatch}
+
+  defp source_value(source, key), do: Map.get(source, key, Map.get(source, source_key_atom(key)))
+  defp source_key_atom("task_id"), do: :task_id
+  defp source_key_atom("issue_identifier"), do: :issue_identifier
+  defp source_key_atom("repository"), do: :repository
+  defp source_key_atom("revision"), do: :revision
+  defp source_key_atom("native_project_id"), do: :native_project_id
+  defp source_key_atom("fence"), do: :fence
+  defp source_key_atom("attempt"), do: :attempt
+  defp source_key_atom("contract_id"), do: :contract_id
+  defp source_key_atom("title"), do: :title
+  defp source_key_atom("workspace_path"), do: :workspace_path
+  defp source_key_atom("worker_host"), do: :worker_host
+
   @doc "Builds the only production contract source: workflow binding plus issue and workspace authority."
   def from_runtime(issue, workspace, opts \\ [])
 

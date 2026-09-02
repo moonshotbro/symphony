@@ -87,6 +87,8 @@ defmodule SymphonyElixir.Codex.TaskLaunchContractTest do
     assert first.contract_id == second.contract_id
     assert first.title == "Implementation SYS-50: define contract"
     assert first.project.saved_project_id == "b12752f9-9a65-4194-bc49-77808b21d767"
+    assert {:ok, ^first} = TaskLaunchContract.verify(first)
+    assert {:error, :invalid_task_launch_contract} = TaskLaunchContract.verify(%TaskLaunchContract{project: %{native_project_id: "forged"}})
   end
 
   test "rejects missing or mismatched project namespaces" do

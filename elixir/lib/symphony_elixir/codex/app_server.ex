@@ -10,6 +10,7 @@ defmodule SymphonyElixir.Codex.AppServer do
   @thread_start_id 2
   @turn_start_id 3
   @thread_read_id 4
+  @thread_fork_id 7
   @thread_name_set_id 6
   @thread_turns_list_id 5
   @thread_turns_page_size 100
@@ -100,6 +101,35 @@ defmodule SymphonyElixir.Codex.AppServer do
         end
       else
         {:error, _reason} = error -> error
+      end
+    else
+      {:error, :thread_id_invalid}
+    end
+  end
+
+  @doc """
+  Creates a persisted child of a persisted Codex thread through the native App
+  Server protocol.  This is deliberately a narrow provider primitive: callers
+  must place it behind their own durable intent/effect boundary.
+  """
+  @spec fork_thread(String.t(), Path.t(), keyword()) :: {:ok, map()} | {:error, term()}
+  def fork_thread(thread_id, workspace, opts \\ []) do
+    if is_binary(thread_id) and is_binary(workspace) and String.trim(thread_id) != "" do
+      worker_host = Keyword.get(opts, :worker_host)
+      dynamic_tool_binding = DynamicTool.bind()
+
+      with {:ok, contract} <- validate_launch_contract(Keyword.get(opts, :task_contract), workspace),
+           {:ok, expanded_workspace} <- validate_workspace_cwd(workspace, worker_host),
+           {:ok, port} <- start_port(expanded_workspace, worker_host, dynamic_tool_binding) do
+        try do
+          with :ok <- send_initialize(port),
+               {:ok, %{"id" => ^thread_id} = source} <- read_thread_from_port(port, thread_id),
+               :ok <- verify_thread_authority(source, expanded_workspace, nil, contract, false) do
+            fork_thread_from_port(port, thread_id, expanded_workspace, contract)
+          end
+        after
+          stop_port(port)
+        end
       end
     else
       {:error, :thread_id_invalid}
@@ -506,7 +536,8 @@ defmodule SymphonyElixir.Codex.AppServer do
       else: {:ok, nil}
   end
 
-  defp validate_launch_contract(%TaskLaunchContract{} = contract, _workspace), do: {:ok, contract}
+  defp validate_launch_contract(%TaskLaunchContract{} = contract, _workspace),
+    do: TaskLaunchContract.verify(contract)
 
   defp validate_launch_contract(contract, workspace) when is_map(contract) do
     if TaskLaunchContract.project_binding_enabled?() or workspace_repository?(workspace) do
@@ -595,15 +626,33 @@ defmodule SymphonyElixir.Codex.AppServer do
   defp verify_thread_authority(thread, workspace, session_id, contract, require_name) do
     cwd = Map.get(thread, "cwd") || Map.get(thread, "workingDirectory")
     name = Map.get(thread, "name") || Map.get(thread, "title")
+    git_info = Map.get(thread, "gitInfo")
 
     cond do
       cwd != workspace -> {:error, :cwd_mismatch}
       Map.get(thread, "projectId") != contract.project.native_project_id -> {:error, :native_project_mismatch}
-      Map.get(thread, "ephemeral") == true -> {:error, :ephemeral_thread}
+      Map.get(thread, "ephemeral") != false -> {:error, :thread_persistence_unverified}
+      not valid_session_id?(Map.get(thread, "sessionId")) -> {:error, :session_id_missing}
+      not exact_git_identity?(git_info, contract) -> {:error, :thread_revision_or_repository_mismatch}
       require_name and name != contract.title -> {:error, :title_mismatch}
       not is_nil(session_id) and Map.get(thread, "sessionId") != session_id -> {:error, :session_id_mismatch}
       true -> :ok
     end
+  end
+
+  defp valid_session_id?(value), do: is_binary(value) and String.trim(value) != ""
+
+  defp exact_git_identity?(%{"sha" => sha, "originUrl" => origin}, contract)
+       when is_binary(sha) and is_binary(origin),
+       do: sha == contract.exact_revision and repository_name(origin) == contract.repository
+
+  defp exact_git_identity?(_, _contract), do: false
+
+  defp repository_name(remote) do
+    remote
+    |> String.replace(~r/^git@[^:]+:/, "")
+    |> String.replace(~r|^https?://[^/]+/|, "")
+    |> String.replace_suffix(".git", "")
   end
 
   defp thread_session_id(%{"sessionId" => session_id}) when is_binary(session_id) and session_id != "", do: {:ok, session_id}
@@ -666,6 +715,40 @@ defmodule SymphonyElixir.Codex.AppServer do
         {:error, {:thread_read_failed, reason}}
     end
   end
+
+  defp fork_thread_from_port(port, thread_id, workspace, contract) do
+    send_message(port, %{
+      "method" => "thread/fork",
+      "id" => @thread_fork_id,
+      "params" => %{"threadId" => thread_id, "excludeTurns" => true}
+    })
+
+    case await_response(port, @thread_fork_id) do
+      {:ok, %{"thread" => %{"id" => child_id, "forkedFromId" => ^thread_id} = child}}
+      when is_binary(child_id) and child_id != "" ->
+        with :ok <- verify_thread_authority(child, workspace, nil, contract, false),
+             {:ok, %{"id" => ^child_id, "forkedFromId" => ^thread_id} = persisted} <- read_thread_from_port(port, child_id),
+             :ok <- verify_thread_authority(persisted, workspace, nil, contract, false),
+             :ok <- verify_fork_correlation(child, persisted) do
+          {:ok, %{id: child_id, forked_from_id: thread_id, correlation_id: Map.get(persisted, "sessionId")}}
+        end
+
+      {:ok, response} ->
+        {:error, {:provider_fork_response_invalid, response}}
+
+      {:error, {:response_error, %{"code" => -32_600, "message" => message}}}
+      when is_binary(message) ->
+        {:error, {:provider_rejected, message}}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp verify_fork_correlation(%{"sessionId" => session_id}, %{"sessionId" => persisted_session_id})
+       when is_binary(session_id) and session_id != "" and session_id == persisted_session_id, do: :ok
+
+  defp verify_fork_correlation(_, _), do: {:error, :fork_correlation_mismatch}
 
   defp read_thread_turns(port, thread_id), do: read_thread_turns(port, thread_id, nil, [], 0)
 

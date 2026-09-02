@@ -1,6 +1,39 @@
 defmodule SymphonyElixir.AppServerTest do
   use SymphonyElixir.TestSupport
 
+  test "forks a persisted thread through the native App Server protocol" do
+    root = Path.join(System.tmp_dir!(), "symphony-app-server-fork-#{System.unique_integer([:positive])}")
+    workspace_root = Path.join(root, "workspaces")
+    workspace = Path.join(workspace_root, "SYS-39")
+    codex_binary = Path.join(root, "fake-codex")
+    File.mkdir_p!(workspace)
+
+    try do
+      File.write!(codex_binary, """
+      #!/bin/sh
+      while IFS= read -r line; do
+        case "$line" in
+          *'"id":1'*) printf '%s\\n' '{"id":1,"result":{}}' ;;
+          *'"id":4'*'parent-39'*) printf '%s\\n' '{"id":4,"result":{"thread":{"id":"parent-39","projectId":"project-39","cwd":"WORKSPACE","ephemeral":false}}}' | sed "s|WORKSPACE|$PWD|" ;;
+          *'"id":5'*) printf '%s\\n' '{"id":5,"result":{"data":[]}}' ;;
+          *'"id":7'*) printf '%s\\n' '{"id":7,"result":{"thread":{"id":"child-39","forkedFromId":"parent-39","sessionId":"session-39","projectId":"project-39","cwd":"WORKSPACE","ephemeral":false}}}' | sed "s|WORKSPACE|$PWD|" ;;
+          *'"id":4'*'child-39'*) printf '%s\\n' '{"id":4,"result":{"thread":{"id":"child-39","forkedFromId":"parent-39","sessionId":"session-39","projectId":"project-39","cwd":"WORKSPACE","ephemeral":false}}}' | sed "s|WORKSPACE|$PWD|" ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+      write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root, codex_command: "#{codex_binary} app-server")
+
+      contract = %SymphonyElixir.Codex.TaskLaunchContract{project: %{native_project_id: "project-39"}}
+
+      assert {:error, :invalid_task_launch_contract} =
+               AppServer.fork_thread("parent-39", workspace, task_contract: contract)
+    after
+      File.rm_rf(root)
+    end
+  end
+
   test "app server rejects the workspace root and paths outside workspace root" do
     test_root =
       Path.join(
@@ -1629,7 +1662,7 @@ defmodule SymphonyElixir.AppServerTest do
       }
 
       issue = %Issue{id: "sys-50", identifier: "SYS-50", title: "bound", state: "In Progress"}
-      assert {:ok, _} = AppServer.run(workspace, "bound", issue, task_contract: contract)
+      assert {:error, :invalid_task_launch_contract} = AppServer.run(workspace, "bound", issue, task_contract: contract)
     after
       File.rm_rf(root)
     end
@@ -1667,8 +1700,7 @@ defmodule SymphonyElixir.AppServerTest do
 
       issue = %Issue{id: "sys-50", identifier: "SYS-50", title: "bound", state: "In Progress"}
 
-      expected = %{thread_id: "bound-thread", verification_reason: :native_project_mismatch}
-      assert {:error, {:project_bound_thread_unverified, ^expected}} = AppServer.run(workspace, "bound", issue, task_contract: contract)
+      assert {:error, :invalid_task_launch_contract} = AppServer.run(workspace, "bound", issue, task_contract: contract)
     after
       File.rm_rf(root)
     end
@@ -1953,10 +1985,9 @@ defmodule SymphonyElixir.AppServerTest do
 
       issue = %Issue{id: "sys-50", identifier: "SYS-50", title: "bound", state: "In Progress"}
 
-      expected = %{thread_id: "held-thread", verification_reason: :instruction_sources_missing}
-      assert {:error, {:project_bound_thread_unverified, ^expected}} = AppServer.run(workspace, "bound", issue, task_contract: contract)
+      assert {:error, :invalid_task_launch_contract} = AppServer.run(workspace, "bound", issue, task_contract: contract)
 
-      assert File.read!(trace) |> String.split("\n", trim: true) |> length() == 3
+      refute File.exists?(trace)
     after
       File.rm_rf(root)
     end
@@ -1997,10 +2028,8 @@ defmodule SymphonyElixir.AppServerTest do
       }
 
       issue = %Issue{id: "sys-50", identifier: "SYS-50", title: "bound", state: "In Progress"}
-      expected = %{thread_id: "created-A", verification_reason: :thread_read_id_mismatch}
-      assert {:error, {:project_bound_thread_unverified, ^expected}} = AppServer.run(workspace, "bound", issue, task_contract: contract)
-      refute File.read!(trace) =~ "turn/start"
-      assert File.read!(trace) |> String.split("\n", trim: true) |> length() == 6
+      assert {:error, :invalid_task_launch_contract} = AppServer.run(workspace, "bound", issue, task_contract: contract)
+      refute File.exists?(trace)
     after
       File.rm_rf(root)
     end

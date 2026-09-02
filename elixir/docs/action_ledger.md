@@ -104,8 +104,15 @@ initial ledger write fails, the issue remains blocked and no retry is scheduled.
 - every transition emits `[:symphony, :action_ledger, :transition]` with action, state, issue/task/
   session correlation, checkpoint hash, policy fingerprint, and blocker tokens only.
 
-Task messaging, automation, fork, and handoff share the typed envelope and adapter boundary, but
-their live effect adapters are deliberately outside this first phase. The GitHub adapter provides
+`Codex.CoordinationEffects` is the typed native boundary for these operations. It records the
+fence, attempt, and correlation identifiers as bounded identity facts before calling a provider.
+Only stored-thread fork is currently admitted; its provider must return the exact source and child
+thread IDs, and a lost response remains `uncertain` until a read-only child inspection reconciles
+it. Task messaging, automation, and handoff are persisted as typed preflight rejections because
+the installed desktop-host capability has not been identity-bound to Symphony. No request body,
+prompt, tool arguments, host pipe metadata, or provider payload is admitted to the ledger.
+
+The GitHub adapter provides
 the first live mutation boundary as `github_merge`; its review source, reviewer, exact check list,
 and derived fingerprint are persisted as bounded source metadata without prompts, credentials, or
 review body content.
