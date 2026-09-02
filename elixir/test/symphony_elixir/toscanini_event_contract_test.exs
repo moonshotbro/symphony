@@ -17,7 +17,7 @@ defmodule SymphonyElixir.Toscanini.EventContractTest do
         assurance_receipt_digest: String.duplicate("c", 64),
         evidence_manifest_digest: String.duplicate("d", 64),
         matrix_revision: "risk-matrix-v1",
-        required_gates: ["G-EXACT-HEAD-REVIEW"],
+        required_gate_ids: ["G-EXACT-HEAD-REVIEW"],
         artifact_url: "https://github.com/moonshotbro/symphony/actions/runs/51/artifacts",
         stage: "review",
         assurance_outcome: "unresolved"

@@ -17,7 +17,7 @@ defmodule SymphonyElixir.Toscanini.EventContract do
     identity: ~w(programme repo issue pr role task attempt fence idempotency exact_revision registry_id registry_version canonical_digest authority_revision primary_role domain_alias work_character),
     lifecycle: ~w(state terminal_reason blocking_reason requested_action),
     evidence: ~w(refs risk_assurance),
-    risk_assurance: ~w(schema repository head_sha risk_receipt_digest assurance_receipt_digest evidence_manifest_digest matrix_revision required_gates artifact_url stage assurance_outcome),
+    risk_assurance: ~w(schema repository head_sha risk_receipt_digest assurance_receipt_digest evidence_manifest_digest matrix_revision required_gate_ids artifact_url stage assurance_outcome),
     ref: ~w(url digest kind),
     delivery: ~w(idempotency_key sequence),
     recovery:
@@ -314,14 +314,14 @@ defmodule SymphonyElixir.Toscanini.EventContract do
     schema?(projection, @schemas.risk_assurance) and projection.schema == "sysmiq.symphony.risk-assurance.v1" and
       projection.repository == identity.repo and repo?(projection.repository) and sha?(projection.head_sha) and projection.head_sha == identity.exact_revision and
       receipt_digest?(projection.risk_receipt_digest) and receipt_digest?(projection.assurance_receipt_digest) and receipt_digest?(projection.evidence_manifest_digest) and
-      matrix_revision?(projection.matrix_revision) and required_gates?(projection.required_gates) and artifact_url?(projection.artifact_url, identity) and
+      matrix_revision?(projection.matrix_revision) and required_gate_ids?(projection.required_gate_ids) and artifact_url?(projection.artifact_url, identity) and
       projection.stage in ["review", "landing"] and projection.assurance_outcome in ["unresolved", "pass"]
   end
 
   defp risk_assurance?(_, _), do: false
 
-  defp required_gates?(gates) when is_list(gates) and gates != [] and length(gates) <= @limits.list, do: Enum.all?(gates, &identifier?/1)
-  defp required_gates?(_), do: false
+  defp required_gate_ids?(gates) when is_list(gates) and gates != [] and length(gates) <= @limits.list, do: Enum.all?(gates, &identifier?/1)
+  defp required_gate_ids?(_), do: false
   defp matrix_revision?(revision), do: is_binary(revision) and byte_size(revision) in 1..128
   defp sha?(value), do: is_binary(value) and value =~ ~r/^[0-9a-f]{40}$/
   defp receipt_digest?(value), do: is_binary(value) and value =~ ~r/^[0-9a-f]{64}$/
@@ -586,7 +586,7 @@ defmodule SymphonyElixir.Toscanini.EventContract do
   end
 
   defp risk_assurance(%{data: %{evidence: evidence}}), do: Map.get(evidence, :risk_assurance)
-  defp risk_assurance_binding(projection), do: Map.take(projection, [:repository, :head_sha, :matrix_revision, :required_gates])
+  defp risk_assurance_binding(projection), do: Map.take(projection, [:repository, :head_sha, :matrix_revision, :required_gate_ids])
 
   defp sequential(%State{last_sequence: last}, e) do
     case sequence(e) do

@@ -690,10 +690,10 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
 
   defp valid_risk_assurance?(projection, repository, head, role) when is_map(projection) and role in [:independent_review, :landing] do
     Map.keys(projection) |> Enum.sort() ==
-      ~w(artifact_url assurance_outcome assurance_receipt_digest evidence_manifest_digest head_sha matrix_revision repository required_gates risk_receipt_digest schema stage) and
+      ~w(artifact_url assurance_outcome assurance_receipt_digest evidence_manifest_digest head_sha matrix_revision repository required_gate_ids risk_receipt_digest schema stage) and
       projection["schema"] == "sysmiq.symphony.risk-assurance.v1" and projection["repository"] == repository and
       projection["head_sha"] == head and receipt_digest?(projection["risk_receipt_digest"]) and receipt_digest?(projection["assurance_receipt_digest"]) and
-      receipt_digest?(projection["evidence_manifest_digest"]) and nonblank_string?(projection["matrix_revision"]) and valid_required_gates?(projection["required_gates"]) and
+      receipt_digest?(projection["evidence_manifest_digest"]) and nonblank_string?(projection["matrix_revision"]) and valid_required_gate_ids?(projection["required_gate_ids"]) and
       artifact_url?(projection["artifact_url"], repository, head) and valid_risk_assurance_stage?(projection, role)
   end
 
@@ -702,7 +702,7 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
   defp valid_risk_assurance_stage?(%{"stage" => "landing", "assurance_outcome" => "pass"}, :landing), do: true
   defp valid_risk_assurance_stage?(_, _), do: false
   defp receipt_digest?(value), do: is_binary(value) and Regex.match?(~r/^[0-9a-f]{64}$/, value)
-  defp valid_required_gates?(value), do: is_list(value) and value != [] and length(value) <= 32 and Enum.all?(value, &(is_binary(&1) and Regex.match?(~r/^[A-Za-z][A-Za-z0-9_.:-]{0,127}$/, &1)))
+  defp valid_required_gate_ids?(value), do: is_list(value) and value != [] and length(value) <= 32 and Enum.all?(value, &(is_binary(&1) and Regex.match?(~r/^[A-Za-z][A-Za-z0-9_.:-]{0,127}$/, &1)))
 
   defp artifact_url?(url, repository, _head) when is_binary(url) do
     uri = URI.parse(url)
