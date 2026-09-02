@@ -4,7 +4,15 @@ defmodule SymphonyElixir.Codex.AppServer do
   """
 
   require Logger
-  alias SymphonyElixir.{Codex.DynamicTool, Codex.TaskLaunchContract, Config, PathSafety, SSH}
+
+  alias SymphonyElixir.{
+    Codex.DynamicTool,
+    Codex.ProviderCapacityRecovery,
+    Codex.TaskLaunchContract,
+    Config,
+    PathSafety,
+    SSH
+  }
 
   @initialize_id 1
   @thread_start_id 2
@@ -771,7 +779,10 @@ defmodule SymphonyElixir.Codex.AppServer do
           Map.get(payload, "params")
         )
 
-        {:error, {:turn_failed, Map.get(payload, "params")}}
+        params = Map.get(payload, "params")
+        failure_class = ProviderCapacityRecovery.classify(params)
+
+        {:error, {:turn_failed, %{failure_class: failure_class, response_started: false, params: params}}}
 
       {:ok, %{"method" => "turn/cancelled", "params" => _} = payload} ->
         emit_turn_event(

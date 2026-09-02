@@ -13,6 +13,8 @@ defmodule SymphonyElixir.Codex.ProviderCapacityRecovery do
   @efforts [:low, :medium, :high, :xhigh, :max, :ultra]
   @capacity_markers ["server_overloaded", "server overloaded"]
   @max_payload_depth 12
+  @model_names %{"gpt-5.6-sol" => :"gpt-5.6-sol", "gpt-5.6-terra" => :"gpt-5.6-terra", "gpt-5.6-luna" => :"gpt-5.6-luna"}
+  @effort_names %{"low" => :low, "medium" => :medium, "high" => :high, "xhigh" => :xhigh, "max" => :max, "ultra" => :ultra}
 
   @type model :: :"gpt-5.6-sol" | :"gpt-5.6-terra" | :"gpt-5.6-luna"
   @type effort :: :low | :medium | :high | :xhigh | :max | :ultra
@@ -83,7 +85,7 @@ defmodule SymphonyElixir.Codex.ProviderCapacityRecovery do
   end
 
   @spec delay_ms(non_neg_integer(), non_neg_integer(), float(), (-> float())) :: non_neg_integer()
-  def delay_ms(attempt, base_ms, jitter_ratio, random \\ &:rand.uniform/0)
+  def delay_ms(attempt, base_ms, jitter_ratio, random \\ fn -> 0.5 end)
       when is_integer(attempt) and attempt >= 0 and is_integer(base_ms) and base_ms >= 0 and
              is_float(jitter_ratio) and jitter_ratio >= 0.0 and is_function(random, 0) do
     exponential = base_ms * Integer.pow(2, min(attempt, 30))
@@ -173,14 +175,20 @@ defmodule SymphonyElixir.Codex.ProviderCapacityRecovery do
   defp normalize_model(model) when model in @models, do: {:ok, model}
 
   defp normalize_model(model) when is_binary(model) do
-    model |> String.trim() |> String.to_atom() |> normalize_model()
+    case Map.get(@model_names, String.trim(model)) do
+      nil -> {:error, :unsupported_route}
+      model -> {:ok, model}
+    end
   end
 
   defp normalize_model(_), do: {:error, :unsupported_route}
 
   defp normalize_effort(effort) when effort in @efforts, do: {:ok, effort}
-  defp normalize_effort(effort) when is_binary(effort), do: normalize_effort(String.to_atom(String.trim(effort)))
+  defp normalize_effort(effort) when is_binary(effort), do: Map.get(@effort_names, String.trim(effort), {:error, :unsupported_route}) |> normalize_effort_result()
   defp normalize_effort(_), do: {:error, :unsupported_route}
+
+  defp normalize_effort_result(effort) when effort in @efforts, do: {:ok, effort}
+  defp normalize_effort_result(_), do: {:error, :unsupported_route}
 
   defp payload_values(_payload, depth) when depth > @max_payload_depth, do: []
 
