@@ -10,13 +10,14 @@ defmodule SymphonyElixir.Orchestrator do
   alias SymphonyElixir.{
     ActionLedger,
     AgentRunner,
-    Codex.RecoveryInspector,
     Config,
     CoordinationAdapter,
     StatusDashboard,
     Tracker,
     Workspace
   }
+
+  alias SymphonyElixir.Codex.{AppServer, CoordinationEffects, RecoveryInspector}
 
   alias SymphonyElixir.Tracker.Issue
 
@@ -64,6 +65,17 @@ defmodule SymphonyElixir.Orchestrator do
     GenServer.start_link(__MODULE__, opts, name: name)
   end
 
+  @doc """
+  Coordinates one native persisted-thread fork through the orchestrator's
+  durable action ledger. Desktop-only coordination families have no alternate
+  path here; their typed rejection is owned by `CoordinationEffects`.
+  """
+  @spec fork_thread(GenServer.server(), ActionLedger.intent(), Path.t(), keyword()) ::
+          CoordinationAdapter.dispatch_result(map())
+  def fork_thread(server \\ __MODULE__, intent, workspace, opts \\ []) do
+    GenServer.call(server, {:fork_thread, intent, workspace, opts})
+  end
+
   @impl true
   def init(opts) do
     case Config.settings() do
@@ -99,6 +111,13 @@ defmodule SymphonyElixir.Orchestrator do
         {:stop, reason}
     end
   end
+
+  defp normalize_fork_read({:ok, %{"id" => id, "forkedFromId" => source_id}})
+       when is_binary(id) and is_binary(source_id),
+       do: {:ok, %{id: id, forked_from_id: source_id}}
+
+  defp normalize_fork_read({:ok, _thread}), do: {:error, :fork_read_invalid}
+  defp normalize_fork_read({:error, reason}), do: {:error, reason}
 
   @impl true
   def handle_info({:tick, tick_token}, %{tick_token: tick_token} = state)
@@ -1562,6 +1581,23 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   @impl true
+  def handle_call({:fork_thread, intent, workspace, opts}, _from, state)
+      when is_map(intent) and is_binary(workspace) and is_list(opts) do
+    worker_host = Keyword.get(opts, :worker_host)
+
+    provider = %{
+      fork: fn thread_id -> AppServer.fork_thread(thread_id, workspace, worker_host: worker_host) end,
+      inspect_fork: fn thread_id ->
+        AppServer.read_thread(thread_id, workspace, worker_host: worker_host) |> normalize_fork_read()
+      end
+    }
+
+    {:reply, CoordinationEffects.dispatch(state.action_ledger, intent, :fork, provider), state}
+  end
+
+  def handle_call({:fork_thread, _intent, _workspace, _opts}, _from, state),
+    do: {:reply, {:error, :fork_request_invalid}, state}
+
   def handle_call({:resume_goal, action_id_or_issue_id, condition}, _from, state) do
     case find_goal_action(state, action_id_or_issue_id) do
       {issue_id, action_id} when is_binary(issue_id) and is_binary(action_id) ->

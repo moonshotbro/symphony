@@ -1,6 +1,34 @@
 defmodule SymphonyElixir.AppServerTest do
   use SymphonyElixir.TestSupport
 
+  test "forks a persisted thread through the native App Server protocol" do
+    root = Path.join(System.tmp_dir!(), "symphony-app-server-fork-#{System.unique_integer([:positive])}")
+    workspace_root = Path.join(root, "workspaces")
+    workspace = Path.join(workspace_root, "SYS-39")
+    codex_binary = Path.join(root, "fake-codex")
+    File.mkdir_p!(workspace)
+
+    try do
+      File.write!(codex_binary, """
+      #!/bin/sh
+      while IFS= read -r line; do
+        case "$line" in
+          *'"id":1'*) printf '%s\\n' '{"id":1,"result":{}}' ;;
+          *'"id":7'*) printf '%s\\n' '{"id":7,"result":{"thread":{"id":"child-39","forkedFromId":"parent-39","sessionId":"session-39"}}}'; exit 0 ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+      write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root, codex_command: "#{codex_binary} app-server")
+
+      assert {:ok, %{id: "child-39", forked_from_id: "parent-39", correlation_id: "session-39"}} =
+               AppServer.fork_thread("parent-39", workspace)
+    after
+      File.rm_rf(root)
+    end
+  end
+
   test "app server rejects the workspace root and paths outside workspace root" do
     test_root =
       Path.join(

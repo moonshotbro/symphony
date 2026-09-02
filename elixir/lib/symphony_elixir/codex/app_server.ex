@@ -10,6 +10,7 @@ defmodule SymphonyElixir.Codex.AppServer do
   @thread_start_id 2
   @turn_start_id 3
   @thread_read_id 4
+  @thread_fork_id 7
   @thread_name_set_id 6
   @thread_turns_list_id 5
   @thread_turns_page_size 100
@@ -100,6 +101,32 @@ defmodule SymphonyElixir.Codex.AppServer do
         end
       else
         {:error, _reason} = error -> error
+      end
+    else
+      {:error, :thread_id_invalid}
+    end
+  end
+
+  @doc """
+  Creates a persisted child of a persisted Codex thread through the native App
+  Server protocol.  This is deliberately a narrow provider primitive: callers
+  must place it behind their own durable intent/effect boundary.
+  """
+  @spec fork_thread(String.t(), Path.t(), keyword()) :: {:ok, map()} | {:error, term()}
+  def fork_thread(thread_id, workspace, opts \\ []) do
+    if is_binary(thread_id) and is_binary(workspace) and String.trim(thread_id) != "" do
+      worker_host = Keyword.get(opts, :worker_host)
+      dynamic_tool_binding = DynamicTool.bind()
+
+      with {:ok, expanded_workspace} <- validate_workspace_cwd(workspace, worker_host),
+           {:ok, port} <- start_port(expanded_workspace, worker_host, dynamic_tool_binding) do
+        try do
+          with :ok <- send_initialize(port) do
+            fork_thread_from_port(port, thread_id)
+          end
+        after
+          stop_port(port)
+        end
       end
     else
       {:error, :thread_id_invalid}
@@ -664,6 +691,35 @@ defmodule SymphonyElixir.Codex.AppServer do
 
       {:error, reason} ->
         {:error, {:thread_read_failed, reason}}
+    end
+  end
+
+  defp fork_thread_from_port(port, thread_id) do
+    send_message(port, %{
+      "method" => "thread/fork",
+      "id" => @thread_fork_id,
+      "params" => %{"threadId" => thread_id, "excludeTurns" => true}
+    })
+
+    case await_response(port, @thread_fork_id) do
+      {:ok, %{"thread" => %{"id" => child_id, "forkedFromId" => ^thread_id} = child}}
+      when is_binary(child_id) and child_id != "" ->
+        {:ok,
+         %{
+           id: child_id,
+           forked_from_id: thread_id,
+           correlation_id: Map.get(child, "sessionId")
+         }}
+
+      {:ok, response} ->
+        {:error, {:provider_fork_response_invalid, response}}
+
+      {:error, {:response_error, %{"code" => -32_600, "message" => message}}}
+      when is_binary(message) ->
+        {:error, {:provider_rejected, message}}
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 
