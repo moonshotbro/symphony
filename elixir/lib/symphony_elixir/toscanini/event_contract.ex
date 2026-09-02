@@ -5,7 +5,7 @@ defmodule SymphonyElixir.Toscanini.EventContract do
   @version "1.1.0"
   @states ~w(discovered assessed ready claimed dispatched running progress candidate_ready review_pending rework_requested landing cleanup_pending complete superseded attention recovery_pending blocked failed cancelled archived dead_letter)
   @events ~w(task_accepted durable_progress candidate_ready review_accepted review_rejected rework_requested landed cleanup_complete superseded resume attention blocked needs_judgment failed cancelled)
-  @commands ~w(start steer request_candidate repair_findings review_exact_head resume supersede stop)
+  @commands ~w(start steer request_candidate repair_findings review_exact_head resume supersede stop dispatch_requested)
   @terminal_events ~w(cleanup_complete superseded failed cancelled)
   @top ~w(specversion id source type subject time datacontenttype dataschema correlation_id causation_id data)
   @data ~w(envelope_version kind message_id correlation_id causation_id sender recipient authority_ref identity lifecycle evidence delivery recovery privacy)
@@ -324,7 +324,7 @@ defmodule SymphonyElixir.Toscanini.EventContract do
 
   defp identity?(i) when is_map(i),
     do:
-      schema?(i, @schemas.identity) and binary?(i.programme) and repo?(i.repo) and positive?(i.issue) and nullable_positive?(i.pr) and
+      schema?(i, @schemas.identity) and identifier?(i.programme) and repo?(i.repo) and positive?(i.issue) and nullable_positive?(i.pr) and
         i.role == i.primary_role and i.primary_role in TaskAccountabilityRegistry.roles() and identifier?(i.task) and is_integer(i.attempt) and
         i.attempt >= 0 and is_integer(i.fence) and i.fence >= 0 and binary?(i.idempotency) and digest?(i.exact_revision) and registry_identity?(i)
 
@@ -334,18 +334,11 @@ defmodule SymphonyElixir.Toscanini.EventContract do
     registry = TaskAccountabilityRegistry.identity()
 
     identity.registry_id == registry.registry_id and identity.registry_version == registry.registry_version and identity.canonical_digest == registry.canonical_digest and
-      identity.authority_revision == registry.authority_revision and canonical_alias?(identity.primary_role, identity.domain_alias) and
+      identity.authority_revision == registry.authority_revision and TaskAccountabilityRegistry.canonical_alias?(identity.primary_role, identity.domain_alias) and
       identity.work_character in ["bounded", "recovery", "review", "landing"]
   end
 
-  defp canonical_alias?("execution_production", alias_name), do: alias_name in ["implementation worker", "production worker", "document operations"]
-  defp canonical_alias?("verification_assessment", alias_name), do: alias_name in ["independent review", "exact-head reviewer", "monitor"]
-  defp canonical_alias?("integration_closeout", alias_name), do: alias_name in ["landing", "landing owner"]
-  defp canonical_alias?("response_recovery", alias_name), do: alias_name == "recovery owner"
-  defp canonical_alias?("investigation_evidence", alias_name), do: alias_name in ["research", "telemetry"]
-  defp canonical_alias?(role, alias_name), do: is_binary(alias_name) and alias_name == role
-
-  defp principal?(p) when is_map(p), do: schema?(p, @schemas.sender) and p.kind in ["worker", "role", "adapter"] and binary?(p.id) and binary?(p.role)
+  defp principal?(p) when is_map(p), do: schema?(p, @schemas.sender) and p.kind in ["worker", "role", "adapter"] and identifier?(p.id) and identifier?(p.role)
   defp principal?(_), do: false
   defp lifecycle?(l), do: l.state in @events and nullable_reason?(l.terminal_reason) and nullable_reason?(l.blocking_reason) and nullable_action?(l.requested_action)
   defp delivery?(d), do: identifier?(d.idempotency_key) and positive?(d.sequence)
@@ -395,22 +388,37 @@ defmodule SymphonyElixir.Toscanini.EventContract do
        })
        when failure in ["capacity", "rate_limited", "timeout", "provider_error", "unknown"] and action in ["retry", "resume", "attention", "abandon"], do: true
 
-  defp recovery_coherent?(%{lifecycle: "scheduled", outcome: "pending", circuit_state: state, failure_class: failure, retry_after_ms: delay, retries_remaining: retries, next_safe_action: "retry"})
-       when state in ["open", "half_open"] and failure != "none" and delay > 0 and retries > 0, do: true
+  defp recovery_coherent?(%{
+         lifecycle: "scheduled",
+         outcome: "pending",
+         circuit_state: state,
+         failure_class: failure,
+         response_started: false,
+         effect_uncertain: true,
+         retry_after_ms: delay,
+         retries_remaining: retries,
+         next_safe_action: "retry",
+         effective_route: route,
+         attempted_routes: routes
+       })
+       when state in ["open", "half_open"] and failure != "none" and delay > 0 and retries > 0, do: route == List.last(routes)
 
   defp recovery_coherent?(%{
          lifecycle: "resumed",
          outcome: "recovered",
          circuit_state: "closed",
          effective_route: route,
+         attempted_routes: routes,
          failure_class: failure,
          response_started: false,
          effect_uncertain: false,
          next_safe_action: "none"
        })
-       when route in ["terra", "luna"] and failure != "none", do: true
+       when route in ["terra", "luna"] and failure != "none", do: route == List.last(routes)
 
-  defp recovery_coherent?(%{lifecycle: "abandoned", outcome: "failed"}), do: true
+  defp recovery_coherent?(%{lifecycle: "abandoned", outcome: "failed", failure_class: failure, response_started: false, effect_uncertain: true, circuit_state: "open", next_safe_action: "abandon"})
+       when failure != "none", do: true
+
   defp recovery_coherent?(_), do: false
   defp privacy?(p), do: p.classification == "structural_metadata" and p.retention in ["audit", "operational"] and p.redacted == true
   defp binary?(x), do: is_binary(x) and byte_size(x) in 1..@limits.string
@@ -507,13 +515,13 @@ defmodule SymphonyElixir.Toscanini.EventContract do
       "rework_requested" => ["review_rejected"],
       "landed" => ["review_accepted", "landing"],
       "cleanup_complete" => ["landed", "cleanup_pending"],
-      "superseded" => @states,
+      "superseded" => @states ++ @events,
       "resume" => ["attention", "needs_judgment", "blocked", "recovery_pending", "rework_requested"],
       "attention" => ["durable_progress", "candidate_ready", "rework_requested", "resume"],
       "blocked" => ["durable_progress", "candidate_ready", "attention", "resume"],
       "needs_judgment" => ["durable_progress", "candidate_ready", "attention", "blocked"],
-      "failed" => @states,
-      "cancelled" => @states
+      "failed" => @states ++ @events,
+      "cancelled" => @states ++ @events
     }
 
     if current in Map.get(paths, event, []), do: {:ok, event}, else: {:error, {:illegal_transition, current, event}}

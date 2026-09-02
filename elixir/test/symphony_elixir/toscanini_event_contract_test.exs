@@ -286,4 +286,85 @@ defmodule SymphonyElixir.Toscanini.EventContractTest do
 
     assert {:error, :malformed_data} = EventContract.new(put_in(base.data[:recovery], held))
   end
+
+  test "replays ordinary progress into every accepted terminal outcome and keeps dispatch command support" do
+    for terminal <- ["failed", "cancelled", "superseded"] do
+      assert {:ok, %{current: ^terminal}} = EventContract.replay([event("e1", 1, "task_accepted"), event("e2", 2, "durable_progress"), event("e3", 3, terminal)])
+    end
+
+    command = %{
+      event("c1", 1, "task_accepted")
+      | type: "sysmiq.command.dispatch_requested.v1",
+        data: event("c1", 1, "task_accepted").data |> Map.put(:kind, "command") |> put_in([:lifecycle, :requested_action], "dispatch_requested")
+    }
+
+    assert {:ok, _} = EventContract.new(command)
+  end
+
+  test "uses every accepted registry alias and rejects cross-role aliases and customer structural fields" do
+    for {role, alias_name} <- [
+          {"execution_production", "implementation worker"},
+          {"verification_assessment", "independent reviewer"},
+          {"investigation_evidence", "evidence worker"},
+          {"planning_coordination", "programme conductor"},
+          {"engagement_service", "customer service"},
+          {"response_recovery", "incident response"},
+          {"integration_closeout", "landing owner"}
+        ] do
+      candidate = event("e1", 1, "task_accepted") |> put_in([:data, :identity, :role], role) |> put_in([:data, :identity, :primary_role], role) |> put_in([:data, :identity, :domain_alias], alias_name)
+      assert {:ok, _} = EventContract.new(candidate)
+    end
+
+    assert {:error, :malformed_data} = EventContract.new(put_in(event("e1", 1, "task_accepted").data[:identity][:domain_alias], "landing owner"))
+    assert {:error, :malformed_data} = EventContract.new(put_in(event("e1", 1, "task_accepted").data[:identity][:programme], "Customer Jane Doe medical diagnosis"))
+    assert {:error, :malformed_data} = EventContract.new(put_in(event("e1", 1, "task_accepted").data[:sender][:role], "Customer Jane Doe medical diagnosis"))
+  end
+
+  test "binds effective recovery routes and contradictory abandoned states to the ordered attempt record" do
+    base = event("e1", 1, "task_accepted")
+
+    scheduled = %{
+      base.data.recovery
+      | effective_route: "luna",
+        attempted_routes: ["sol"],
+        failure_class: "capacity",
+        response_started: true,
+        effect_uncertain: false,
+        lifecycle: "scheduled",
+        outcome: "pending",
+        circuit_state: "open",
+        retry_after_ms: 1,
+        retries_remaining: 1,
+        next_safe_action: "retry"
+    }
+
+    assert {:error, :malformed_data} = EventContract.new(put_in(base.data[:recovery], scheduled))
+
+    resumed = %{
+      scheduled
+      | response_started: false,
+        effect_uncertain: false,
+        lifecycle: "resumed",
+        outcome: "recovered",
+        circuit_state: "closed",
+        retry_after_ms: 0,
+        retries_remaining: 0,
+        next_safe_action: "none"
+    }
+
+    assert {:error, :malformed_data} = EventContract.new(put_in(base.data[:recovery], resumed))
+
+    abandoned = %{
+      base.data.recovery
+      | failure_class: "none",
+        response_started: true,
+        effect_uncertain: false,
+        lifecycle: "abandoned",
+        outcome: "failed",
+        circuit_state: "closed",
+        next_safe_action: "none"
+    }
+
+    assert {:error, :malformed_data} = EventContract.new(put_in(base.data[:recovery], abandoned))
+  end
 end
