@@ -1,3 +1,4 @@
+# credo:disable-for-this-file Credo.Check.Warning.StructFieldCount
 defmodule SymphonyElixir.Codex.TaskLaunchContract do
   @moduledoc """
   Pure compiler for the bounded identity carried by a Codex task launch.
@@ -6,6 +7,7 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
   validates the authority boundary before a caller enters that effectful path.
   """
 
+  alias SymphonyElixir.Codex.TaskAccountabilityRegistry
   alias SymphonyElixir.Config
 
   @roles [
@@ -59,7 +61,14 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
           exact_revision: String.t(),
           attempt: non_neg_integer(),
           fence: String.t(),
-          project: saved_project_binding()
+          project: saved_project_binding(),
+          registry_id: String.t(),
+          registry_version: String.t(),
+          primary_role: String.t(),
+          domain_alias: String.t(),
+          authority_revision: String.t(),
+          work_character: String.t(),
+          permission_envelope: [String.t()]
         }
   @type commissioning_identity ::
           %{kind: :human, authority: String.t()}
@@ -109,7 +118,8 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
           escalation: escalation_link() | nil,
           supersedes: %{contract_id: String.t(), resolution: String.t()} | nil,
           title: String.t(),
-          project: saved_project_binding()
+          project: saved_project_binding(),
+          accountability: map()
         }
 
   defstruct [
@@ -140,7 +150,8 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
     :executing_identity,
     :escalation,
     :supersedes,
-    :project
+    :project,
+    :accountability
   ]
 
   @spec supported_roles() :: [role()]
@@ -207,9 +218,10 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
   defp compile_valid(attrs) do
     with {:ok, values} <- validate(attrs),
          {:ok, project} <- project_binding(values["project"], values["programme"]),
-         {:ok, identity} <- identity(values, project) do
+         {:ok, registry} <- TaskAccountabilityRegistry.compile(values),
+         {:ok, identity} <- identity(values, project, registry) do
       title = title(values)
-      executing_identity = executing_identity(identity, values, project, title)
+      executing_identity = executing_identity(identity, values, project, title, registry)
 
       {:ok,
        struct!(__MODULE__, %{
@@ -240,7 +252,8 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
          escalation: values["escalation"],
          supersedes: values["supersedes"],
          title: title,
-         project: project
+         project: project,
+         accountability: registry
        })}
     end
   end
@@ -426,7 +439,7 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
 
   defp project_binding(_, _), do: {:error, [:project_binding_not_a_map]}
 
-  defp identity(values, project) do
+  defp identity(values, project, registry) do
     if values["repository"] != project.repository do
       {:error, [:repository_project_mismatch]}
     else
@@ -459,7 +472,28 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
           project.saved_project_id,
           project.native_project_id,
           project.repository,
-          project.root
+          project.root,
+          registry.registry_id,
+          registry.registry_version,
+          registry.primary_role,
+          registry.domain_alias,
+          registry.authority_revision,
+          registry.work_character,
+          registry.permission_envelope,
+          registry,
+          values["execution_principal"],
+          values["reviewer_principal"],
+          values["integrator_principal"],
+          values["candidate_id"],
+          values["verdict_candidate_id"],
+          values["verdict_attempt"],
+          values["verdict_exact_revision"],
+          values["execution_fence"],
+          values["verdict_fence"],
+          values["accepted_verdict"],
+          values["receipt_identity"],
+          values["receipt_fence"],
+          values["handoff"]
         ]
         |> :erlang.term_to_binary()
 
@@ -493,7 +527,7 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
     length(keys) != length(Enum.uniq(normalized)) or
       Enum.any?(
         normalized,
-        &(&1 not in ~w(programme repository issue_or_pr role task attempt fence exact_revision write_boundary evidence model effort trigger goal_policy dependencies permissions evidence_gates stall_policy closeout_policy idempotency_identity conflict_identity commissioning_identity escalation supersedes project))
+        &(&1 not in ~w(programme repository issue_or_pr role task attempt fence execution_fence exact_revision write_boundary evidence model effort trigger goal_policy dependencies permissions evidence_gates stall_policy closeout_policy idempotency_identity conflict_identity commissioning_identity escalation supersedes project registry_id registry_version primary_role domain_alias authority_revision canonical_digest work_character permission_envelope execution_principal reviewer_principal integrator_principal candidate_id verdict_candidate_id verdict_attempt verdict_exact_revision verdict_fence accepted_verdict receipt_identity receipt_fence handoff))
       )
   end
 
@@ -574,7 +608,7 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
   defp contract_id?(value), do: is_binary(value) and Regex.match?(~r/^tlc-[0-9a-f]{64}$/, value)
   defp nonblank_string?(value), do: is_binary(value) and String.trim(value) != ""
 
-  defp executing_identity(contract_id, values, project, title),
+  defp executing_identity(contract_id, values, project, title, registry),
     do: %{
       contract_id: contract_id,
       task: values["task"],
@@ -586,7 +620,14 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
       exact_revision: values["exact_revision"],
       attempt: values["attempt"],
       fence: values["fence"],
-      project: project
+      project: project,
+      registry_id: registry.registry_id,
+      registry_version: registry.registry_version,
+      primary_role: registry.primary_role,
+      domain_alias: registry.domain_alias,
+      authority_revision: registry.authority_revision,
+      work_character: registry.work_character,
+      permission_envelope: registry.permission_envelope
     }
 
   defp binding_enabled?(%{enabled: true}), do: true
@@ -654,7 +695,7 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
          fence: "#{identifier}:#{attempt}:#{revision}",
          exact_revision: revision,
          write_boundary: :product,
-         evidence: [],
+         evidence: ["change_record", "test_or_quality_evidence"],
          model: model,
          effort: effort,
          trigger: trigger,
@@ -669,7 +710,28 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
          commissioning_identity: commissioning_identity,
          escalation: escalation,
          supersedes: supersedes,
-         project: Map.put(project, :root, workspace)
+         project: Map.put(project, :root, workspace),
+         registry_id: TaskAccountabilityRegistry.identity().registry_id,
+         registry_version: TaskAccountabilityRegistry.identity().registry_version,
+         canonical_digest: TaskAccountabilityRegistry.identity().canonical_digest,
+         primary_role: Atom.to_string(role),
+         domain_alias: Keyword.get(opts, :domain_alias, default_domain_alias(role)),
+         authority_revision: TaskAccountabilityRegistry.identity().authority_revision,
+         work_character: Keyword.get(opts, :work_character, "bounded"),
+         permission_envelope: Keyword.get(opts, :permission_envelope, ["write_bound_scope"]),
+         execution_principal: Keyword.get(opts, :execution_principal),
+         reviewer_principal: Keyword.get(opts, :reviewer_principal),
+         integrator_principal: Keyword.get(opts, :integrator_principal),
+         candidate_id: Keyword.get(opts, :candidate_id, identifier),
+         verdict_candidate_id: Keyword.get(opts, :verdict_candidate_id),
+         verdict_attempt: Keyword.get(opts, :verdict_attempt),
+         execution_fence: Keyword.get(opts, :execution_fence, "#{identifier}:#{attempt}:#{revision}"),
+         verdict_exact_revision: Keyword.get(opts, :verdict_exact_revision),
+         verdict_fence: Keyword.get(opts, :verdict_fence),
+         accepted_verdict: Keyword.get(opts, :accepted_verdict),
+         receipt_identity: Keyword.get(opts, :receipt_identity),
+         receipt_fence: Keyword.get(opts, :receipt_fence),
+         handoff: Keyword.get(opts, :handoff)
        }}
     else
       {:error, :invalid_issue_authority}
@@ -679,4 +741,15 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
   defp model_for_trigger(trigger) when trigger in @terra_triggers, do: {:"gpt-5.6-terra", :medium}
   defp model_for_trigger(trigger) when trigger in @sol_triggers, do: {:"gpt-5.6-sol", :high}
   defp model_for_trigger(_), do: {:"gpt-5.6-luna", :medium}
+
+  defp default_domain_alias(:implementation), do: "implementation worker"
+  defp default_domain_alias(:independent_review), do: "independent review"
+  defp default_domain_alias(:landing), do: "landing"
+  defp default_domain_alias(:recovery), do: "recovery owner"
+  defp default_domain_alias(:monitor), do: "monitor"
+  defp default_domain_alias(:telemetry), do: "telemetry"
+  defp default_domain_alias(:research), do: "research"
+  defp default_domain_alias(:programme), do: "programme"
+  defp default_domain_alias(:acceptance), do: "acceptance"
+  defp default_domain_alias(role), do: Atom.to_string(role)
 end
