@@ -951,8 +951,6 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
       else: {:error, :risk_receipt_authority_unavailable}
   end
 
-  defp runtime_receipt_authority(_, _opts), do: {:error, :invalid_risk_receipt_ref}
-
   defp resolve_runtime_receipt(resolver, ref) do
     case resolver.(ref) do
       {:ok, canonical} when is_map(canonical) ->
