@@ -102,7 +102,7 @@ defmodule SymphonyElixir.Toscanini.EventContract do
   defp replay_events(_, _, _), do: {:error, :malformed_replay}
 
   defp normalize(attrs) do
-    with :ok <- keys(attrs, @top), {:ok, data} <- map(attrs[:data] || attrs["data"] || %{}) do
+    with :ok <- keys(attrs, @top), {:ok, data} <- map(attrs[:data] || attrs["data"] || %{}, 1) do
       aliases = %{correlation_id: ["sysmiqcorrelationid"], causation_id: ["sysmiqcausationid"]}
 
       fields =
@@ -114,11 +114,11 @@ defmodule SymphonyElixir.Toscanini.EventContract do
     end
   end
 
-  defp map(value) when is_map(value) and map_size(value) <= @limits.entries do
+  defp map(value, depth) when depth <= @limits.depth and is_map(value) and map_size(value) <= @limits.entries do
     Enum.reduce_while(value, {:ok, %{}, MapSet.new()}, fn {key, child}, {:ok, acc, seen} ->
       with {:ok, atom} <- key(key),
            false <- MapSet.member?(seen, atom),
-           {:ok, normalized} <- value(child),
+           {:ok, normalized} <- value(child, depth + 1),
            do: {:cont, {:ok, Map.put(acc, atom, normalized), MapSet.put(seen, atom)}},
            else: (
              :error -> {:halt, {:error, :unknown_field}}
@@ -132,26 +132,27 @@ defmodule SymphonyElixir.Toscanini.EventContract do
     end
   end
 
-  defp map(_), do: {:error, :malformed_data}
-  defp value(value) when is_map(value), do: map(value)
+  defp map(_, _), do: {:error, :malformed_data}
+  defp value(_, depth) when depth > @limits.depth, do: {:error, :malformed_data}
+  defp value(value, depth) when is_map(value), do: map(value, depth)
 
-  defp value(value) when is_list(value), do: normalize_list(value, [], @limits.list)
+  defp value(value, depth) when is_list(value), do: normalize_list(value, [], @limits.list, depth)
 
-  defp value(value) when is_binary(value) or is_integer(value) or is_float(value) or is_boolean(value) or is_nil(value), do: {:ok, value}
+  defp value(value, _depth) when is_binary(value) or is_integer(value) or is_float(value) or is_boolean(value) or is_nil(value), do: {:ok, value}
 
-  defp value(_), do: {:error, :malformed_data}
+  defp value(_, _), do: {:error, :malformed_data}
 
-  defp normalize_list([], acc, _remaining), do: {:ok, Enum.reverse(acc)}
+  defp normalize_list([], acc, _remaining, _depth), do: {:ok, Enum.reverse(acc)}
 
-  defp normalize_list([item | tail], acc, remaining) when remaining > 0 do
-    case value(item) do
-      {:ok, normalized} -> normalize_list(tail, [normalized | acc], remaining - 1)
+  defp normalize_list([item | tail], acc, remaining, depth) when remaining > 0 do
+    case value(item, depth + 1) do
+      {:ok, normalized} -> normalize_list(tail, [normalized | acc], remaining - 1, depth)
       error -> error
     end
   end
 
-  defp normalize_list([_ | _], _acc, 0), do: {:error, :malformed_data}
-  defp normalize_list(_, _, _), do: {:error, :malformed_data}
+  defp normalize_list([_ | _], _acc, 0, _depth), do: {:error, :malformed_data}
+  defp normalize_list(_, _, _, _), do: {:error, :malformed_data}
   defp key(value) when is_atom(value), do: if(value in @keys, do: {:ok, value}, else: :error)
   defp key(value) when is_binary(value), do: Enum.find_value(@keys, :error, fn atom -> if value == Atom.to_string(atom), do: {:ok, atom} end)
   defp key(_), do: :error

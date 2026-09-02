@@ -31,6 +31,9 @@ defmodule SymphonyElixir.Toscanini.EventContractTest do
     }
   end
 
+  defp nested_known_map(0, leaf), do: leaf
+  defp nested_known_map(depth, leaf), do: %{kind: nested_known_map(depth - 1, leaf)}
+
   test "validates normalized event and keeps commands separate" do
     assert {:ok, envelope} = EventContract.new(event("e1", 1, "accepted"))
     assert EventContract.event?(envelope)
@@ -142,5 +145,12 @@ defmodule SymphonyElixir.Toscanini.EventContractTest do
 
     replay = Enum.map(1..32, &event("e#{&1}", &1, "cancelled")) ++ [self()]
     assert {:error, :malformed_replay} = EventContract.replay(replay, %EventContract.State{current: "running"})
+  end
+
+  test "rejects nested maps past the normalization depth budget before traversing the hostile leaf" do
+    hostile_ref = nested_known_map(7, self())
+
+    assert {:error, :malformed_data} =
+             EventContract.new(put_in(event("e1", 1, "accepted").data[:evidence][:refs], [hostile_ref]))
   end
 end
