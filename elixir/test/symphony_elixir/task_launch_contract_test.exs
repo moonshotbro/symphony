@@ -27,16 +27,31 @@ defmodule SymphonyElixir.Codex.TaskLaunchContractTest do
       )
 
       issue = %SymphonyElixir.Tracker.Issue{identifier: "SYS-50", title: "Bound worker"}
+      {revision, 0} = System.cmd("git", ["-C", root, "rev-parse", "HEAD"])
+      runtime_ref = runtime_risk_receipt_ref(String.trim(revision))
 
       assert {:ok, contract} =
                TaskLaunchContract.from_runtime(issue, root,
                  trigger: :integration_design,
-                 commissioning_identity: %{kind: "human", authority: "programme"}
+                 commissioning_identity: %{kind: "human", authority: "programme"},
+                 risk_receipt_ref: runtime_ref,
+                 authority_digest: String.duplicate("c", 64)
                )
 
       assert contract.executing_identity.model == :"gpt-5.6-terra"
       assert contract.project.saved_project_id != contract.project.native_project_id
+      assert contract.risk_receipt_ref["required_gate_ids"] == ["project-bound-readback"]
       assert TaskLaunchContract.prompt(contract, "work") =~ contract.contract_id
+
+      assert {:error, :risk_receipt_authority_mismatch} =
+               TaskLaunchContract.from_runtime(issue, root,
+                 risk_receipt_ref: runtime_ref,
+                 authority_digest: String.duplicate("d", 64)
+               )
+
+      assert {:error, :risk_receipt_authority_unavailable} =
+               TaskLaunchContract.from_runtime(issue, root, risk_receipt_ref: runtime_ref)
+
       assert {:error, :workspace_revision_unavailable} = TaskLaunchContract.from_runtime(issue, Path.join(root, "missing"))
     after
       File.rm_rf(root)
@@ -224,9 +239,9 @@ defmodule SymphonyElixir.Codex.TaskLaunchContractTest do
   end
 
   defp risk_receipt_ref do
-    %{
+    ref = %{
       "schema" => "sysmiq.risk-receipt.v1",
-      "digest" => String.duplicate("a", 64),
+      "digest" => "pending",
       "repository" => "moonshotbro/sysmiq-symphony",
       "base_sha" => String.duplicate("b", 40),
       "head_sha" => "3d3ee035725b0728f041d8d10fc29f5c8adc42c0",
@@ -241,5 +256,21 @@ defmodule SymphonyElixir.Codex.TaskLaunchContractTest do
       "unresolved_judgments" => [],
       "escalation_required" => false
     }
+
+    Map.put(ref, "digest", receipt_digest(ref))
+  end
+
+  defp runtime_risk_receipt_ref(head_sha) do
+    ref = %{risk_receipt_ref() | "head_sha" => head_sha, "required_gate_ids" => ["project-bound-readback"]}
+    Map.put(ref, "digest", receipt_digest(ref))
+  end
+
+  defp receipt_digest(ref) do
+    ref
+    |> Map.delete("digest")
+    |> Enum.sort()
+    |> :erlang.term_to_binary()
+    |> then(&:crypto.hash(:sha256, &1))
+    |> Base.encode16(case: :lower)
   end
 end

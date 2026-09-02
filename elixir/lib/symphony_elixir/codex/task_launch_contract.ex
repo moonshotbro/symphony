@@ -882,58 +882,86 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
     {model, effort} = model_for_trigger(trigger)
 
     if is_binary(identifier) and is_binary(title) and is_integer(attempt) and attempt >= 0 do
-      {:ok,
-       %{
-         programme: project.programme,
-         repository: project.repository,
-         issue_or_pr: identifier,
-         role: role,
-         task: title,
-         attempt: attempt,
-         fence: "#{identifier}:#{attempt}:#{revision}",
-         exact_revision: revision,
-         write_boundary: :product,
-         evidence: ["change_record", "test_or_quality_evidence"],
-         model: model,
-         effort: effort,
-         trigger: trigger,
-         goal_policy: if(role in @worker_goal_roles, do: :worker, else: :none),
-         dependencies: [],
-         permissions: ["workspace-write"],
-         evidence_gates: ["project-bound-readback"],
-         stall_policy: :fail_closed,
-         closeout_policy: :reconcile,
-         idempotency_identity: "#{identifier}/#{role}/#{revision}/#{attempt}",
-         conflict_identity: "#{project.repository}:#{identifier}:#{role}:#{revision}",
-         commissioning_identity: commissioning_identity,
-         escalation: escalation,
-         supersedes: supersedes,
-         project: Map.put(project, :root, workspace),
-         registry_id: TaskAccountabilityRegistry.identity().registry_id,
-         registry_version: TaskAccountabilityRegistry.identity().registry_version,
-         canonical_digest: TaskAccountabilityRegistry.identity().canonical_digest,
-         primary_role: Atom.to_string(role),
-         domain_alias: Keyword.get(opts, :domain_alias, default_domain_alias(role)),
-         authority_revision: TaskAccountabilityRegistry.identity().authority_revision,
-         work_character: Keyword.get(opts, :work_character, "bounded"),
-         permission_envelope: Keyword.get(opts, :permission_envelope, ["write_bound_scope"]),
-         execution_principal: Keyword.get(opts, :execution_principal),
-         reviewer_principal: Keyword.get(opts, :reviewer_principal),
-         integrator_principal: Keyword.get(opts, :integrator_principal),
-         candidate_id: Keyword.get(opts, :candidate_id, identifier),
-         verdict_candidate_id: Keyword.get(opts, :verdict_candidate_id),
-         verdict_attempt: Keyword.get(opts, :verdict_attempt),
-         execution_fence: Keyword.get(opts, :execution_fence, "#{identifier}:#{attempt}:#{revision}"),
-         verdict_exact_revision: Keyword.get(opts, :verdict_exact_revision),
-         verdict_fence: Keyword.get(opts, :verdict_fence),
-         accepted_verdict: Keyword.get(opts, :accepted_verdict),
-         receipt_identity: Keyword.get(opts, :receipt_identity),
-         receipt_fence: Keyword.get(opts, :receipt_fence),
-         handoff: Keyword.get(opts, :handoff)
-       }}
+      attrs = %{
+        programme: project.programme,
+        repository: project.repository,
+        issue_or_pr: identifier,
+        role: role,
+        task: title,
+        attempt: attempt,
+        fence: "#{identifier}:#{attempt}:#{revision}",
+        exact_revision: revision,
+        write_boundary: :product,
+        evidence: ["change_record", "test_or_quality_evidence"],
+        model: model,
+        effort: effort,
+        trigger: trigger,
+        goal_policy: if(role in @worker_goal_roles, do: :worker, else: :none),
+        dependencies: [],
+        permissions: ["workspace-write"],
+        evidence_gates: ["project-bound-readback"],
+        stall_policy: :fail_closed,
+        closeout_policy: :reconcile,
+        idempotency_identity: "#{identifier}/#{role}/#{revision}/#{attempt}",
+        conflict_identity: "#{project.repository}:#{identifier}:#{role}:#{revision}",
+        commissioning_identity: commissioning_identity,
+        escalation: escalation,
+        supersedes: supersedes,
+        risk_receipt_ref: Keyword.get(opts, :risk_receipt_ref),
+        project: Map.put(project, :root, workspace),
+        registry_id: TaskAccountabilityRegistry.identity().registry_id,
+        registry_version: TaskAccountabilityRegistry.identity().registry_version,
+        canonical_digest: TaskAccountabilityRegistry.identity().canonical_digest,
+        primary_role: Atom.to_string(role),
+        domain_alias: Keyword.get(opts, :domain_alias, default_domain_alias(role)),
+        authority_revision: TaskAccountabilityRegistry.identity().authority_revision,
+        work_character: Keyword.get(opts, :work_character, "bounded"),
+        permission_envelope: Keyword.get(opts, :permission_envelope, ["write_bound_scope"]),
+        execution_principal: Keyword.get(opts, :execution_principal),
+        reviewer_principal: Keyword.get(opts, :reviewer_principal),
+        integrator_principal: Keyword.get(opts, :integrator_principal),
+        candidate_id: Keyword.get(opts, :candidate_id, identifier),
+        verdict_candidate_id: Keyword.get(opts, :verdict_candidate_id),
+        verdict_attempt: Keyword.get(opts, :verdict_attempt),
+        execution_fence: Keyword.get(opts, :execution_fence, "#{identifier}:#{attempt}:#{revision}"),
+        verdict_exact_revision: Keyword.get(opts, :verdict_exact_revision),
+        verdict_fence: Keyword.get(opts, :verdict_fence),
+        accepted_verdict: Keyword.get(opts, :accepted_verdict),
+        receipt_identity: Keyword.get(opts, :receipt_identity),
+        receipt_fence: Keyword.get(opts, :receipt_fence),
+        handoff: Keyword.get(opts, :handoff)
+      }
+
+      with :ok <- runtime_receipt_authority(attrs, opts) do
+        {:ok, attrs}
+      end
     else
       {:error, :invalid_issue_authority}
     end
+  end
+
+  defp runtime_receipt_authority(%{risk_receipt_ref: nil}, _opts), do: :ok
+
+  defp runtime_receipt_authority(%{risk_receipt_ref: ref}, opts) do
+    accepted = Keyword.get(opts, :authority_digest)
+
+    cond do
+      not digest?(accepted) -> {:error, :risk_receipt_authority_unavailable}
+      ref["authority_digest"] != accepted -> {:error, :risk_receipt_authority_mismatch}
+      ref["digest"] != risk_receipt_digest(ref) -> {:error, :risk_receipt_digest_mismatch}
+      true -> :ok
+    end
+  end
+
+  defp runtime_receipt_authority(_, _opts), do: {:error, :invalid_risk_receipt_ref}
+
+  defp risk_receipt_digest(ref) do
+    ref
+    |> Map.delete("digest")
+    |> Enum.sort()
+    |> :erlang.term_to_binary()
+    |> then(&:crypto.hash(:sha256, &1))
+    |> Base.encode16(case: :lower)
   end
 
   defp model_for_trigger(trigger) when trigger in @terra_triggers, do: {:"gpt-5.6-terra", :medium}
