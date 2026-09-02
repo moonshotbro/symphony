@@ -6,7 +6,7 @@ defmodule SymphonyElixir.Toscanini.EventContractTest do
 
   defp event(id, seq, name, from \\ nil) do
     causation_id = from || if(seq == 1, do: nil, else: "e#{seq - 1}")
-    refs = if(name == "cleanup_complete", do: [%{url: "https://github.com/moonshotbro/symphony/issues/51", digest: nil, kind: "issue"}], else: [])
+    refs = if(name in ["cleanup_complete", "superseded", "failed", "cancelled"], do: [%{url: "https://github.com/moonshotbro/symphony/issues/51", digest: nil, kind: "issue"}], else: [])
 
     %{
       specversion: "1.0",
@@ -50,19 +50,23 @@ defmodule SymphonyElixir.Toscanini.EventContractTest do
         delivery: %{idempotency_key: "i-#{id}", sequence: seq},
         recovery: %{
           original_route: "sol",
-          effective_route: "held",
+          effective_route: "sol",
+          attempted_routes: ["sol"],
           governed_effort: "medium",
-          attempt: 1,
-          budget: 32_000,
-          resume_at: "2026-09-02T00:00:00Z",
-          failure_class: "capacity",
+          goal_id: "goal-51",
+          operation_id: "operation-#{id}",
+          attempt: 0,
+          retry_after_ms: 0,
+          retries_remaining: 0,
+          failure_class: "none",
           response_started: false,
-          effect_uncertain: true,
-          lifecycle: "held",
-          outcome: "pending",
-          circuit_state: "open"
+          effect_uncertain: false,
+          lifecycle: "not_required",
+          outcome: "not_started",
+          circuit_state: "closed",
+          next_safe_action: "none"
         },
-        privacy: %{classification: "metadata", retention: "audit", redacted: false}
+        privacy: %{classification: "structural_metadata", retention: "audit", redacted: true}
       }
     }
   end
@@ -77,8 +81,8 @@ defmodule SymphonyElixir.Toscanini.EventContractTest do
 
     command = %{
       event("c1", 1, "task_accepted")
-      | type: "sysmiq.command.dispatch_requested.v1",
-        data: envelope.data |> Map.put(:kind, "command") |> Map.put(:message_id, "c1") |> put_in([:lifecycle, :requested_action], "dispatch_requested")
+      | type: "sysmiq.command.start.v1",
+        data: envelope.data |> Map.put(:kind, "command") |> Map.put(:message_id, "c1") |> put_in([:lifecycle, :requested_action], "start")
     }
 
     assert {:ok, command} = EventContract.new(command)
@@ -99,7 +103,7 @@ defmodule SymphonyElixir.Toscanini.EventContractTest do
     assert state.current == "cleanup_complete"
     assert state.revision == 6
     assert {:error, :duplicate_operation} = EventContract.transition(state, hd(events))
-    assert {:error, :out_of_order_transition} = EventContract.transition(EventContract.initial_state(), event("e2", 2, "durable_progress"))
+    assert {:error, :causation_mismatch} = EventContract.transition(EventContract.initial_state(), event("e2", 2, "durable_progress"))
   end
 
   test "rejects privacy-prohibited payloads and illegal state changes" do
@@ -202,18 +206,84 @@ defmodule SymphonyElixir.Toscanini.EventContractTest do
     base = event("e1", 1, "task_accepted")
 
     assert {:ok, envelope} = EventContract.new(base)
-    assert envelope.data.recovery.effective_route == "held"
-    assert envelope.data.recovery.effect_uncertain
+    assert envelope.data.recovery.effective_route == "sol"
+    refute envelope.data.recovery.effect_uncertain
 
     assert {:error, :malformed_data} = EventContract.new(put_in(base.data[:recovery][:original_route], "https://provider.example"))
     assert {:error, :malformed_data} = EventContract.new(put_in(base.data[:recovery][:governed_effort], "unbounded"))
     assert {:error, :malformed_data} = EventContract.new(put_in(base.data[:recovery][:attempt], 33))
-    assert {:error, :malformed_data} = EventContract.new(put_in(base.data[:recovery][:budget], 1_000_001))
-    assert {:error, :malformed_data} = EventContract.new(put_in(base.data[:recovery][:resume_at], "customer data"))
+    assert {:error, :malformed_data} = EventContract.new(put_in(base.data[:recovery][:retry_after_ms], 1_000_001))
+    assert {:error, :malformed_data} = EventContract.new(put_in(base.data[:recovery][:attempted_routes], ["luna", "sol"]))
     assert {:error, :malformed_data} = EventContract.new(put_in(base.data[:recovery][:response_started], "unknown"))
     assert {:error, :malformed_data} = EventContract.new(put_in(base.data[:recovery][:failure_class], "tool_payload"))
     assert {:error, :unknown_field} = EventContract.new(put_in(base.data[:recovery][:prompt], "customer data"))
     assert {:error, :unknown_field} = EventContract.new(put_in(base.data[:recovery][:arbitrary], %{nested: true}))
     assert {:error, :malformed_data} = EventContract.new(put_in(base.data[:identity][:task], "Customer Jane Doe medical diagnosis"))
+  end
+
+  test "accepts the factual attention and judgment lifecycle and rejects dead transitions" do
+    events = [
+      event("e1", 1, "task_accepted"),
+      event("e2", 2, "durable_progress"),
+      event("e3", 3, "attention"),
+      event("e4", 4, "needs_judgment"),
+      event("e5", 5, "resume"),
+      event("e6", 6, "durable_progress")
+    ]
+
+    assert {:ok, %{current: "durable_progress"}} = EventContract.replay(events)
+    assert {:ok, _} = EventContract.new(event("blocked", 1, "blocked"))
+    assert {:ok, _} = EventContract.new(event("judgment", 1, "needs_judgment"))
+    assert {:error, :malformed_data} = EventContract.new(event("old", 1, "needs_input"))
+  end
+
+  test "fails closed on root causation, terminal evidence, aliases, and free-text lifecycle metadata" do
+    assert {:error, :causation_mismatch} = EventContract.transition(EventContract.initial_state(), event("e1", 1, "task_accepted", "ghost"))
+
+    chain = [
+      event("e1", 1, "task_accepted"),
+      event("e2", 2, "durable_progress"),
+      event("e3", 3, "candidate_ready"),
+      event("e4", 4, "review_accepted"),
+      event("e5", 5, "landed"),
+      put_in(event("e6", 6, "cleanup_complete").data[:evidence][:refs], [])
+    ]
+
+    assert {:error, :missing_terminal_evidence} = EventContract.replay(chain)
+    assert {:error, :malformed_data} = EventContract.new(put_in(event("e1", 1, "task_accepted").data[:identity][:domain_alias], "Customer Jane Doe medical diagnosis"))
+    assert {:error, :malformed_data} = EventContract.new(put_in(event("e1", 1, "task_accepted").data[:identity][:domain_alias], "landing owner"))
+    assert {:error, :malformed_data} = EventContract.new(put_in(event("e1", 1, "task_accepted").data[:lifecycle][:blocking_reason], "Customer Jane Doe medical diagnosis"))
+  end
+
+  test "requires ordered and semantically coherent Sol Terra Luna recovery" do
+    base = event("e1", 1, "task_accepted")
+
+    resumed = %{
+      base.data.recovery
+      | effective_route: "luna",
+        attempted_routes: ["sol", "terra", "luna"],
+        failure_class: "capacity",
+        lifecycle: "resumed",
+        outcome: "recovered",
+        circuit_state: "closed"
+    }
+
+    assert {:ok, _} = EventContract.new(put_in(base.data[:recovery], resumed))
+    assert {:error, :malformed_data} = EventContract.new(put_in(base.data[:recovery][:attempted_routes], ["luna", "sol"]))
+
+    held = %{
+      base.data.recovery
+      | effective_route: "held",
+        attempted_routes: ["sol"],
+        failure_class: "none",
+        response_started: true,
+        effect_uncertain: false,
+        lifecycle: "held",
+        outcome: "pending",
+        circuit_state: "open",
+        next_safe_action: "attention"
+    }
+
+    assert {:error, :malformed_data} = EventContract.new(put_in(base.data[:recovery], held))
   end
 end
