@@ -103,7 +103,7 @@ defmodule SymphonyElixir.Codex.CoordinationEffects do
       {:ok, %{id: ^child_id, forked_from_id: _source}} ->
         {:ok, %{provider: "codex", authoritative: false, exists: false, disposition: "fork_source_mismatch"}}
 
-      {:error, :not_found} ->
+      {:error, reason} when reason in [:not_found, :thread_not_found] ->
         {:ok, %{provider: "codex", authoritative: true, exists: false, disposition: "thread_fork_absent"}}
 
       _ ->
@@ -123,7 +123,7 @@ defmodule SymphonyElixir.Codex.CoordinationEffects do
     source = value(intent, :source)
 
     if value(intent, :kind) in [:fork, "fork"] and value(intent, :expected_postcondition) == "codex.thread_forked" and
-         is_map(source) and Enum.all?([:task_id, :correlation_id, :fence, :attempt], &valid_identity?(value(source, &1))) and
+         is_map(source) and Enum.all?([:task_id, :correlation_id, :fence, :attempt, :issue_id, :repository, :revision, :native_project_id], &valid_identity?(value(source, &1))) and
          valid_identity?(target_id(intent)), do: :ok, else: {:error, :fork_intent_invalid}
   end
 

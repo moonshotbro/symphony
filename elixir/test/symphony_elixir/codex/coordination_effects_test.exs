@@ -228,7 +228,16 @@ defmodule SymphonyElixir.Codex.CoordinationEffectsTest do
   defp intent(suffix \\ "one") do
     %{
       kind: :fork,
-      source: %{task_id: "task-#{suffix}", correlation_id: "corr-#{suffix}", fence: "fence-1", attempt: "1", issue_id: "issue-39", revision: "abc1234"},
+      source: %{
+        task_id: "task-#{suffix}",
+        correlation_id: "corr-#{suffix}",
+        fence: "fence-1",
+        attempt: "1",
+        issue_id: "issue-39",
+        repository: "moonshotbro/symphony",
+        revision: "abc1234",
+        native_project_id: "project-39"
+      },
       target: %{type: "codex_thread", id: "source-1"},
       purpose: "coordination.fork.#{suffix}",
       checkpoint: "abc1234",

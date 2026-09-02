@@ -14,7 +14,10 @@ defmodule SymphonyElixir.AppServerTest do
       while IFS= read -r line; do
         case "$line" in
           *'"id":1'*) printf '%s\\n' '{"id":1,"result":{}}' ;;
-          *'"id":7'*) printf '%s\\n' '{"id":7,"result":{"thread":{"id":"child-39","forkedFromId":"parent-39","sessionId":"session-39"}}}'; exit 0 ;;
+          *'"id":4'*'parent-39'*) printf '%s\\n' '{"id":4,"result":{"thread":{"id":"parent-39","projectId":"project-39","cwd":"WORKSPACE","ephemeral":false}}}' | sed "s|WORKSPACE|$PWD|" ;;
+          *'"id":5'*) printf '%s\\n' '{"id":5,"result":{"data":[]}}' ;;
+          *'"id":7'*) printf '%s\\n' '{"id":7,"result":{"thread":{"id":"child-39","forkedFromId":"parent-39","sessionId":"session-39","projectId":"project-39","cwd":"WORKSPACE","ephemeral":false}}}' | sed "s|WORKSPACE|$PWD|" ;;
+          *'"id":4'*'child-39'*) printf '%s\\n' '{"id":4,"result":{"thread":{"id":"child-39","forkedFromId":"parent-39","sessionId":"session-39","projectId":"project-39","cwd":"WORKSPACE","ephemeral":false}}}' | sed "s|WORKSPACE|$PWD|" ;;
         esac
       done
       """)
@@ -22,8 +25,10 @@ defmodule SymphonyElixir.AppServerTest do
       File.chmod!(codex_binary, 0o755)
       write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root, codex_command: "#{codex_binary} app-server")
 
+      contract = %SymphonyElixir.Codex.TaskLaunchContract{project: %{native_project_id: "project-39"}}
+
       assert {:ok, %{id: "child-39", forked_from_id: "parent-39", correlation_id: "session-39"}} =
-               AppServer.fork_thread("parent-39", workspace)
+               AppServer.fork_thread("parent-39", workspace, task_contract: contract)
     after
       File.rm_rf(root)
     end

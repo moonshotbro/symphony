@@ -118,11 +118,14 @@ defmodule SymphonyElixir.Codex.AppServer do
       worker_host = Keyword.get(opts, :worker_host)
       dynamic_tool_binding = DynamicTool.bind()
 
-      with {:ok, expanded_workspace} <- validate_workspace_cwd(workspace, worker_host),
+      with {:ok, contract} <- validate_launch_contract(Keyword.get(opts, :task_contract), workspace),
+           {:ok, expanded_workspace} <- validate_workspace_cwd(workspace, worker_host),
            {:ok, port} <- start_port(expanded_workspace, worker_host, dynamic_tool_binding) do
         try do
-          with :ok <- send_initialize(port) do
-            fork_thread_from_port(port, thread_id)
+          with :ok <- send_initialize(port),
+               {:ok, %{"id" => ^thread_id} = source} <- read_thread_from_port(port, thread_id),
+               :ok <- verify_thread_authority(source, expanded_workspace, nil, contract, false) do
+            fork_thread_from_port(port, thread_id, expanded_workspace, contract)
           end
         after
           stop_port(port)
@@ -694,7 +697,7 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp fork_thread_from_port(port, thread_id) do
+  defp fork_thread_from_port(port, thread_id, workspace, contract) do
     send_message(port, %{
       "method" => "thread/fork",
       "id" => @thread_fork_id,
@@ -704,12 +707,12 @@ defmodule SymphonyElixir.Codex.AppServer do
     case await_response(port, @thread_fork_id) do
       {:ok, %{"thread" => %{"id" => child_id, "forkedFromId" => ^thread_id} = child}}
       when is_binary(child_id) and child_id != "" ->
-        {:ok,
-         %{
-           id: child_id,
-           forked_from_id: thread_id,
-           correlation_id: Map.get(child, "sessionId")
-         }}
+        with :ok <- verify_thread_authority(child, workspace, nil, contract, false),
+             {:ok, %{"id" => ^child_id, "forkedFromId" => ^thread_id} = persisted} <- read_thread_from_port(port, child_id),
+             :ok <- verify_thread_authority(persisted, workspace, nil, contract, false),
+             :ok <- verify_fork_correlation(child, persisted) do
+          {:ok, %{id: child_id, forked_from_id: thread_id, correlation_id: Map.get(persisted, "sessionId")}}
+        end
 
       {:ok, response} ->
         {:error, {:provider_fork_response_invalid, response}}
@@ -722,6 +725,11 @@ defmodule SymphonyElixir.Codex.AppServer do
         {:error, reason}
     end
   end
+
+  defp verify_fork_correlation(%{"sessionId" => session_id}, %{"sessionId" => persisted_session_id})
+       when is_binary(session_id) and session_id != "" and session_id == persisted_session_id, do: :ok
+
+  defp verify_fork_correlation(_, _), do: {:error, :fork_correlation_mismatch}
 
   defp read_thread_turns(port, thread_id), do: read_thread_turns(port, thread_id, nil, [], 0)
 

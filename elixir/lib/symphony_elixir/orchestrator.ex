@@ -1584,9 +1584,15 @@ defmodule SymphonyElixir.Orchestrator do
   def handle_call({:fork_thread, intent, workspace, opts}, _from, state)
       when is_map(intent) and is_binary(workspace) and is_list(opts) do
     worker_host = Keyword.get(opts, :worker_host)
+    task_contract = Keyword.get(opts, :task_contract)
 
     provider = %{
-      fork: fn thread_id -> AppServer.fork_thread(thread_id, workspace, worker_host: worker_host) end,
+      fork: fn thread_id ->
+        AppServer.fork_thread(thread_id, workspace,
+          worker_host: worker_host,
+          task_contract: task_contract
+        )
+      end,
       inspect_fork: fn thread_id ->
         AppServer.read_thread(thread_id, workspace, worker_host: worker_host) |> normalize_fork_read()
       end
