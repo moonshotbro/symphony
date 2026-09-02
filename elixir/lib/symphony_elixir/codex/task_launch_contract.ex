@@ -31,6 +31,7 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
   @luna_triggers ~w(bounded implementation tests documentation hygiene mechanical_review gate_repair)a
   @terra_triggers ~w(ambiguous_diagnosis integration_design repository_wide_judgment recovery privacy_telemetry_semantics provider_boundary_reasoning scope_discovery)a
   @sol_triggers ~w(security_architecture consequential_production_customer_billing difficult_cross_repository_incident final_high_risk_review)a
+  @risk_receipt_schema "sysmiq.risk-receipt.v1"
 
   @type role ::
           :programme
@@ -80,6 +81,23 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
               model: atom(),
               effort: atom()
             }
+  @type risk_receipt_ref :: %{
+          schema: String.t(),
+          digest: String.t(),
+          repository: String.t(),
+          base_sha: String.t(),
+          head_sha: String.t(),
+          authority_digest: String.t(),
+          policy_id: String.t(),
+          policy_version: String.t(),
+          policy_digest: String.t(),
+          compiler_version: String.t(),
+          matrix_revision: String.t(),
+          tier: 1..4,
+          required_gate_ids: [String.t()],
+          unresolved_judgments: [String.t()],
+          escalation_required: boolean()
+        }
   @type escalation_link ::
           %{
             prior_contract_id: String.t(),
@@ -114,6 +132,7 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
           idempotency_identity: String.t(),
           conflict_identity: String.t(),
           commissioning_identity: commissioning_identity() | nil,
+          risk_receipt_ref: risk_receipt_ref() | nil,
           executing_identity: executing_identity(),
           escalation: escalation_link() | nil,
           supersedes: %{contract_id: String.t(), resolution: String.t()} | nil,
@@ -147,6 +166,7 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
     :idempotency_identity,
     :conflict_identity,
     :commissioning_identity,
+    :risk_receipt_ref,
     :executing_identity,
     :escalation,
     :supersedes,
@@ -198,6 +218,7 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
         :idempotency_identity,
         :conflict_identity,
         :commissioning_identity,
+        :risk_receipt_ref,
         :escalation,
         :supersedes,
         :project
@@ -357,6 +378,7 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
          executing_identity: executing_identity,
          escalation: values["escalation"],
          supersedes: values["supersedes"],
+         risk_receipt_ref: values["risk_receipt_ref"],
          title: title,
          project: project,
          accountability: registry
@@ -401,6 +423,7 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
         |> Map.put("commissioning_identity", normalize_commissioning(attrs["commissioning_identity"]))
         |> Map.put("escalation", normalize_escalation(attrs["escalation"]))
         |> Map.put("supersedes", normalize_supersession(attrs["supersedes"]))
+        |> Map.put("risk_receipt_ref", normalize_risk_receipt_ref(attrs["risk_receipt_ref"]))
 
       role = normalize_atom(attrs["role"])
       trigger = normalize_atom(attrs["trigger"] || "bounded")
@@ -430,7 +453,8 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
              "closeout_policy" => normalize_atom(attrs["closeout_policy"]),
              "commissioning_identity" => attrs["commissioning_identity"],
              "escalation" => attrs["escalation"],
-             "supersedes" => attrs["supersedes"]
+             "supersedes" => attrs["supersedes"],
+             "risk_receipt_ref" => attrs["risk_receipt_ref"]
            })}
 
         errors ->
@@ -469,6 +493,7 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
       :invalid_escalation_link
     )
     |> add_unless(valid_supersession?(attrs["supersedes"]), :invalid_supersession_identity)
+    |> add_unless(valid_risk_receipt_ref?(attrs["risk_receipt_ref"], attrs), :invalid_risk_receipt_ref)
     |> add_unless(role != :programme or goal == :programme, :programme_goal_required)
     |> add_unless(role == :programme or goal != :programme, :programme_goal_role_required)
     |> add_unless(goal != :worker or role in @worker_goal_roles, :worker_goal_role_invalid)
@@ -574,6 +599,7 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
           values["commissioning_identity"],
           values["escalation"],
           values["supersedes"],
+          values["risk_receipt_ref"],
           values["evidence"],
           project.saved_project_id,
           project.native_project_id,
@@ -633,7 +659,7 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
     length(keys) != length(Enum.uniq(normalized)) or
       Enum.any?(
         normalized,
-        &(&1 not in ~w(programme repository issue_or_pr role task attempt fence execution_fence exact_revision write_boundary evidence model effort trigger goal_policy dependencies permissions evidence_gates stall_policy closeout_policy idempotency_identity conflict_identity commissioning_identity escalation supersedes project registry_id registry_version primary_role domain_alias authority_revision canonical_digest work_character permission_envelope execution_principal reviewer_principal integrator_principal candidate_id verdict_candidate_id verdict_attempt verdict_exact_revision verdict_fence accepted_verdict receipt_identity receipt_fence handoff))
+        &(&1 not in ~w(programme repository issue_or_pr role task attempt fence execution_fence exact_revision write_boundary evidence model effort trigger goal_policy dependencies permissions evidence_gates stall_policy closeout_policy idempotency_identity conflict_identity commissioning_identity escalation supersedes risk_receipt_ref project registry_id registry_version primary_role domain_alias authority_revision canonical_digest work_character permission_envelope execution_principal reviewer_principal integrator_principal candidate_id verdict_candidate_id verdict_attempt verdict_exact_revision verdict_fence accepted_verdict receipt_identity receipt_fence handoff))
       )
   end
 
@@ -673,6 +699,72 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
   defp normalize_supersession(nil), do: nil
   defp normalize_supersession(value) when is_map(value), do: stringify_keys(value)
   defp normalize_supersession(_), do: :invalid
+
+  defp normalize_risk_receipt_ref(nil), do: nil
+  defp normalize_risk_receipt_ref(value) when is_map(value), do: stringify_keys(value)
+  defp normalize_risk_receipt_ref(_), do: :invalid
+
+  defp valid_risk_receipt_ref?(nil, _attrs), do: true
+
+  defp valid_risk_receipt_ref?(
+         %{
+           "schema" => @risk_receipt_schema,
+           "digest" => _,
+           "repository" => _,
+           "base_sha" => _,
+           "head_sha" => _,
+           "authority_digest" => _,
+           "policy_id" => _,
+           "policy_version" => _,
+           "policy_digest" => _,
+           "compiler_version" => _,
+           "matrix_revision" => _,
+           "tier" => _,
+           "required_gate_ids" => _,
+           "unresolved_judgments" => _,
+           "escalation_required" => _
+         } = ref,
+         attrs
+       ) do
+    keys =
+      ~w(schema digest repository base_sha head_sha authority_digest policy_id policy_version policy_digest compiler_version matrix_revision tier required_gate_ids unresolved_judgments escalation_required)
+
+    risk_receipt_shape?(ref, keys) and
+      risk_receipt_values?(ref) and
+      risk_receipt_binding?(ref, attrs) and risk_receipt_state?(ref)
+  end
+
+  defp valid_risk_receipt_ref?(_, _), do: false
+  defp risk_receipt_shape?(ref, keys), do: Map.keys(ref) |> Enum.sort() == Enum.sort(keys)
+
+  defp risk_receipt_values?(ref) do
+    risk_receipt_digests?(ref) and risk_receipt_strings?(ref) and risk_receipt_tier?(ref)
+  end
+
+  defp risk_receipt_digests?(ref), do: digest?(ref["digest"]) and digest?(ref["authority_digest"]) and digest?(ref["policy_digest"])
+  defp risk_receipt_strings?(ref), do: sha?(ref["base_sha"]) and sha?(ref["head_sha"]) and repository?(ref["repository"])
+
+  defp risk_receipt_tier?(ref) do
+    Enum.all?(~w(policy_id policy_version compiler_version matrix_revision), &nonblank_string?(ref[&1])) and
+      ref["tier"] in 1..4
+  end
+
+  defp risk_receipt_binding?(ref, attrs) do
+    ref["head_sha"] == attrs["exact_revision"] and ref["repository"] == attrs["repository"] and
+      gate_ids?(ref["required_gate_ids"]) and MapSet.new(ref["required_gate_ids"]) == MapSet.new(attrs["evidence_gates"])
+  end
+
+  defp risk_receipt_state?(ref) do
+    unresolved = ref["unresolved_judgments"]
+
+    string_list?(unresolved) and unresolved == Enum.uniq(unresolved) and
+      is_boolean(ref["escalation_required"]) and unresolved == [] and not ref["escalation_required"]
+  end
+
+  defp sha?(value), do: is_binary(value) and Regex.match?(~r/^[0-9a-f]{40}$/, value)
+  defp digest?(value), do: is_binary(value) and Regex.match?(~r/^[0-9a-f]{64}$/, value)
+  defp repository?(value), do: is_binary(value) and Regex.match?(~r/^[^\s\/]+\/[^\s\/]+$/, value)
+  defp gate_ids?(values), do: string_list?(values) and values != [] and values == Enum.uniq(values) and Enum.all?(values, &nonblank_string?/1)
 
   defp valid_commissioning?(nil), do: true
 

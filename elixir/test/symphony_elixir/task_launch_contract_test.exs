@@ -102,6 +102,34 @@ defmodule SymphonyElixir.Codex.TaskLaunchContractTest do
     assert :invalid_exact_revision in errors
   end
 
+  test "accepts an exact-head risk receipt reference and binds its gates" do
+    ref = risk_receipt_ref()
+    assert {:ok, contract} = TaskLaunchContract.compile(Map.put(valid_attrs(), :risk_receipt_ref, ref))
+    assert contract.risk_receipt_ref["head_sha"] == contract.exact_revision
+    assert contract.risk_receipt_ref["required_gate_ids"] == contract.evidence_gates
+    assert {:ok, ^contract} = TaskLaunchContract.verify(contract)
+  end
+
+  test "rejects malformed, stale, mismatched, or unresolved risk receipt references" do
+    ref = risk_receipt_ref()
+
+    for invalid <- [
+          Map.put(ref, "head_sha", String.duplicate("b", 40)),
+          Map.put(ref, "repository", "other/repository"),
+          Map.put(ref, "required_gate_ids", ["review"]),
+          Map.put(ref, "digest", "not-a-digest"),
+          Map.put(ref, "unresolved_judgments", ["authority unclear"]),
+          Map.put(ref, "escalation_required", true),
+          Map.put(ref, "unexpected", "field")
+        ] do
+      assert {:error, errors} = TaskLaunchContract.compile(Map.put(valid_attrs(), :risk_receipt_ref, invalid))
+      assert :invalid_risk_receipt_ref in errors
+    end
+
+    assert {:error, errors} = TaskLaunchContract.compile(Map.put(valid_attrs(), :risk_receipt_ref, "malformed"))
+    assert :invalid_risk_receipt_ref in errors
+  end
+
   test "enforces role and goal policy boundaries" do
     assert {:error, errors} = TaskLaunchContract.compile(%{valid_attrs() | role: :landing, goal_policy: :worker})
     assert :role_requires_no_goal in errors
@@ -192,6 +220,26 @@ defmodule SymphonyElixir.Codex.TaskLaunchContractTest do
         repository: "moonshotbro/sysmiq-symphony",
         root: "/Users/sysmiq/sysmiq-symphony"
       }
+    }
+  end
+
+  defp risk_receipt_ref do
+    %{
+      "schema" => "sysmiq.risk-receipt.v1",
+      "digest" => String.duplicate("a", 64),
+      "repository" => "moonshotbro/sysmiq-symphony",
+      "base_sha" => String.duplicate("b", 40),
+      "head_sha" => "3d3ee035725b0728f041d8d10fc29f5c8adc42c0",
+      "authority_digest" => String.duplicate("c", 64),
+      "policy_id" => "sysmiq-risk-policy",
+      "policy_version" => "1.0",
+      "policy_digest" => String.duplicate("d", 64),
+      "compiler_version" => "1.0",
+      "matrix_revision" => "matrix-2026-09-02",
+      "tier" => 2,
+      "required_gate_ids" => ["tests"],
+      "unresolved_judgments" => [],
+      "escalation_required" => false
     }
   end
 end
