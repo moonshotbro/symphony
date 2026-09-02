@@ -177,6 +177,69 @@ defmodule SymphonyElixir.Config.Schema do
     import Ecto.Changeset
 
     @primary_key false
+
+    defmodule ProjectBinding do
+      @moduledoc false
+      use Ecto.Schema
+      import Ecto.Changeset
+
+      @primary_key false
+      embedded_schema do
+        field(:enabled, :boolean, default: false)
+        field(:programme, :string)
+        field(:saved_project_id, :string)
+        field(:native_project_id, :string)
+        field(:repository, :string)
+        field(:root, :string)
+      end
+
+      @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
+      def changeset(schema, attrs) do
+        schema
+        |> cast(
+          attrs,
+          [:enabled, :programme, :saved_project_id, :native_project_id, :repository, :root],
+          empty_values: []
+        )
+        |> validate_enabled_binding()
+      end
+
+      defp validate_enabled_binding(changeset) do
+        if get_field(changeset, :enabled) do
+          changeset
+          |> validate_required([:programme, :saved_project_id, :native_project_id, :repository, :root])
+          |> validate_format(:programme, ~r/^[a-z0-9][a-z0-9._-]*$/)
+          |> validate_format(:repository, ~r/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/)
+          |> validate_change(:saved_project_id, &nonblank/2)
+          |> validate_change(:native_project_id, &nonblank/2)
+          |> validate_change(:root, &validate_absolute_root/2)
+          |> validate_distinct_project_namespaces()
+        else
+          changeset
+        end
+      end
+
+      defp nonblank(field, value) when is_binary(value) do
+        if String.trim(value) == "", do: [{field, "can't be blank"}], else: []
+      end
+
+      defp nonblank(field, _value), do: [{field, "must be a string"}]
+
+      defp validate_absolute_root(field, value) when is_binary(value) do
+        if Path.type(value) == :absolute, do: [], else: [{field, "must be absolute"}]
+      end
+
+      defp validate_absolute_root(field, _value), do: [{field, "must be a string"}]
+
+      defp validate_distinct_project_namespaces(changeset) do
+        if get_field(changeset, :saved_project_id) == get_field(changeset, :native_project_id) do
+          add_error(changeset, :native_project_id, "must identify a distinct namespace")
+        else
+          changeset
+        end
+      end
+    end
+
     embedded_schema do
       field(:command, :string, default: "codex app-server")
 
@@ -195,6 +258,7 @@ defmodule SymphonyElixir.Config.Schema do
       field(:turn_timeout_ms, :integer, default: 3_600_000)
       field(:read_timeout_ms, :integer, default: 5_000)
       field(:stall_timeout_ms, :integer, default: 300_000)
+      embeds_one(:project_binding, ProjectBinding, on_replace: :update)
     end
 
     @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
@@ -224,6 +288,7 @@ defmodule SymphonyElixir.Config.Schema do
       |> validate_number(:turn_timeout_ms, greater_than: 0)
       |> validate_number(:read_timeout_ms, greater_than: 0)
       |> validate_number(:stall_timeout_ms, greater_than_or_equal_to: 0)
+      |> cast_embed(:project_binding, with: &ProjectBinding.changeset/2)
     end
   end
 

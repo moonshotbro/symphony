@@ -114,6 +114,7 @@ defmodule SymphonyElixir.TestSupport do
           codex_turn_timeout_ms: 3_600_000,
           codex_read_timeout_ms: 5_000,
           codex_stall_timeout_ms: 300_000,
+          codex_project_binding: nil,
           hook_after_create: nil,
           hook_before_run: nil,
           hook_after_run: nil,
@@ -154,6 +155,7 @@ defmodule SymphonyElixir.TestSupport do
     codex_turn_timeout_ms = Keyword.get(config, :codex_turn_timeout_ms)
     codex_read_timeout_ms = Keyword.get(config, :codex_read_timeout_ms)
     codex_stall_timeout_ms = Keyword.get(config, :codex_stall_timeout_ms)
+    codex_project_binding = Keyword.get(config, :codex_project_binding)
     hook_after_create = Keyword.get(config, :hook_after_create)
     hook_before_run = Keyword.get(config, :hook_before_run)
     hook_after_run = Keyword.get(config, :hook_after_run)
@@ -198,6 +200,7 @@ defmodule SymphonyElixir.TestSupport do
         "  turn_timeout_ms: #{yaml_value(codex_turn_timeout_ms)}",
         "  read_timeout_ms: #{yaml_value(codex_read_timeout_ms)}",
         "  stall_timeout_ms: #{yaml_value(codex_stall_timeout_ms)}",
+        project_binding_yaml(codex_project_binding),
         hooks_yaml(hook_after_create, hook_before_run, hook_after_run, hook_before_remove, hook_timeout_ms),
         observability_yaml(observability_enabled, observability_refresh_ms, observability_render_interval_ms),
         action_ledger_yaml(action_ledger_enabled, action_ledger_path),
@@ -244,6 +247,17 @@ defmodule SymphonyElixir.TestSupport do
       hook_entry("before_remove", hook_before_remove)
     ]
     |> Enum.reject(&is_nil/1)
+    |> Enum.join("\n")
+  end
+
+  defp project_binding_yaml(nil), do: nil
+
+  defp project_binding_yaml(binding) when is_map(binding) do
+    (["  project_binding:", "    enabled: #{yaml_value(Map.get(binding, :enabled, Map.get(binding, "enabled")))}"] ++
+       Enum.map(~w(programme saved_project_id native_project_id repository root), fn key ->
+         value = Map.get(binding, String.to_atom(key), Map.get(binding, key))
+         "    #{key}: #{yaml_value(value)}"
+       end))
     |> Enum.join("\n")
   end
 

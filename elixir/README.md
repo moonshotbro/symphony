@@ -145,6 +145,41 @@ You are working on an issue from the configured tracker {{ issue.identifier }}.
 Title: {{ issue.title }} Body: {{ issue.description }}
 ```
 
+For project-bound Codex task contracts, `codex.project_binding` must declare
+the saved Codex project ID, the distinct native App Server project ID, the
+repository they own, and its absolute root. The two IDs are separate
+namespaces and are never interchangeable:
+
+```yaml
+codex:
+  project_binding:
+    enabled: true
+    programme: build-toscanini
+    saved_project_id: b12752f9-9a65-4194-bc49-77808b21d767
+    native_project_id: 01a04aab-c77c-79b0-ab09-65187353bb4b
+    repository: moonshotbro/sysmiq-symphony
+    root: /path/to/symphony-repository
+```
+
+When enabled, the runtime derives the launch contract from this binding, the
+authoritative tracker issue, and the checked-out workspace revision. It rejects
+missing, ambiguous, or mismatched bindings before opening the App Server. The
+supported protocol carries `cwd`, model, effort and policy on `thread/start`,
+sets the concise visible name with `thread/name/set`, then requires
+`thread/read` to confirm the persisted thread identity before the first turn.
+The saved Codex and native App Server project IDs remain distinct namespaces.
+For the pinned App Server schema, Symphony sends only the validated native ID
+as `thread/start.projectId`; the saved desktop ID is retained only as contract
+evidence and is never interchanged with it.
+
+Caller intent or an asynchronous client task ID is not proof of placement. A
+project-bound task is accepted only when the synchronous start response and
+the later persisted `thread/read` both return the intended native `projectId`.
+Null, missing, or mismatched values fail closed before a turn. The resulting
+failure carries the resolved thread ID together with intended/observed project
+identity for the separate ledger/correlation integration; it does not claim an
+external task as success.
+
 Notes:
 
 - If a value is missing, defaults are used.
