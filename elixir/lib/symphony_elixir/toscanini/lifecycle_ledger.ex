@@ -37,11 +37,26 @@ defmodule SymphonyElixir.Toscanini.LifecycleLedger do
 
   @spec event(GenServer.server(), term()) :: result()
   def event(ledger, envelope) do
+    case event(ledger, envelope, EventContract.initial_state()) do
+      {:ok, _state, action} -> {:ok, envelope, action}
+      other -> other
+    end
+  end
+
+  @doc "Validate and persist an event against the caller's lifecycle state."
+  @spec event(GenServer.server(), term(), EventContract.state()) ::
+          {:ok, EventContract.state(), Action.t()} | {:already_satisfied, Action.t()} | {:error, term()}
+  def event(ledger, envelope, state) do
     with {:ok, envelope} <- EventContract.new(envelope),
          true <- EventContract.event?(envelope),
+         {:ok, next_state} <- EventContract.transition(state, envelope),
          intent = intent(envelope, :event),
          {:ok, action, disposition} <- ActionLedger.plan(ledger, intent) do
-      persist_event(ledger, action, disposition, envelope)
+      case persist_event(ledger, action, disposition, envelope) do
+        {:ok, _envelope, recorded} -> {:ok, next_state, recorded}
+        {:already_satisfied, recorded} -> {:already_satisfied, recorded}
+        error -> error
+      end
     else
       false -> {:error, :event_required}
       error -> error
@@ -88,9 +103,9 @@ defmodule SymphonyElixir.Toscanini.LifecycleLedger do
       "disposition" => "event_recorded"
     }
 
-    case ActionLedger.transition(ledger, action.id, :succeeded, effect) do
-      {:ok, recorded} -> {:ok, envelope, recorded}
-      error -> error
+    with {:ok, _dispatched} <- ActionLedger.transition(ledger, action.id, :dispatched),
+         {:ok, recorded} <- ActionLedger.transition(ledger, action.id, :succeeded, effect) do
+      {:ok, envelope, recorded}
     end
   end
 
@@ -100,7 +115,7 @@ defmodule SymphonyElixir.Toscanini.LifecycleLedger do
     source = %{
       "programme" => identity.programme,
       "repository" => identity.repo,
-      "issue" => Integer.to_string(identity.issue),
+      "issue_id" => Integer.to_string(identity.issue),
       "role" => identity.role,
       "task" => identity.task,
       "attempt" => Integer.to_string(identity.attempt),

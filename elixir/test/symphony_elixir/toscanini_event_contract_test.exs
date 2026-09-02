@@ -2,7 +2,8 @@
 defmodule SymphonyElixir.Toscanini.EventContractTest do
   use ExUnit.Case, async: true
 
-  alias SymphonyElixir.Toscanini.EventContract
+  alias SymphonyElixir.Toscanini.{EventContract, LifecycleLedger}
+  alias SymphonyElixir.ActionLedger
   alias SymphonyElixir.Codex.TaskAccountabilityRegistry
 
   @head String.duplicate("a", 40)
@@ -540,5 +541,20 @@ defmodule SymphonyElixir.Toscanini.EventContractTest do
     for path <- [[:data, :identity, :task], [:data, :sender, :id], [:data, :identity, :idempotency], [:data, :delivery, :idempotency_key]] do
       assert {:error, :malformed_data} = EventContract.new(put_in(event("e1", 1, "task_accepted"), path, "Customer_Jane_Doe_medical_diagnosis"))
     end
+  end
+
+  test "lifecycle ledger validates ordering before recording and deduplicates readback" do
+    path = Path.join(System.tmp_dir!(), "toscanini-lifecycle-#{System.unique_integer([:positive])}.jsonl")
+    {:ok, ledger} = ActionLedger.start_link(name: nil, path: path)
+
+    on_exit(fn ->
+      if Process.alive?(ledger), do: GenServer.stop(ledger)
+      File.rm(path)
+    end)
+
+    first = event("e1", 1, "task_accepted")
+    assert {:ok, state, _action} = LifecycleLedger.event(ledger, first, EventContract.initial_state())
+    assert {:error, :causation_mismatch} = LifecycleLedger.event(ledger, event("e3", 3, "durable_progress"), state)
+    assert {:already_satisfied, _action} = LifecycleLedger.event(ledger, first, EventContract.initial_state())
   end
 end
