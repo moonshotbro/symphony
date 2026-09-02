@@ -1,12 +1,12 @@
 # credo:disable-for-this-file
 defmodule SymphonyElixir.Toscanini.EventContract do
   @moduledoc "Privacy-safe, deterministic Toscanini command and event contract."
-  @version "1.0.0"
+  @version "1.1.0"
   @states ~w(discovered assessed ready claimed dispatched running checkpointed review_requested reconciled needs_input blocked context_exhausted usage_limited failed recovery_pending rejected cancelled archived dead_letter)
   @events ~w(accepted started checkpointed review_requested completed failed blocked needs_input cancelled context_exhausted usage_limited)
   @commands ~w(dispatch_requested review_requested integration_requested reconcile_requested needs_input_acknowledged archive_requested)
   @top ~w(specversion id source type subject time datacontenttype dataschema correlation_id causation_id data)
-  @data ~w(envelope_version kind message_id correlation_id causation_id sender recipient authority_ref identity lifecycle evidence delivery privacy)
+  @data ~w(envelope_version kind message_id correlation_id causation_id sender recipient authority_ref identity lifecycle evidence delivery recovery privacy)
   @schemas %{
     sender: ~w(kind id role),
     recipient: ~w(kind id role),
@@ -16,6 +16,7 @@ defmodule SymphonyElixir.Toscanini.EventContract do
     evidence: ~w(refs),
     ref: ~w(url digest kind),
     delivery: ~w(idempotency_key sequence),
+    recovery: ~w(original_route effective_route governed_effort attempt budget resume_at failure_class response_started effect_uncertain lifecycle outcome circuit_state),
     privacy: ~w(classification retention redacted)
   }
   @keys (@top ++ @data ++ Enum.flat_map(@schemas, fn {_, v} -> v end)) |> Enum.uniq() |> Enum.map(&String.to_atom/1)
@@ -205,9 +206,10 @@ defmodule SymphonyElixir.Toscanini.EventContract do
 
   defp data(d) when is_map(d) do
     if schema?(d, @data) and schema?(d.sender, @schemas.sender) and schema?(d.recipient, @schemas.recipient) and schema?(d.authority_ref, @schemas.authority) and schema?(d.identity, @schemas.identity) and
-         schema?(d.lifecycle, @schemas.lifecycle) and schema?(d.evidence, @schemas.evidence) and schema?(d.delivery, @schemas.delivery) and schema?(d.privacy, @schemas.privacy) and
+         schema?(d.lifecycle, @schemas.lifecycle) and schema?(d.evidence, @schemas.evidence) and schema?(d.delivery, @schemas.delivery) and schema?(d.recovery, @schemas.recovery) and
+         schema?(d.privacy, @schemas.privacy) and
          binary?(d.message_id) and binary?(d.correlation_id) and nullable_binary?(d.causation_id) and identity?(d.identity) and principal?(d.sender) and principal?(d.recipient) and
-         authority?(d.authority_ref, d.identity) and lifecycle?(d.lifecycle) and delivery?(d.delivery) and privacy?(d.privacy) and evidence?(d.evidence, d.identity),
+         authority?(d.authority_ref, d.identity) and lifecycle?(d.lifecycle) and delivery?(d.delivery) and recovery?(d.recovery) and privacy?(d.privacy) and evidence?(d.evidence, d.identity),
        do: :ok,
        else: {:error, :malformed_data}
   end
@@ -315,6 +317,24 @@ defmodule SymphonyElixir.Toscanini.EventContract do
   defp principal?(_), do: false
   defp lifecycle?(l), do: binary?(l.state) and nullable_binary?(l.terminal_reason) and nullable_binary?(l.blocking_reason) and nullable_binary?(l.requested_action)
   defp delivery?(d), do: binary?(d.idempotency_key) and positive?(d.sequence)
+
+  defp recovery?(recovery) do
+    route?(recovery.original_route) and route?(recovery.effective_route) and effort?(recovery.governed_effort) and bounded_attempt?(recovery.attempt) and
+      bounded_budget?(recovery.budget) and nullable_timestamp?(recovery.resume_at) and failure_class?(recovery.failure_class) and is_boolean(recovery.response_started) and
+      is_boolean(recovery.effect_uncertain) and recovery_lifecycle?(recovery.lifecycle) and recovery_outcome?(recovery.outcome) and circuit_state?(recovery.circuit_state)
+  end
+
+  defp route?(value), do: value in ["primary", "fallback", "held"]
+  defp effort?(value), do: value in ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]
+  defp bounded_attempt?(value), do: is_integer(value) and value in 0..@limits.list
+  defp bounded_budget?(value), do: is_integer(value) and value in 0..1_000_000
+  defp nullable_timestamp?(nil), do: true
+  defp nullable_timestamp?(value) when is_binary(value) and byte_size(value) <= @limits.string, do: match?({:ok, _, _}, DateTime.from_iso8601(value))
+  defp nullable_timestamp?(_), do: false
+  defp failure_class?(value), do: value in ["none", "capacity", "rate_limited", "timeout", "provider_error", "unknown"]
+  defp recovery_lifecycle?(value), do: value in ["not_required", "observed", "held", "scheduled", "resumed", "abandoned"]
+  defp recovery_outcome?(value), do: value in ["pending", "recovered", "failed", "not_started"]
+  defp circuit_state?(value), do: value in ["closed", "open", "half_open"]
   defp privacy?(p), do: p.classification in ["metadata", "confidential"] and p.retention in ["audit", "operational"] and is_boolean(p.redacted)
   defp binary?(x), do: is_binary(x) and byte_size(x) in 1..@limits.string
   defp nullable_binary?(nil), do: true

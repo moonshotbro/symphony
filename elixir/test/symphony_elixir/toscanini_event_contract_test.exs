@@ -14,7 +14,7 @@ defmodule SymphonyElixir.Toscanini.EventContractTest do
       dataschema: "urn:sysmiq:test:1",
       correlation_id: "run-1",
       data: %{
-        envelope_version: "1.0.0",
+        envelope_version: "1.1.0",
         kind: "event",
         message_id: id,
         correlation_id: "run-1",
@@ -26,6 +26,20 @@ defmodule SymphonyElixir.Toscanini.EventContractTest do
         lifecycle: %{state: name, terminal_reason: nil, blocking_reason: nil, requested_action: nil},
         evidence: %{refs: []},
         delivery: %{idempotency_key: "i-#{id}", sequence: seq},
+        recovery: %{
+          original_route: "primary",
+          effective_route: "held",
+          governed_effort: "medium",
+          attempt: 1,
+          budget: 32_000,
+          resume_at: "2026-09-02T00:00:00Z",
+          failure_class: "capacity",
+          response_started: false,
+          effect_uncertain: true,
+          lifecycle: "held",
+          outcome: "pending",
+          circuit_state: "open"
+        },
         privacy: %{classification: "metadata", retention: "audit", redacted: false}
       }
     }
@@ -152,5 +166,23 @@ defmodule SymphonyElixir.Toscanini.EventContractTest do
 
     assert {:error, :malformed_data} =
              EventContract.new(put_in(event("e1", 1, "accepted").data[:evidence][:refs], [hostile_ref]))
+  end
+
+  test "requires a bounded typed provider-capacity recovery record" do
+    base = event("e1", 1, "accepted")
+
+    assert {:ok, envelope} = EventContract.new(base)
+    assert envelope.data.recovery.effective_route == "held"
+    assert envelope.data.recovery.effect_uncertain
+
+    assert {:error, :malformed_data} = EventContract.new(put_in(base.data[:recovery][:original_route], "https://provider.example"))
+    assert {:error, :malformed_data} = EventContract.new(put_in(base.data[:recovery][:governed_effort], "unbounded"))
+    assert {:error, :malformed_data} = EventContract.new(put_in(base.data[:recovery][:attempt], 33))
+    assert {:error, :malformed_data} = EventContract.new(put_in(base.data[:recovery][:budget], 1_000_001))
+    assert {:error, :malformed_data} = EventContract.new(put_in(base.data[:recovery][:resume_at], "customer data"))
+    assert {:error, :malformed_data} = EventContract.new(put_in(base.data[:recovery][:response_started], "unknown"))
+    assert {:error, :malformed_data} = EventContract.new(put_in(base.data[:recovery][:failure_class], "tool_payload"))
+    assert {:error, :unknown_field} = EventContract.new(put_in(base.data[:recovery][:prompt], "customer data"))
+    assert {:error, :unknown_field} = EventContract.new(put_in(base.data[:recovery][:arbitrary], %{nested: true}))
   end
 end
