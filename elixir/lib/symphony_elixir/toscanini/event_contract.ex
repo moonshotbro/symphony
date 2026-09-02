@@ -346,8 +346,8 @@ defmodule SymphonyElixir.Toscanini.EventContract do
   defp delivery?(d), do: operation_identity?(d.idempotency_key) and positive?(d.sequence)
 
   defp recovery?(recovery) do
-    recovery.original_route == "sol" and route?(recovery.effective_route) and ordered_routes?(recovery.attempted_routes) and effort?(recovery.governed_effort) and identifier?(recovery.goal_id) and
-      identifier?(recovery.operation_id) and bounded_attempt?(recovery.attempt) and
+    recovery.original_route == "sol" and route?(recovery.effective_route) and ordered_routes?(recovery.attempted_routes) and effort?(recovery.governed_effort) and issued?(recovery.goal_id, "goal") and
+      operation_identity?(recovery.operation_id) and bounded_attempt?(recovery.attempt) and
       bounded_budget?(recovery.retry_after_ms) and bounded_attempt?(recovery.retries_remaining) and failure_class?(recovery.failure_class) and is_boolean(recovery.response_started) and
       is_boolean(recovery.effect_uncertain) and recovery_lifecycle?(recovery.lifecycle) and recovery_outcome?(recovery.outcome) and circuit_state?(recovery.circuit_state) and
       recovery.next_safe_action in ["none", "retry", "resume", "attention", "abandon"] and
@@ -454,11 +454,12 @@ defmodule SymphonyElixir.Toscanini.EventContract do
   defp digest?(x), do: is_binary(x) and x =~ ~r/^[0-9a-fA-F]{7,128}$/
   defp repo?(x), do: is_binary(x) and x =~ ~r/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/
   defp identifier?(x), do: is_binary(x) and byte_size(x) in 1..128 and x =~ ~r/^[A-Za-z0-9._:-]+$/
-  defp programme?(x), do: x in ["p1", "build-toscanini"] or (is_binary(x) and x =~ ~r/^toscanini-[a-z0-9-]{1,96}$/)
+  defp programme?(x), do: issued?(x, "programme")
   defp operational_role?(x), do: x in ["implementation", "programme", "landing", "recovery", "research", "monitor", "telemetry", "acceptance"] or x in TaskAccountabilityRegistry.roles()
-  defp task_identity?(x), do: is_binary(x) and x =~ ~r/^(t\d+|issue-\d+|task-[a-z0-9][a-z0-9-]{0,96})$/
-  defp principal_identity?(x), do: x == "programme" or (is_binary(x) and x =~ ~r/^(w\d+|worker-[a-z0-9][a-z0-9-]{0,96}|role-[a-z0-9][a-z0-9-]{0,96}|adapter-[a-z0-9][a-z0-9-]{0,96})$/)
-  defp operation_identity?(x), do: is_binary(x) and x =~ ~r/^(i|op)-[a-z0-9][a-z0-9._:-]{0,120}$/
+  defp task_identity?(x), do: issued?(x, "task")
+  defp principal_identity?(x), do: x == "programme" or issued?(x, "worker") or issued?(x, "role") or issued?(x, "adapter")
+  defp operation_identity?(x), do: issued?(x, "op")
+  defp issued?(value, namespace), do: is_binary(value) and value =~ Regex.compile!("^" <> namespace <> "-[0-9a-f]{32}$")
   defp nullable_reason?(nil), do: true
   defp nullable_reason?(value), do: value in ["capacity", "rate_limited", "timeout", "provider_error", "unknown", "operator_attention", "needs_judgment", "superseded", "cancelled", "failed"]
   defp nullable_action?(nil), do: true

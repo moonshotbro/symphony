@@ -12,7 +12,7 @@ defmodule SymphonyElixir.Toscanini.EventContractTest do
     %{
       specversion: "1.0",
       id: id,
-      source: "urn:sysmiq:worker:w1",
+      source: "urn:sysmiq:worker:worker-000000000000000000000000000000e1",
       type: "sysmiq.work.#{name}.v1",
       subject: "github:moonshotbro/symphony#51",
       dataschema: "urn:sysmiq:test:1",
@@ -24,19 +24,19 @@ defmodule SymphonyElixir.Toscanini.EventContractTest do
         message_id: id,
         correlation_id: "run-1",
         causation_id: causation_id,
-        sender: %{kind: "worker", id: "w1", role: "implementation"},
+        sender: %{kind: "worker", id: "worker-000000000000000000000000000000e1", role: "implementation"},
         recipient: %{kind: "role", id: "programme", role: "programme"},
         authority_ref: %{repository: "moonshotbro/symphony", issue: 51, pr: nil, url: "https://github.com/moonshotbro/symphony/issues/51", expected_revision: "abc1234"},
         identity: %{
-          programme: "p1",
+          programme: "programme-000000000000000000000000000000e1",
           repo: "moonshotbro/symphony",
           issue: 51,
           pr: nil,
           role: "execution_production",
-          task: "t1",
+          task: "task-00000000000000000000000000000001",
           attempt: 0,
           fence: 1,
-          idempotency: "i-#{id}",
+          idempotency: "op-#{String.pad_leading(id, 32, "0")}",
           exact_revision: "abc1234",
           registry_id: "SYS-LIB-ROLE-REGISTRY-001",
           registry_version: "1.0",
@@ -48,14 +48,14 @@ defmodule SymphonyElixir.Toscanini.EventContractTest do
         },
         lifecycle: %{state: name, terminal_reason: nil, blocking_reason: nil, requested_action: nil},
         evidence: %{refs: refs},
-        delivery: %{idempotency_key: "i-#{id}", sequence: seq},
+        delivery: %{idempotency_key: "op-#{String.pad_leading(id, 32, "0")}", sequence: seq},
         recovery: %{
           original_route: "sol",
           effective_route: "sol",
           attempted_routes: ["sol"],
           governed_effort: "medium",
-          goal_id: "goal-51",
-          operation_id: "operation-#{id}",
+          goal_id: "goal-00000000000000000000000000000051",
+          operation_id: "op-#{String.pad_leading(id, 32, "0")}",
           attempt: 0,
           retry_after_ms: 0,
           retries_remaining: 0,
@@ -233,8 +233,8 @@ defmodule SymphonyElixir.Toscanini.EventContractTest do
     ]
 
     assert {:ok, %{current: "durable_progress"}} = EventContract.replay(events)
-    assert {:ok, _} = EventContract.new(event("blocked", 1, "blocked"))
-    assert {:ok, _} = EventContract.new(event("judgment", 1, "needs_judgment"))
+    assert {:ok, _} = EventContract.new(event("e7", 1, "blocked"))
+    assert {:ok, _} = EventContract.new(event("e8", 1, "needs_judgment"))
     assert {:error, :malformed_data} = EventContract.new(event("old", 1, "needs_input"))
   end
 
@@ -448,7 +448,7 @@ defmodule SymphonyElixir.Toscanini.EventContractTest do
 
   test "accepts controlled structural domains and rejects disguised prose across all generated identifiers" do
     assert {:ok, _} = EventContract.new(event("e1", 1, "task_accepted"))
-    assert {:ok, _} = EventContract.new(put_in(event("e1", 1, "task_accepted").data[:identity][:programme], "toscanini-build-51"))
+    assert {:ok, _} = EventContract.new(put_in(event("e1", 1, "task_accepted").data[:identity][:programme], "programme-00000000000000000000000000000051"))
 
     for path <- [[:data, :identity, :task], [:data, :sender, :id], [:data, :identity, :idempotency], [:data, :delivery, :idempotency_key]] do
       assert {:error, :malformed_data} = EventContract.new(put_in(event("e1", 1, "task_accepted"), path, "Customer_Jane_Doe_medical_diagnosis"))
