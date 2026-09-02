@@ -52,8 +52,11 @@ defmodule SymphonyElixir.Toscanini.EventContract do
   def initial_state(_), do: %State{}
   @spec transition(term(), term()) :: result(state())
   def transition(state, envelope), do: safe(fn -> transition_value(state, envelope) end)
+  @spec replay(term()) :: result(state())
+  def replay(values), do: safe(fn -> replay_value(values, initial_state()) end)
+
   @spec replay(term(), term()) :: result(state())
-  def replay(values, state \\ initial_state()), do: safe(fn -> replay_value(values, state) end)
+  def replay(values, state), do: safe(fn -> replay_value(values, state) end)
 
   defp new_value(value) when is_map(value) do
     with {:ok, envelope} <- normalize(value), :ok <- validate_value(envelope), do: {:ok, envelope}
@@ -82,20 +85,20 @@ defmodule SymphonyElixir.Toscanini.EventContract do
 
   defp transition_value(_, _), do: {:error, :malformed_state}
 
-  defp replay_value(values, %State{} = state) when is_list(values) do
-    if proper?(values) do
-      Enum.reduce_while(values, {:ok, state}, fn value, {:ok, current} ->
-        case transition_value(current, value) do
-          {:ok, next} -> {:cont, {:ok, next}}
-          error -> {:halt, error}
-        end
-      end)
-    else
-      {:error, :malformed_replay}
+  defp replay_value(values, %State{} = state) when is_list(values), do: replay_events(values, state)
+
+  defp replay_value(_, _), do: {:error, :malformed_replay}
+
+  defp replay_events([], state), do: {:ok, state}
+
+  defp replay_events([value | tail], state) when is_list(tail) do
+    case transition_value(state, value) do
+      {:ok, next} -> replay_events(tail, next)
+      error -> error
     end
   end
 
-  defp replay_value(_, _), do: {:error, :malformed_replay}
+  defp replay_events(_, _), do: {:error, :malformed_replay}
 
   defp normalize(attrs) do
     with :ok <- keys(attrs, @top), {:ok, data} <- map(attrs[:data] || attrs["data"] || %{}) do
@@ -125,25 +128,22 @@ defmodule SymphonyElixir.Toscanini.EventContract do
   defp map(_), do: {:error, :malformed_data}
   defp value(value) when is_map(value), do: map(value)
 
-  defp value(value) when is_list(value) do
-    if proper?(value) do
-      Enum.reduce_while(value, {:ok, []}, fn x, {:ok, acc} ->
-        case value(x) do
-          {:ok, y} -> {:cont, {:ok, [y | acc]}}
-          error -> {:halt, error}
-        end
-      end)
-      |> then(fn
-        {:ok, xs} -> {:ok, Enum.reverse(xs)}
-        error -> error
-      end)
-    else
-      {:error, :malformed_data}
+  defp value(value) when is_list(value), do: normalize_list(value, [])
+
+  defp value(value) when is_binary(value) or is_integer(value) or is_float(value) or is_boolean(value) or is_nil(value), do: {:ok, value}
+
+  defp value(_), do: {:error, :malformed_data}
+
+  defp normalize_list([], acc), do: {:ok, Enum.reverse(acc)}
+
+  defp normalize_list([item | tail], acc) when is_list(tail) do
+    case value(item) do
+      {:ok, normalized} -> normalize_list(tail, [normalized | acc])
+      error -> error
     end
   end
 
-  defp value(value) when is_binary(value) or is_integer(value) or is_float(value) or is_boolean(value) or is_nil(value), do: {:ok, value}
-  defp value(_), do: {:error, :malformed_data}
+  defp normalize_list(_, _), do: {:error, :malformed_data}
   defp key(value) when is_atom(value), do: if(value in @keys, do: {:ok, value}, else: :error)
   defp key(value) when is_binary(value), do: Enum.find_value(@keys, :error, fn atom -> if value == Atom.to_string(atom), do: {:ok, atom} end)
   defp key(_), do: :error
@@ -151,7 +151,6 @@ defmodule SymphonyElixir.Toscanini.EventContract do
   defp keys(map, allowed) when is_map(map),
     do: if(Enum.all?(Map.keys(map), fn k -> (is_atom(k) and Atom.to_string(k) in allowed) or (is_binary(k) and k in allowed) end), do: :ok, else: {:error, :unknown_field})
 
-  defp keys(_, _), do: {:error, :malformed_envelope}
   defp fetch(map, key, aliases), do: Enum.find_value([key, Atom.to_string(key) | aliases], fn candidate -> Map.get(map, candidate) end)
   defp ensure(%__MODULE__{} = e), do: {:ok, e}
   defp ensure(map) when is_map(map), do: new_value(map)
@@ -198,20 +197,34 @@ defmodule SymphonyElixir.Toscanini.EventContract do
   defp github(url) when is_binary(url) and byte_size(url) <= @limits.string do
     uri = URI.parse(url)
 
-    with true <- uri.scheme == "https" and uri.host == "github.com" and is_nil(uri.userinfo) and is_nil(uri.query) and is_nil(uri.fragment),
-         [owner, repo, resource, target] <- String.split(uri.path || "", "/", trim: true),
-         true <- repo?(owner <> "/" <> repo),
-         {:ok, kind} <- ref_kind(resource, target),
-         do: {:ok, %{repo: owner <> "/" <> repo, kind: kind, target: target}},
-         else: (_ -> :error)
+    if uri.scheme == "https" and uri.host == "github.com" and is_nil(uri.userinfo) and is_nil(uri.query) and is_nil(uri.fragment) do
+      case String.split(uri.path || "", "/", trim: true) do
+        [owner, repo, resource, target] ->
+          repository = owner <> "/" <> repo
+
+          if repo?(repository) do
+            case ref_kind(resource, target) do
+              {:ok, kind} -> {:ok, %{repo: repository, kind: kind, target: target}}
+              :error -> :error
+            end
+          else
+            :error
+          end
+
+        _ ->
+          :error
+      end
+    else
+      :error
+    end
   rescue
     _ -> :error
   end
 
   defp github(_), do: :error
-  defp ref_kind("issues", x), do: if(is_binary(x) and x =~ ~r/^\d+$/, do: {:ok, :issue}, else: :error)
-  defp ref_kind("pull", x), do: if(is_binary(x) and x =~ ~r/^\d+$/, do: {:ok, :pull_request}, else: :error)
-  defp ref_kind("commit", x), do: if(is_binary(x) and x =~ ~r/^[0-9a-fA-F]{7,128}$/, do: {:ok, :commit}, else: :error)
+  defp ref_kind("issues", x) when is_binary(x), do: if(x =~ ~r/^\d+$/, do: {:ok, :issue}, else: :error)
+  defp ref_kind("pull", x) when is_binary(x), do: if(x =~ ~r/^\d+$/, do: {:ok, :pull_request}, else: :error)
+  defp ref_kind("commit", x) when is_binary(x), do: if(x =~ ~r/^[0-9a-fA-F]{7,128}$/, do: {:ok, :commit}, else: :error)
   defp ref_kind(_, _), do: :error
 
   defp authority?(a, i) do
@@ -233,11 +246,14 @@ defmodule SymphonyElixir.Toscanini.EventContract do
 
   defp evidence_ref?(ref, i) when is_map(ref) do
     if schema?(ref, @schemas.ref) do
-      with {:ok, parsed} <- github(ref.url),
-           true <- ref.kind in ["issue", "pull_request", "commit", "check", "review"],
-           true <- is_nil(ref.digest) or digest?(ref.digest),
-           do: evidence_target?(parsed, ref.kind, i),
-           else: (_ -> false)
+      case github(ref.url) do
+        {:ok, parsed} ->
+          ref.kind in ["issue", "pull_request", "commit", "check", "review"] and
+            (is_nil(ref.digest) or digest?(ref.digest)) and evidence_target?(parsed, ref.kind, i)
+
+        :error ->
+          false
+      end
     else
       false
     end
@@ -294,16 +310,16 @@ defmodule SymphonyElixir.Toscanini.EventContract do
   defp unsafe?(_), do: false
   defp bounds(e), do: if(bounded?(e), do: :ok, else: {:error, :malformed_envelope})
   defp bounded?(%__MODULE__{} = e), do: bounded?(Map.from_struct(e), 0)
-  defp bounded?(x), do: bounded?(x, 0)
   defp bounded?(_, d) when d > @limits.depth, do: false
   defp bounded?(x, _) when is_nil(x) or is_boolean(x) or is_integer(x) or is_float(x), do: true
   defp bounded?(x, _) when is_binary(x), do: byte_size(x) <= @limits.string
   defp bounded?(x, d) when is_map(x), do: map_size(x) <= @limits.entries and Enum.all?(x, fn {k, v} -> (is_atom(k) or is_binary(k)) and bounded?(v, d + 1) end)
   defp bounded?(x, d) when is_list(x), do: proper?(x) and length(x) <= @limits.list and Enum.all?(x, &bounded?(&1, d + 1))
   defp bounded?(_, _), do: false
-  defp proper?(x), do: proper?(x, 0)
+
+  defp proper?(value), do: proper?(value, 0)
   defp proper?([], _), do: true
-  defp proper?([_ | tail], n) when n < @limits.list, do: proper?(tail, n + 1)
+  defp proper?([_ | tail], count) when count < @limits.list, do: proper?(tail, count + 1)
   defp proper?(_, _), do: false
 
   defp schema?(map, keys) when is_map(map),
@@ -354,11 +370,13 @@ defmodule SymphonyElixir.Toscanini.EventContract do
   defp identity(%{data: %{identity: x}}), do: x
   defp sequence(%{data: %{delivery: %{sequence: x}}}), do: x
 
-  defp safe(fun) do
-    fun.()
-  rescue
-    _ -> {:error, :malformed_envelope}
-  catch
-    _, _ -> {:error, :malformed_envelope}
+  defp safe(fun) when is_function(fun, 0) do
+    try do
+      fun.()
+    rescue
+      _ -> {:error, :malformed_envelope}
+    catch
+      _, _ -> {:error, :malformed_envelope}
+    end
   end
 end
