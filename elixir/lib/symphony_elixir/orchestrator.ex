@@ -717,8 +717,12 @@ defmodule SymphonyElixir.Orchestrator do
           {true, stage} when stage in [nil, :observing] ->
             # First expiry is an observation checkpoint. Do not kill a worker
             # before we have attempted the bounded recovery protocol.
-            Logger.warning("Issue stalled; recording inspection checkpoint: issue_id=#{issue_id} issue_identifier=#{identifier} elapsed_ms=#{elapsed_ms}")
-            put_in(state.running[issue_id][:recovery_stage], :inspected)
+            inspection = stalled_worker_inspection(running_entry)
+            Logger.warning("Issue stalled; recording inspection checkpoint: issue_id=#{issue_id} issue_identifier=#{identifier} elapsed_ms=#{elapsed_ms} inspection=#{inspect(inspection)}")
+
+            state.running[issue_id]
+            |> Map.merge(%{recovery_stage: :inspected, recovery_started_at: DateTime.utc_now(), inspection: inspection})
+            |> then(&%{state | running: Map.put(state.running, issue_id, &1)})
 
           {true, :inspected} ->
             case Map.get(running_entry, :pid) do
@@ -730,7 +734,7 @@ defmodule SymphonyElixir.Orchestrator do
             end
 
           {true, :steered} when is_pid(running_entry.pid) ->
-            if Process.alive?(running_entry.pid) do
+            if Process.alive?(running_entry.pid) and not recovery_window_expired?(running_entry, now, timeout_ms) do
               Logger.warning("Holding stalled issue until steered worker is terminal: issue_id=#{issue_id} issue_identifier=#{identifier}")
               state
             else
@@ -750,11 +754,31 @@ defmodule SymphonyElixir.Orchestrator do
     case AgentRunner.steer(pid, "Continue from the current state; make one durable progress step and report the result.") do
       {:ok, _provider_result} ->
         Logger.info("Issued one bounded stall recovery steer: issue_id=#{issue_id} issue_identifier=#{identifier}")
-        put_in(state.running[issue_id][:recovery_stage], :steered)
+
+        state.running[issue_id]
+        |> Map.merge(%{recovery_stage: :steered, recovery_started_at: DateTime.utc_now()})
+        |> then(&%{state | running: Map.put(state.running, issue_id, &1)})
 
       {:error, reason} ->
         Logger.warning("Stall recovery steer was rejected or unavailable: issue_id=#{issue_id} reason=#{inspect(reason)}")
         state
+    end
+  end
+
+  defp stalled_worker_inspection(running_entry) do
+    %{
+      worker_alive: is_pid(Map.get(running_entry, :pid)) and Process.alive?(running_entry.pid),
+      session_present: is_binary(Map.get(running_entry, :session_id)),
+      workspace_present: is_binary(Map.get(running_entry, :workspace_path)),
+      thread_present: is_binary(Map.get(running_entry, :thread_id)),
+      turn_present: is_binary(Map.get(running_entry, :turn_id))
+    }
+  end
+
+  defp recovery_window_expired?(running_entry, now, timeout_ms) do
+    case Map.get(running_entry, :recovery_started_at) do
+      %DateTime{} = started_at -> DateTime.diff(now, started_at, :millisecond) > timeout_ms
+      _ -> false
     end
   end
 
@@ -1915,6 +1939,9 @@ defmodule SymphonyElixir.Orchestrator do
           last_codex_timestamp: metadata.last_codex_timestamp,
           last_codex_message: metadata.last_codex_message,
           last_codex_event: metadata.last_codex_event,
+          recovery_stage: Map.get(metadata, :recovery_stage),
+          recovery_started_at: Map.get(metadata, :recovery_started_at),
+          inspection: Map.get(metadata, :inspection),
           runtime_seconds: running_seconds(metadata.started_at, now)
         }
       end)
@@ -2058,6 +2085,8 @@ defmodule SymphonyElixir.Orchestrator do
       Map.merge(running_entry, %{
         last_codex_timestamp: timestamp,
         last_durable_progress_at: durable_progress_timestamp(running_entry, event, timestamp),
+        recovery_stage: recovery_stage_after_progress(running_entry, event),
+        recovery_started_at: recovery_started_at_after_progress(running_entry, event),
         last_codex_message: summarize_codex_update(update),
         session_id: session_id_for_update(running_entry.session_id, update),
         thread_id: correlation_value(running_entry, update, :thread_id),
@@ -2081,6 +2110,16 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp durable_progress_timestamp(running_entry, _event, _timestamp),
     do: Map.get(running_entry, :last_durable_progress_at)
+
+  defp recovery_stage_after_progress(running_entry, event) when event in @durable_progress_events,
+    do: if(Map.get(running_entry, :recovery_stage) == :steered, do: :observing, else: Map.get(running_entry, :recovery_stage))
+
+  defp recovery_stage_after_progress(running_entry, _event), do: Map.get(running_entry, :recovery_stage)
+
+  defp recovery_started_at_after_progress(running_entry, event) when event in @durable_progress_events,
+    do: if(Map.get(running_entry, :recovery_stage) == :steered, do: nil, else: Map.get(running_entry, :recovery_started_at))
+
+  defp recovery_started_at_after_progress(running_entry, _event), do: Map.get(running_entry, :recovery_started_at)
 
   defp codex_app_server_pid_for_update(_existing, %{codex_app_server_pid: pid})
        when is_binary(pid),
