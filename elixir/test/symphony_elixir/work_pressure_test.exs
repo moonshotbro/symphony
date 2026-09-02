@@ -14,7 +14,7 @@ defmodule SymphonyElixir.WorkPressureTest do
         repository: "repo-1",
         write_domain: "domain-#{id}",
         role: "implementation",
-        exact_revision: "rev-#{id}",
+        authority_revision: "rev-#{id}",
         idempotency_key: "dispatch-#{id}"
       },
       Map.new(opts)

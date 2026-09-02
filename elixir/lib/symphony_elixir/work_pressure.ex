@@ -13,7 +13,7 @@ defmodule SymphonyElixir.WorkPressure do
   than as a retryable failure, so a full system does not create retry storms.
   """
 
-  @required_item_keys ~w(issue_id task_id project_id repository write_domain role exact_revision idempotency_key)a
+  @required_item_keys ~w(issue_id task_id project_id repository write_domain role authority_revision idempotency_key)a
   @optional_item_keys ~w(priority host fence_epoch)a
   @required_limit_keys ~w(global host project repository write_domain)a
 
@@ -24,7 +24,7 @@ defmodule SymphonyElixir.WorkPressure do
           required(:repository) => String.t(),
           required(:write_domain) => String.t(),
           required(:role) => String.t(),
-          required(:exact_revision) => String.t(),
+          required(:authority_revision) => String.t(),
           required(:idempotency_key) => String.t(),
           optional(:priority) => integer(),
           optional(:host) => String.t(),
@@ -122,7 +122,7 @@ defmodule SymphonyElixir.WorkPressure do
   end
 
   defp validate_item_values(item) do
-    string_keys = ~w(issue_id task_id project_id repository write_domain role exact_revision idempotency_key host)a
+    string_keys = ~w(issue_id task_id project_id repository write_domain role authority_revision idempotency_key host)a
 
     cond do
       Enum.any?(string_keys, fn key -> Map.has_key?(item, key) and not valid_text?(item[key]) end) ->
@@ -135,7 +135,8 @@ defmodule SymphonyElixir.WorkPressure do
           (not is_integer(item.fence_epoch) or item.fence_epoch < 0) ->
         {:error, :fence_epoch_invalid}
 
-      true -> :ok
+      true ->
+        :ok
     end
   end
 
@@ -187,6 +188,7 @@ defmodule SymphonyElixir.WorkPressure do
 
   defp capacity_available?(item, active, selected, limits) do
     occupants = active ++ selected
+
     Enum.all?(
       [{:host, :host}, {:project, :project_id}, {:repository, :repository}, {:write_domain, :write_domain}],
       fn {limit_key, item_key} ->
@@ -197,9 +199,11 @@ defmodule SymphonyElixir.WorkPressure do
   end
 
   defp limit_for(value, _dimension) when is_integer(value), do: value
+
   defp limit_for(value, dimension) when is_map(value) do
     Map.get(value, dimension) || Map.get(value, to_string(dimension))
   end
+
   defp limit_for(_value, _dimension), do: nil
 
   defp count_dimension(items, key, value), do: Enum.count(items, &(Map.get(&1, key) == value))

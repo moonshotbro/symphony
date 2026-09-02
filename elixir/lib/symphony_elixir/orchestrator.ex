@@ -14,7 +14,8 @@ defmodule SymphonyElixir.Orchestrator do
     CoordinationAdapter,
     StatusDashboard,
     Tracker,
-    Workspace
+    Workspace,
+    WorkPressure
   }
 
   alias SymphonyElixir.Codex.{AppServer, CoordinationEffects, RecoveryInspector, TaskLaunchContract}
@@ -54,7 +55,8 @@ defmodule SymphonyElixir.Orchestrator do
       blocked: %{},
       retry_attempts: %{},
       codex_totals: nil,
-      codex_rate_limits: nil
+      codex_rate_limits: nil,
+      work_pressure: nil
     ]
   end
 
@@ -335,8 +337,7 @@ defmodule SymphonyElixir.Orchestrator do
       |> reconcile_blocked_issues()
 
     with :ok <- Config.validate!(),
-         {:ok, issues} <- Tracker.fetch_issues_by_states(Config.settings!().tracker.active_states),
-         true <- available_slots(state) > 0 do
+         {:ok, issues} <- Tracker.fetch_issues_by_states(Config.settings!().tracker.active_states) do
       choose_issues(issues, state)
     else
       {:error, :missing_linear_api_token} ->
@@ -375,9 +376,6 @@ defmodule SymphonyElixir.Orchestrator do
 
       {:error, reason} ->
         Logger.error("Failed to fetch from issue tracker: #{inspect(reason)}")
-        state
-
-      false ->
         state
     end
   end
@@ -872,15 +870,163 @@ defmodule SymphonyElixir.Orchestrator do
     active_states = active_state_set()
     terminal_states = terminal_state_set()
 
-    issues
-    |> sort_issues_for_dispatch()
-    |> Enum.reduce(state, fn issue, state_acc ->
-      if should_dispatch_issue?(issue, state_acc, active_states, terminal_states) do
-        dispatch_issue(state_acc, issue)
-      else
-        state_acc
-      end
-    end)
+    with {:ok, project_id} <- work_pressure_project_id(),
+         :ok <- work_pressure_ledger_available?(state) do
+      choose_issues_with_authority(issues, state, active_states, terminal_states, project_id)
+    else
+      {:error, reason} ->
+        Logger.warning("Work pressure authority unavailable: #{inspect(reason)}")
+        %{state | work_pressure: %{error: reason}}
+    end
+  end
+
+  defp choose_issues_with_authority(issues, state, active_states, terminal_states, project_id) do
+    ready =
+      issues
+      |> sort_issues_for_dispatch()
+      |> Enum.filter(&dispatch_candidate?(&1, state, active_states, terminal_states))
+
+    active =
+      state.running
+      |> Map.values()
+      |> Enum.map(&work_pressure_item_from_running/1)
+      |> Enum.reject(&is_nil/1)
+      |> Enum.sort_by(&{&1.issue_id, &1.task_id, &1.idempotency_key})
+
+    decision_revision = work_pressure_revision(ready, active)
+
+    case WorkPressure.select(
+           Enum.map(ready, &work_pressure_item_from_issue(&1, project_id)),
+           active,
+           work_pressure_limits(),
+           decision_revision
+         ) do
+      {:ok, result} ->
+        case record_work_pressure_constructor(state, result) do
+          {:ok, state} ->
+            state = %{state | work_pressure: result}
+            selected_ids = MapSet.new(result.selected, & &1.issue_id)
+
+            Enum.reduce(ready, state, fn issue, state_acc ->
+              if MapSet.member?(selected_ids, issue.id) and should_dispatch_issue?(issue, state_acc, active_states, terminal_states),
+                do: dispatch_issue(state_acc, issue),
+                else: state_acc
+            end)
+
+          {:error, state} ->
+            %{state | work_pressure: %{error: :constructor_not_durable, decision_revision: decision_revision}}
+        end
+
+      {:error, reason} ->
+        Logger.error("Work pressure selection failed: #{inspect(reason)}")
+        %{state | work_pressure: %{error: reason, decision_revision: decision_revision}}
+    end
+  end
+
+  defp work_pressure_item_from_issue(%Issue{} = issue, project_id) do
+    %{
+      issue_id: issue.id,
+      task_id: issue.id,
+      project_id: project_id,
+      repository: issue_repository(issue),
+      write_domain: issue.branch_name || issue.identifier,
+      role: "implementation",
+      authority_revision: issue_checkpoint(issue),
+      idempotency_key: "dispatch-#{issue.id}-#{issue_checkpoint(issue)}",
+      priority: 6 - priority_rank(issue.priority)
+    }
+  end
+
+  defp work_pressure_item_from_running(%{issue: %Issue{} = issue} = entry) do
+    item = work_pressure_item_from_issue(issue, work_pressure_project_id!())
+    Map.put(item, :host, Map.get(entry, :worker_host) || "local")
+  end
+
+  defp work_pressure_item_from_running(_), do: nil
+
+  defp work_pressure_project_id do
+    case Config.settings!().codex.project_binding do
+      binding when is_map(binding) ->
+        id = Map.get(binding, :native_project_id, Map.get(binding, "native_project_id"))
+        if is_binary(id) and String.trim(id) != "", do: {:ok, id}, else: {:error, :project_binding_missing}
+
+      _ ->
+        {:error, :project_binding_missing}
+    end
+  end
+
+  defp work_pressure_project_id! do
+    {:ok, id} = work_pressure_project_id()
+    id
+  end
+
+  defp work_pressure_ledger_available?(%State{action_ledger: ledger}) when not is_nil(ledger), do: :ok
+  defp work_pressure_ledger_available?(_state), do: {:error, :action_ledger_missing}
+
+  defp work_pressure_limits do
+    config = Config.settings!()
+    host_limit = config.worker.max_concurrent_agents_per_host
+
+    %{
+      global: config.agent.max_concurrent_agents,
+      host: if(is_integer(host_limit) and host_limit > 0, do: host_limit, else: %{}),
+      project: %{},
+      repository: %{},
+      write_domain: %{}
+    }
+  end
+
+  defp work_pressure_revision(ready, active) do
+    :crypto.hash(:sha256, :erlang.term_to_binary({ready, active}, [:deterministic]))
+    |> Base.encode16(case: :lower)
+  end
+
+  defp record_work_pressure_constructor(%State{action_ledger: nil} = state, _result), do: {:ok, state}
+
+  defp record_work_pressure_constructor(%State{} = state, result) do
+    intent = %{
+      kind: :task_creation,
+      source: %{
+        task_id: "work-pressure",
+        issue_id: result.constructor_action_id,
+        revision: result.decision_revision,
+        role: "constructor"
+      },
+      target: %{type: "work_pressure_constructor"},
+      purpose: "work-pressure.constructor.#{result.decision_revision}",
+      checkpoint: result.decision_revision,
+      expected_postcondition: "work_pressure.selected",
+      policy_fingerprint: ActionLedger.policy_fingerprint("symphony.work-pressure.v1")
+    }
+
+    case ActionLedger.plan(state.action_ledger, intent) do
+      {:ok, action, _disposition} ->
+        case action.state do
+          :planned ->
+            case ActionLedger.transition(state.action_ledger, action.id, :dispatched, %{"disposition" => "selected"}) do
+              {:ok, _} ->
+                case ActionLedger.transition(state.action_ledger, action.id, :succeeded, %{"disposition" => "selected"}) do
+                  {:ok, _} ->
+                    {:ok, state}
+
+                  {:error, reason} ->
+                    Logger.warning("Unable to settle work pressure constructor: #{inspect(reason)}")
+                    {:error, state}
+                end
+
+              {:error, reason} ->
+                Logger.warning("Unable to settle work pressure constructor: #{inspect(reason)}")
+                {:error, state}
+            end
+
+          _ ->
+            {:ok, state}
+        end
+
+      {:error, reason} ->
+        Logger.warning("Unable to record work pressure constructor: #{inspect(reason)}")
+        {:error, state}
+    end
   end
 
   defp sort_issues_for_dispatch(issues) when is_list(issues) do
@@ -919,6 +1065,15 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp should_dispatch_issue?(_issue, _state, _active_states, _terminal_states), do: false
+
+  defp dispatch_candidate?(%Issue{} = issue, %State{running: running, claimed: claimed, blocked: blocked}, active_states, terminal_states) do
+    candidate_issue?(issue, active_states, terminal_states) and
+      !MapSet.member?(claimed, issue.id) and
+      !Map.has_key?(running, issue.id) and
+      !Map.has_key?(blocked, issue.id)
+  end
+
+  defp dispatch_candidate?(_issue, _state, _active_states, _terminal_states), do: false
 
   defp state_slots_available?(%Issue{state: issue_state}, running) when is_map(running) do
     limit = Config.max_concurrent_agents_for_state(issue_state)
@@ -1708,6 +1863,7 @@ defmodule SymphonyElixir.Orchestrator do
        action_ledger: action_ledger_snapshot(state.action_ledger),
        codex_totals: state.codex_totals,
        rate_limits: Map.get(state, :codex_rate_limits),
+       work_pressure: work_pressure_snapshot(state.work_pressure),
        polling: %{
          checking?: state.poll_check_in_progress == true,
          next_poll_in_ms: next_poll_in_ms(state.next_poll_due_at_ms, now_ms),
@@ -1715,6 +1871,29 @@ defmodule SymphonyElixir.Orchestrator do
        }
      }, state}
   end
+
+  defp work_pressure_snapshot(nil), do: nil
+
+  defp work_pressure_snapshot(%{selected: selected, held: held} = result) do
+    %{
+      constructor_action_id: result.constructor_action_id,
+      decision_revision: result.decision_revision,
+      target: result.target,
+      available: result.available,
+      selected_count: length(selected),
+      held_count: length(held),
+      selected_issue_ids: Enum.map(selected, & &1.issue_id),
+      held_issue_ids: Enum.map(held, & &1.item.issue_id),
+      held_reasons: Enum.map(held, &Atom.to_string(&1.reason)),
+      capacity_held_count: Enum.count(held, &(&1.reason == :capacity_held)),
+      write_domain_held_count: Enum.count(held, &(&1.reason == :write_domain_held))
+    }
+  end
+
+  defp work_pressure_snapshot(%{error: reason, decision_revision: revision}),
+    do: %{error: reason, decision_revision: revision}
+
+  defp work_pressure_snapshot(_), do: nil
 
   def handle_call(:request_refresh, _from, state) do
     now_ms = System.monotonic_time(:millisecond)
