@@ -3,6 +3,7 @@ defmodule SymphonyElixir.Toscanini.EventContractTest do
   use ExUnit.Case, async: true
 
   alias SymphonyElixir.Toscanini.EventContract
+  alias SymphonyElixir.Codex.TaskAccountabilityRegistry
 
   defp event(id, seq, name, from \\ nil) do
     causation_id = from || if(seq == 1, do: nil, else: "e#{seq - 1}")
@@ -102,7 +103,7 @@ defmodule SymphonyElixir.Toscanini.EventContractTest do
     assert {:ok, state} = EventContract.replay(events)
     assert state.current == "cleanup_complete"
     assert state.revision == 6
-    assert {:error, :duplicate_operation} = EventContract.transition(state, hd(events))
+    assert {:error, :terminal_state} = EventContract.transition(state, hd(events))
     assert {:error, :causation_mismatch} = EventContract.transition(EventContract.initial_state(), event("e2", 2, "durable_progress"))
   end
 
@@ -192,7 +193,7 @@ defmodule SymphonyElixir.Toscanini.EventContractTest do
              EventContract.new(put_in(event("e1", 1, "task_accepted").data[:evidence][:refs], oversized_evidence))
 
     replay = Enum.map(1..32, &event("e#{&1}", &1, "cancelled")) ++ [self()]
-    assert {:error, :malformed_replay} = EventContract.replay(replay, %EventContract.State{current: "running"})
+    assert {:error, :terminal_state} = EventContract.replay(replay, %EventContract.State{current: "running"})
   end
 
   test "rejects nested maps past the normalization depth budget before traversing the hostile leaf" do
@@ -366,5 +367,75 @@ defmodule SymphonyElixir.Toscanini.EventContractTest do
     }
 
     assert {:error, :malformed_data} = EventContract.new(put_in(base.data[:recovery], abandoned))
+  end
+
+  test "keeps terminal states absorbing" do
+    completed = [
+      event("e1", 1, "task_accepted"),
+      event("e2", 2, "durable_progress"),
+      event("e3", 3, "candidate_ready"),
+      event("e4", 4, "review_accepted"),
+      event("e5", 5, "landed"),
+      event("e6", 6, "cleanup_complete")
+    ]
+
+    assert {:ok, state} = EventContract.replay(completed)
+    assert {:error, :terminal_state} = EventContract.transition(state, event("e7", 7, "failed", "e6"))
+  end
+
+  test "accepts every registry default self alias and rejects cross-role aliases" do
+    for role <- TaskAccountabilityRegistry.roles() do
+      candidate = event("e1", 1, "task_accepted") |> put_in([:data, :identity, :role], role) |> put_in([:data, :identity, :primary_role], role) |> put_in([:data, :identity, :domain_alias], role)
+      assert {:ok, _} = EventContract.new(candidate)
+    end
+
+    crossed =
+      event("e1", 1, "task_accepted")
+      |> put_in([:data, :identity, :role], "response_recovery")
+      |> put_in([:data, :identity, :primary_role], "response_recovery")
+      |> put_in([:data, :identity, :domain_alias], "implementation worker")
+
+    assert {:error, :malformed_data} = EventContract.new(crossed)
+  end
+
+  test "rejects route-mismatched abandoned recovery and accepts coherent recovery attention" do
+    base = event("e1", 1, "task_accepted")
+
+    abandoned = %{
+      base.data.recovery
+      | effective_route: "luna",
+        attempted_routes: ["sol"],
+        failure_class: "capacity",
+        response_started: false,
+        effect_uncertain: true,
+        lifecycle: "abandoned",
+        outcome: "failed",
+        circuit_state: "open",
+        next_safe_action: "abandon"
+    }
+
+    assert {:error, :malformed_data} = EventContract.new(put_in(base.data[:recovery], abandoned))
+
+    attention = %{
+      base.data.recovery
+      | effective_route: "held",
+        failure_class: "capacity",
+        response_started: false,
+        effect_uncertain: true,
+        lifecycle: "attention",
+        outcome: "attention",
+        circuit_state: "open",
+        next_safe_action: "attention"
+    }
+
+    assert {:ok, _} = EventContract.new(put_in(base.data[:recovery], attention))
+  end
+
+  test "rejects identifier-shaped customer metadata in programme role and operation identity" do
+    base = event("e1", 1, "task_accepted")
+    assert {:error, :malformed_data} = EventContract.new(put_in(base.data[:identity][:programme], "Customer_Jane_Doe_medical_diagnosis"))
+    assert {:error, :malformed_data} = EventContract.new(put_in(base.data[:sender][:role], "Customer_Jane_Doe_medical_diagnosis"))
+    bad = base |> put_in([:data, :identity, :idempotency], "Customer_Jane_Doe_medical_diagnosis") |> put_in([:data, :delivery, :idempotency_key], "Customer_Jane_Doe_medical_diagnosis")
+    assert {:error, :malformed_data} = EventContract.new(bad)
   end
 end

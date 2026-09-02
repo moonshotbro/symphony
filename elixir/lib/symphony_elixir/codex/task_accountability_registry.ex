@@ -243,7 +243,7 @@ defmodule SymphonyElixir.Codex.TaskAccountabilityRegistry do
   def roles, do: @roles
 
   @spec canonical_alias?(String.t(), term()) :: boolean()
-  def canonical_alias?(role, alias_name) when role in @roles and is_binary(alias_name), do: Map.get(@aliases, normalize(alias_name)) == role
+  def canonical_alias?(role, alias_name) when role in @roles and is_binary(alias_name), do: alias_name == role or Map.get(@aliases, normalize(alias_name)) == role
   def canonical_alias?(_, _), do: false
 
   @spec profiles() :: map()

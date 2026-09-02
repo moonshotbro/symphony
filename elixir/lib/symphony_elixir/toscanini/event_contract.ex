@@ -79,6 +79,7 @@ defmodule SymphonyElixir.Toscanini.EventContract do
          {:ok, e} <- ensure(envelope),
          :ok <- validate_value(e),
          :ok <- factual(e),
+         :ok <- nonterminal(state),
          :ok <- same_identity(state, e),
          :ok <- operation_idempotency(state, e),
          :ok <- causation(state, e),
@@ -324,9 +325,9 @@ defmodule SymphonyElixir.Toscanini.EventContract do
 
   defp identity?(i) when is_map(i),
     do:
-      schema?(i, @schemas.identity) and identifier?(i.programme) and repo?(i.repo) and positive?(i.issue) and nullable_positive?(i.pr) and
+      schema?(i, @schemas.identity) and programme?(i.programme) and repo?(i.repo) and positive?(i.issue) and nullable_positive?(i.pr) and
         i.role == i.primary_role and i.primary_role in TaskAccountabilityRegistry.roles() and identifier?(i.task) and is_integer(i.attempt) and
-        i.attempt >= 0 and is_integer(i.fence) and i.fence >= 0 and binary?(i.idempotency) and digest?(i.exact_revision) and registry_identity?(i)
+        i.attempt >= 0 and is_integer(i.fence) and i.fence >= 0 and operation_identity?(i.idempotency) and digest?(i.exact_revision) and registry_identity?(i)
 
   defp identity?(_), do: false
 
@@ -338,7 +339,7 @@ defmodule SymphonyElixir.Toscanini.EventContract do
       identity.work_character in ["bounded", "recovery", "review", "landing"]
   end
 
-  defp principal?(p) when is_map(p), do: schema?(p, @schemas.sender) and p.kind in ["worker", "role", "adapter"] and identifier?(p.id) and identifier?(p.role)
+  defp principal?(p) when is_map(p), do: schema?(p, @schemas.sender) and p.kind in ["worker", "role", "adapter"] and identifier?(p.id) and operational_role?(p.role)
   defp principal?(_), do: false
   defp lifecycle?(l), do: l.state in @events and nullable_reason?(l.terminal_reason) and nullable_reason?(l.blocking_reason) and nullable_action?(l.requested_action)
   defp delivery?(d), do: identifier?(d.idempotency_key) and positive?(d.sequence)
@@ -416,7 +417,29 @@ defmodule SymphonyElixir.Toscanini.EventContract do
        })
        when route in ["terra", "luna"] and failure != "none", do: route == List.last(routes)
 
-  defp recovery_coherent?(%{lifecycle: "abandoned", outcome: "failed", failure_class: failure, response_started: false, effect_uncertain: true, circuit_state: "open", next_safe_action: "abandon"})
+  defp recovery_coherent?(%{
+         lifecycle: "abandoned",
+         outcome: "failed",
+         failure_class: failure,
+         response_started: false,
+         effect_uncertain: true,
+         circuit_state: "open",
+         next_safe_action: "abandon",
+         effective_route: route,
+         attempted_routes: routes
+       })
+       when failure != "none", do: route == List.last(routes)
+
+  defp recovery_coherent?(%{
+         lifecycle: "attention",
+         outcome: "attention",
+         failure_class: failure,
+         response_started: false,
+         effect_uncertain: true,
+         circuit_state: "open",
+         next_safe_action: "attention",
+         effective_route: "held"
+       })
        when failure != "none", do: true
 
   defp recovery_coherent?(_), do: false
@@ -430,6 +453,9 @@ defmodule SymphonyElixir.Toscanini.EventContract do
   defp digest?(x), do: is_binary(x) and x =~ ~r/^[0-9a-fA-F]{7,128}$/
   defp repo?(x), do: is_binary(x) and x =~ ~r/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/
   defp identifier?(x), do: is_binary(x) and byte_size(x) in 1..128 and x =~ ~r/^[A-Za-z0-9._:-]+$/
+  defp programme?(x), do: x in ["p1", "build-toscanini"] or (is_binary(x) and x =~ ~r/^toscanini-[a-z0-9-]{1,96}$/)
+  defp operational_role?(x), do: x in ["implementation", "programme", "landing", "recovery", "research", "monitor", "telemetry", "acceptance"] or x in TaskAccountabilityRegistry.roles()
+  defp operation_identity?(x), do: is_binary(x) and x =~ ~r/^(i|op)-[a-z0-9][a-z0-9._:-]{0,120}$/
   defp nullable_reason?(nil), do: true
   defp nullable_reason?(value), do: value in ["capacity", "rate_limited", "timeout", "provider_error", "unknown", "operator_attention", "needs_judgment", "superseded", "cancelled", "failed"]
   defp nullable_action?(nil), do: true
@@ -485,6 +511,8 @@ defmodule SymphonyElixir.Toscanini.EventContract do
   defp same_identity(%State{identity: nil}, _), do: :ok
   defp same_identity(%State{identity: expected}, e), do: if(Map.delete(identity(e), :idempotency) == Map.delete(expected, :idempotency), do: :ok, else: {:error, :identity_mismatch})
   defp unique(%State{seen_ids: ids}, %{id: id}), do: if(MapSet.member?(ids, id), do: {:error, :duplicate_transition}, else: :ok)
+  defp nonterminal(%State{current: current}) when current in @terminal_events, do: {:error, :terminal_state}
+  defp nonterminal(_), do: :ok
 
   defp operation_idempotency(%State{seen_operations: operations}, %{data: %{identity: %{idempotency: identity_key}, delivery: %{idempotency_key: delivery_key}}}) when identity_key == delivery_key,
     do: if(MapSet.member?(operations, delivery_key), do: {:error, :duplicate_operation}, else: :ok)
