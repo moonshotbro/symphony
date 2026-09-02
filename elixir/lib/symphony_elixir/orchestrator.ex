@@ -719,6 +719,7 @@ defmodule SymphonyElixir.Orchestrator do
             # before we have attempted the bounded recovery protocol.
             inspection = stalled_worker_inspection(running_entry)
             Logger.warning("Issue stalled; recording inspection checkpoint: issue_id=#{issue_id} issue_identifier=#{identifier} elapsed_ms=#{elapsed_ms} inspection=#{inspect(inspection)}")
+            emit_recovery_event(:inspected, issue_id, running_entry)
 
             state.running[issue_id]
             |> Map.merge(%{recovery_stage: :inspected, recovery_started_at: DateTime.utc_now(), inspection: inspection})
@@ -754,6 +755,7 @@ defmodule SymphonyElixir.Orchestrator do
     case AgentRunner.steer(pid, "Continue from the current state; make one durable progress step and report the result.") do
       {:ok, _provider_result} ->
         Logger.info("Issued one bounded stall recovery steer: issue_id=#{issue_id} issue_identifier=#{identifier}")
+        emit_recovery_event(:steered, issue_id, state.running[issue_id])
 
         state.running[issue_id]
         |> Map.merge(%{recovery_stage: :steered, recovery_started_at: DateTime.utc_now()})
@@ -785,6 +787,7 @@ defmodule SymphonyElixir.Orchestrator do
   defp retry_stalled_issue(state, issue_id, running_entry, identifier, elapsed_ms) do
     session_id = running_entry_session_id(running_entry)
     Logger.warning("Issue stalled: issue_id=#{issue_id} issue_identifier=#{identifier} session_id=#{session_id} elapsed_ms=#{elapsed_ms}; restarting with backoff")
+    emit_recovery_event(:superseded, issue_id, running_entry)
 
     next_attempt = next_retry_attempt_from_running(running_entry)
 
@@ -1099,13 +1102,14 @@ defmodule SymphonyElixir.Orchestrator do
     }
 
     case ActionLedger.plan(state.action_ledger, intent) do
-      {:ok, action, _disposition} ->
+      {:ok, action, disposition} ->
         case action.state do
           :planned ->
             case ActionLedger.transition(state.action_ledger, action.id, :dispatched, %{"disposition" => "selected"}) do
               {:ok, _} ->
                 case ActionLedger.transition(state.action_ledger, action.id, :succeeded, %{"disposition" => "selected"}) do
                   {:ok, _} ->
+                    if disposition == :new, do: emit_work_pressure_decision(result)
                     {:ok, state}
 
                   {:error, reason} ->
@@ -1126,6 +1130,37 @@ defmodule SymphonyElixir.Orchestrator do
         Logger.warning("Unable to record work pressure constructor: #{inspect(reason)}")
         {:error, state}
     end
+  end
+
+  defp emit_work_pressure_decision(result) do
+    :telemetry.execute(
+      [:symphony, :work_pressure, :decision],
+      %{
+        count: 1,
+        selected_count: length(result.selected),
+        held_count: length(result.held),
+        target: result.target,
+        available: result.available
+      },
+      %{
+        constructor_action_id: result.constructor_action_id,
+        decision_revision: result.decision_revision
+      }
+    )
+  end
+
+  defp emit_recovery_event(stage, issue_id, running_entry) do
+    :telemetry.execute(
+      [:symphony, :work_pressure, :recovery],
+      %{count: 1},
+      %{
+        stage: stage,
+        issue_id: issue_id,
+        role: Map.get(running_entry || %{}, :role),
+        attempt: Map.get(running_entry || %{}, :retry_attempt, 0),
+        action_id: Map.get(running_entry || %{}, :action_id)
+      }
+    )
   end
 
   defp sort_issues_for_dispatch(issues) when is_list(issues) do
