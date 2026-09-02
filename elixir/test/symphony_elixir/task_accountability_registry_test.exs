@@ -121,14 +121,16 @@ defmodule SymphonyElixir.Codex.TaskAccountabilityRegistryTest do
       attempt: 0,
       verdict_attempt: 0,
       fence: "fence-1",
+      execution_fence: "fence-1",
       exact_revision: revision,
       verdict_exact_revision: revision,
-      verdict_fence: "verdict-fence-1"
+      verdict_fence: "fence-1"
     }
 
     assert {:ok, compiled} = TaskAccountabilityRegistry.compile(review)
     assert compiled.primary_role == "verification_assessment"
     assert {:error, :independence_violation} = TaskAccountabilityRegistry.compile(Map.put(review, :reviewer_principal, "worker"))
+    assert {:error, :independence_violation} = TaskAccountabilityRegistry.compile(Map.put(review, :verdict_fence, "replayed-fence"))
 
     landing =
       Map.merge(review, %{
@@ -137,15 +139,36 @@ defmodule SymphonyElixir.Codex.TaskAccountabilityRegistryTest do
         permission_envelope: ["land_bound_destination"],
         evidence: ["accepted_verdict", "destination_receipt", "clean_state"],
         integrator_principal: "integrator",
-        accepted_verdict: %{"accepted" => true, "role" => "verification_assessment", "fence" => "verdict-fence-1"},
+        accepted_verdict: %{"accepted" => true, "role" => "verification_assessment", "fence" => "fence-1"},
         receipt_identity: "receipt-1",
-        receipt_fence: "verdict-fence-1"
+        receipt_fence: "fence-1"
       })
 
     assert {:ok, _} = TaskAccountabilityRegistry.compile(landing)
     assert {:error, :missing_accepted_verdict} = TaskAccountabilityRegistry.compile(Map.delete(landing, :accepted_verdict))
     assert {:error, :missing_accepted_verdict} = TaskAccountabilityRegistry.compile(Map.put(landing, :verdict_attempt, 1))
-    assert {:error, :missing_accepted_verdict} = TaskAccountabilityRegistry.compile(Map.put(landing, :verdict_fence, "replayed-fence"))
+
+    replayed =
+      Map.merge(landing, %{
+        execution_fence: "fence-1",
+        fence: "replayed-fence",
+        verdict_fence: "replayed-fence",
+        verdict_exact_revision: revision,
+        receipt_fence: "replayed-fence",
+        accepted_verdict: %{"accepted" => true, "role" => "verification_assessment", "fence" => "replayed-fence"}
+      })
+
+    assert {:error, :independence_violation} =
+             TaskAccountabilityRegistry.compile(
+               Map.merge(replayed, %{
+                 primary_role: "verification_assessment",
+                 domain_alias: "independent review",
+                 permission_envelope: ["read_candidate_and_test_scope"],
+                 evidence: ["verdict", "reproduction_basis"]
+               })
+             )
+
+    assert {:error, :missing_accepted_verdict} = TaskAccountabilityRegistry.compile(replayed)
     assert {:error, :missing_accepted_verdict} = TaskAccountabilityRegistry.compile(Map.put(landing, :integrator_principal, "worker"))
   end
 
@@ -191,9 +214,10 @@ defmodule SymphonyElixir.Codex.TaskAccountabilityRegistryTest do
             attempt: 0,
             verdict_attempt: 0,
             fence: "fence",
+            execution_fence: "fence",
             exact_revision: String.duplicate("a", 40),
             verdict_exact_revision: String.duplicate("a", 40),
-            verdict_fence: "verdict-fence"
+            verdict_fence: "fence"
           }
         else
           %{}

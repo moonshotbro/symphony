@@ -395,13 +395,15 @@ defmodule SymphonyElixir.Codex.TaskAccountabilityRegistry do
   end
 
   defp same_candidate?(attrs) do
-    fields = [:candidate_id, :attempt, :fence, :exact_revision, :verdict_fence]
+    fields = [:candidate_id, :attempt, :fence, :execution_fence, :exact_revision, :verdict_fence]
 
     Enum.all?(fields, &nonblank(identity_value(attrs, &1))) and
       identity_value(attrs, :verdict_candidate_id) == identity_value(attrs, :candidate_id) and
       identity_value(attrs, :verdict_attempt) == identity_value(attrs, :attempt) and
       identity_value(attrs, :verdict_exact_revision) == identity_value(attrs, :exact_revision) and
-      nonblank(identity_value(attrs, :verdict_fence))
+      nonblank(identity_value(attrs, :verdict_fence)) and
+      identity_value(attrs, :verdict_fence) == identity_value(attrs, :fence) and
+      identity_value(attrs, :execution_fence) == identity_value(attrs, :fence)
   end
 
   defp identity_value(attrs, key), do: Map.get(attrs, key, Map.get(attrs, Atom.to_string(key)))

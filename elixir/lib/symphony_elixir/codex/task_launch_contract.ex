@@ -488,6 +488,7 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
           values["verdict_candidate_id"],
           values["verdict_attempt"],
           values["verdict_exact_revision"],
+          values["execution_fence"],
           values["verdict_fence"],
           values["accepted_verdict"],
           values["receipt_identity"],
@@ -526,7 +527,7 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
     length(keys) != length(Enum.uniq(normalized)) or
       Enum.any?(
         normalized,
-        &(&1 not in ~w(programme repository issue_or_pr role task attempt fence exact_revision write_boundary evidence model effort trigger goal_policy dependencies permissions evidence_gates stall_policy closeout_policy idempotency_identity conflict_identity commissioning_identity escalation supersedes project registry_id registry_version primary_role domain_alias authority_revision canonical_digest work_character permission_envelope execution_principal reviewer_principal integrator_principal candidate_id verdict_candidate_id verdict_attempt verdict_exact_revision verdict_fence accepted_verdict receipt_identity receipt_fence handoff))
+        &(&1 not in ~w(programme repository issue_or_pr role task attempt fence execution_fence exact_revision write_boundary evidence model effort trigger goal_policy dependencies permissions evidence_gates stall_policy closeout_policy idempotency_identity conflict_identity commissioning_identity escalation supersedes project registry_id registry_version primary_role domain_alias authority_revision canonical_digest work_character permission_envelope execution_principal reviewer_principal integrator_principal candidate_id verdict_candidate_id verdict_attempt verdict_exact_revision verdict_fence accepted_verdict receipt_identity receipt_fence handoff))
       )
   end
 
@@ -724,6 +725,7 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
          candidate_id: Keyword.get(opts, :candidate_id, identifier),
          verdict_candidate_id: Keyword.get(opts, :verdict_candidate_id),
          verdict_attempt: Keyword.get(opts, :verdict_attempt),
+         execution_fence: Keyword.get(opts, :execution_fence, "#{identifier}:#{attempt}:#{revision}"),
          verdict_exact_revision: Keyword.get(opts, :verdict_exact_revision),
          verdict_fence: Keyword.get(opts, :verdict_fence),
          accepted_verdict: Keyword.get(opts, :accepted_verdict),
