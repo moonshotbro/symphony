@@ -36,6 +36,11 @@ defmodule SymphonyElixir.Toscanini.ControlPlane do
 
   def compile_task(_attrs), do: {:error, :contract_input_not_a_map}
 
+  @doc "Compile a task from authoritative issue and workspace runtime facts."
+  @spec compile_runtime_task(map(), Path.t(), keyword()) :: {:ok, TaskLaunchContract.t() | nil} | {:error, term()}
+  def compile_runtime_task(issue, workspace, opts \\ []),
+    do: TaskLaunchContract.from_runtime(issue, workspace, opts)
+
   @doc "Select bounded ready work using Symphony's deterministic pressure policy."
   @spec select_work([map()], [map()], map(), String.t()) :: result()
   def select_work(ready, active, limits, decision_revision),

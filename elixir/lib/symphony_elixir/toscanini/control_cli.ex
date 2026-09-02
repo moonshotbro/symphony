@@ -45,14 +45,46 @@ defmodule SymphonyElixir.Toscanini.ControlCLI do
   def invoke(operation, _request), do: %{"ok" => false, "operation" => operation, "error" => "invalid_request"}
 
   defp construct(identity, request) do
-    case ControlPlane.compile_task(request) do
-      {:ok, contract} ->
+    issue = %{
+      "identifier" => Map.get(request, "issue_identifier") || issue_identifier(request),
+      "title" => Map.get(request, "objective")
+    }
+
+    opts = [role: runtime_role(Map.get(request, "role")), trigger: runtime_trigger(Map.get(request, "trigger"))]
+
+    result =
+      case Map.get(request, "workspace_path") do
+        workspace when is_binary(workspace) -> ControlPlane.compile_runtime_task(issue, workspace, opts)
+        _ -> {:error, :workspace_path_required}
+      end
+
+    case result do
+      {:ok, %{} = contract} ->
         Map.merge(identity, %{"ok" => true, "operation" => "construct_task", "contract" => Map.from_struct(contract)})
+
+      {:ok, nil} ->
+        Map.merge(identity, %{"ok" => false, "operation" => "construct_task", "error" => "project_binding_required"})
 
       {:error, reason} ->
         Map.merge(identity, %{"ok" => false, "operation" => "construct_task", "error" => inspect(reason)})
     end
   end
+
+  defp issue_identifier(%{"issue" => issue}) when is_integer(issue), do: "SYMPHONY-#{issue}"
+  defp issue_identifier(_request), do: nil
+
+  defp runtime_role("verification_assessment"), do: :independent_review
+  defp runtime_role("integration_closeout"), do: :landing
+  defp runtime_role("response_recovery"), do: :recovery
+  defp runtime_role("planning_coordination"), do: :programme
+  defp runtime_role("execution_production"), do: :implementation
+  defp runtime_role(value) when value in ~w(implementation independent_review landing recovery programme), do: String.to_atom(value)
+  defp runtime_role(_), do: :implementation
+
+  defp runtime_trigger("integration_design"), do: :integration_design
+  defp runtime_trigger("repository_wide_judgment"), do: :repository_wide_judgment
+  defp runtime_trigger("recovery"), do: :recovery
+  defp runtime_trigger(_), do: :bounded
 
   defp identity_echo(request) do
     %{
@@ -61,7 +93,9 @@ defmodule SymphonyElixir.Toscanini.ControlCLI do
       "project_id" => Map.get(request, "project_id"),
       "fence" => Map.get(request, "fence"),
       "task_id" => Map.get(request, "task_id"),
-      "head_sha" => Map.get(request, "head_sha", Map.get(request, "expected_sha"))
+      "head_sha" => Map.get(request, "head_sha", Map.get(request, "expected_sha")),
+      "workspace_path" => Map.get(request, "workspace_path"),
+      "issue_identifier" => Map.get(request, "issue_identifier", issue_identifier(request))
     }
     |> Enum.reject(fn {_key, value} -> is_nil(value) end)
     |> Map.new()

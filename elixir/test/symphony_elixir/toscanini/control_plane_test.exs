@@ -1,5 +1,5 @@
 defmodule SymphonyElixir.Toscanini.ControlPlaneTest do
-  use ExUnit.Case, async: true
+  use SymphonyElixir.TestSupport
 
   alias SymphonyElixir.Toscanini.ControlPlane
   alias SymphonyElixir.Toscanini.ControlCLI
@@ -61,5 +61,56 @@ defmodule SymphonyElixir.Toscanini.ControlPlaneTest do
     assert {:ok, _} = Jason.decode(Jason.encode!(%{"ok" => false, "error" => "operation_required"}))
     assert "construct_task" in ControlCLI.operations()
     refute "execute" in ControlCLI.operations()
+  end
+
+  test "constructs a shorthand request through the runtime authority path" do
+    root = Path.join(System.tmp_dir!(), "toscanini-control-#{System.unique_integer([:positive])}")
+
+    try do
+      File.mkdir_p!(root)
+      {_, 0} = System.cmd("git", ["init", "-q", root])
+      {_, 0} = System.cmd("git", ["-C", root, "config", "user.email", "test@example.test"])
+      {_, 0} = System.cmd("git", ["-C", root, "config", "user.name", "Test"])
+      {_, 0} = System.cmd("git", ["-C", root, "remote", "add", "origin", "https://github.com/moonshotbro/symphony.git"])
+      File.write!(Path.join(root, "README.md"), "test\n")
+      {_, 0} = System.cmd("git", ["-C", root, "add", "."])
+      {_, 0} = System.cmd("git", ["-C", root, "commit", "-qm", "test"])
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        codex_project_binding: %{
+          enabled: true,
+          programme: "build-toscanini",
+          saved_project_id: "b12752f9-9a65-4194-bc49-77808b21d767",
+          native_project_id: "01a04aab-c77c-79b0-ab09-65187353bb4b",
+          repository: "moonshotbro/symphony",
+          root: root
+        }
+      )
+
+      request = %{
+        "repository" => "moonshotbro/symphony",
+        "project_id" => "p",
+        "fence" => "f",
+        "issue_identifier" => "SYS-61",
+        "objective" => "Bounded construction",
+        "role" => "execution_production",
+        "workspace_path" => root
+      }
+
+      result =
+        request
+        |> then(&ControlCLI.invoke("construct_task", {:ok, &1}))
+        |> Jason.encode!()
+        |> Jason.decode!()
+
+      assert result["ok"] == true
+      assert result["repository"] == request["repository"]
+      assert result["project_id"] == request["project_id"]
+      assert result["fence"] == request["fence"]
+      assert result["contract"]["repository"] == request["repository"]
+      assert result["contract"]["issue_or_pr"] == "SYS-61"
+    after
+      File.rm_rf(root)
+    end
   end
 end
