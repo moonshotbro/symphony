@@ -903,7 +903,8 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
   test "orchestrator restarts stalled workers with retry backoff" do
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_kind: "memory",
-      codex_stall_timeout_ms: 1_000
+      codex_stall_timeout_ms: 1_000,
+      poll_interval_ms: 60_000
     )
 
     issue_id = "issue-stall"
@@ -970,6 +971,148 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     remaining_ms = due_at_ms - System.monotonic_time(:millisecond)
     assert remaining_ms >= 9_500
     assert remaining_ms <= 10_500
+  end
+
+  test "diagnostic Codex chatter does not reset the durable progress clock" do
+    started_at = ~U[2026-01-01 00:00:00Z]
+    entry = %{started_at: started_at, last_durable_progress_at: started_at, session_id: nil}
+
+    {updated, _tokens} =
+      Orchestrator.integrate_codex_update_for_test(entry, %{
+        event: :notification,
+        timestamp: ~U[2026-01-01 00:00:30Z],
+        message: %{method: "tools/list"}
+      })
+
+    assert updated.last_codex_timestamp == ~U[2026-01-01 00:00:30Z]
+    assert updated.last_durable_progress_at == started_at
+    assert Orchestrator.stall_elapsed_ms_for_test(updated, ~U[2026-01-01 00:01:00Z]) == 60_000
+  end
+
+  test "completed turns advance the durable progress clock" do
+    started_at = ~U[2026-01-01 00:00:00Z]
+    entry = %{started_at: started_at, last_durable_progress_at: started_at, session_id: nil}
+
+    {updated, _tokens} =
+      Orchestrator.integrate_codex_update_for_test(entry, %{
+        event: :turn_completed,
+        timestamp: ~U[2026-01-01 00:00:30Z],
+        message: %{method: "tool/complete"}
+      })
+
+    assert updated.last_durable_progress_at == ~U[2026-01-01 00:00:30Z]
+    assert Orchestrator.stall_elapsed_ms_for_test(updated, ~U[2026-01-01 00:01:00Z]) == 30_000
+  end
+
+  test "tool completion alone does not advance the durable progress clock" do
+    started_at = ~U[2026-01-01 00:00:00Z]
+    entry = %{started_at: started_at, last_durable_progress_at: started_at, session_id: nil}
+
+    {updated, _tokens} =
+      Orchestrator.integrate_codex_update_for_test(entry, %{
+        event: :tool_call_completed,
+        timestamp: ~U[2026-01-01 00:00:30Z],
+        message: %{method: "tool/complete"}
+      })
+
+    assert updated.last_durable_progress_at == started_at
+  end
+
+  test "stall timeout uses the normalized task role budget" do
+    config = %{stall_timeout_ms: 300_000, stall_timeout_ms_by_role: %{"implementation worker" => 45_000}}
+
+    assert Orchestrator.stall_timeout_for_test(%{role: " Implementation Worker "}, config) == 45_000
+    assert Orchestrator.stall_timeout_for_test(%{role: "reviewer"}, config) == 300_000
+  end
+
+  test "stalled recovery inspects, steers once, then fences before retry" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      codex_stall_timeout_ms: 1_000
+    )
+
+    suffix = System.unique_integer([:positive])
+    issue_id = "issue-staged-stall-#{suffix}"
+    orchestrator_name = Module.concat(__MODULE__, "StagedStallOrchestrator#{suffix}")
+    parent = self()
+
+    worker =
+      spawn(fn ->
+        receive do
+          {:symphony_steer, caller, ref, _input} ->
+            send(caller, {:symphony_steer_result, ref, {:ok, :accepted}})
+            send(parent, :steered)
+            Process.sleep(:infinity)
+        end
+      end)
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-STAGED-#{suffix}",
+      state: "In Progress",
+      url: "https://example.org/issues/MT-STAGED-#{suffix}",
+      dispatchable: true
+    }
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [])
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+    on_exit(fn -> if Process.alive?(pid), do: Process.exit(pid, :normal) end)
+    Process.sleep(30)
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+
+    stale = DateTime.add(DateTime.utc_now(), -5, :second)
+    initial = :sys.get_state(pid)
+
+    entry = %{
+      pid: worker,
+      ref: Process.monitor(worker),
+      identifier: issue.identifier,
+      issue: issue,
+      worker_host: nil,
+      workspace_path: "/tmp/#{issue.identifier}",
+      session_id: "thread-staged-turn-staged",
+      thread_id: "thread-staged",
+      turn_id: "turn-staged",
+      started_at: stale,
+      last_durable_progress_at: stale,
+      last_codex_timestamp: stale,
+      last_codex_event: :notification,
+      recovery_enabled: true,
+      recovery_stage: :observing,
+      role: "implementation worker",
+      retry_attempt: 0,
+      action_id: nil
+    }
+
+    :sys.replace_state(pid, fn state ->
+      %{state | running: %{issue_id => entry}, claimed: MapSet.put(initial.claimed, issue_id)}
+    end)
+
+    send(pid, :tick)
+    Process.sleep(50)
+
+    assert %{recovery_stage: :inspected, inspection: %{worker_alive: true}} =
+             :sys.get_state(pid).running[issue_id]
+
+    send(pid, :tick)
+    assert_receive :steered, 1_000
+    assert :sys.get_state(pid).running[issue_id].recovery_stage == :steered
+
+    # A normal poll inside the recovery budget must not issue another steer.
+    send(pid, :tick)
+    refute_receive :steered, 100
+    assert Process.alive?(worker)
+
+    :sys.replace_state(pid, fn state ->
+      put_in(state.running[issue_id].recovery_started_at, stale)
+    end)
+
+    send(pid, :tick)
+    Process.sleep(50)
+    state = :sys.get_state(pid)
+    refute Process.alive?(worker)
+    refute Map.has_key?(state.running, issue_id)
+    assert Map.has_key?(state.retry_attempts, issue_id)
   end
 
   test "orchestrator blocks stalled workers that are waiting on MCP elicitation" do

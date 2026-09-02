@@ -489,6 +489,10 @@ fields locally if they want stricter startup checks.
 - `stall_timeout_ms` (integer)
   - Default: `300000` (5 minutes)
   - If `<= 0`, stall detection is disabled.
+- `stall_timeout_ms_by_role` (map of nonnegative integers, OPTIONAL)
+  - Optional role/domain-specific stall budgets keyed by a bounded role alias.
+  - Keys are normalized by trimming whitespace and lowercasing.
+  - A missing or unknown role key uses `stall_timeout_ms` at runtime.
 
 #### 5.3.7 `action_ledger` (object, OPTIONAL extension)
 
@@ -648,6 +652,8 @@ not require recognizing or validating extension fields unless that extension is 
 - `codex.turn_timeout_ms`: integer, default `3600000`
 - `codex.read_timeout_ms`: integer, default `5000`
 - `codex.stall_timeout_ms`: integer, default `300000`
+- `codex.stall_timeout_ms_by_role`: optional map of nonnegative integers keyed by
+  normalized bounded role/domain alias; unknown roles fall back to `codex.stall_timeout_ms`
 
 ## 7. Orchestration State Machine
 

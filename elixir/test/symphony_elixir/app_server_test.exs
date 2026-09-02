@@ -1,6 +1,25 @@
 defmodule SymphonyElixir.AppServerTest do
   use SymphonyElixir.TestSupport
 
+  test "steering is routed through the active session owner and preserves provider response" do
+    test_pid = self()
+
+    owner =
+      spawn(fn ->
+        receive do
+          {:symphony_steer, caller, ref, "reduce scope"} ->
+            send(test_pid, :owner_received)
+            send(caller, {:symphony_steer_result, ref, {:error, {:provider_rejected, %{"code" => -32_600}}}})
+        end
+      end)
+
+    # The owner is the process that serializes access to the provider stream.
+    # This test exercises the public handoff without creating a competing port reader.
+    task = Task.async(fn -> AppServer.steer_turn(%{owner: owner}, "reduce scope") end)
+    assert_receive :owner_received
+    assert {:error, {:provider_rejected, %{"code" => -32_600}}} = Task.await(task)
+  end
+
   test "forks a persisted thread through the native App Server protocol" do
     root = Path.join(System.tmp_dir!(), "symphony-app-server-fork-#{System.unique_integer([:positive])}")
     workspace_root = Path.join(root, "workspaces")

@@ -10,6 +10,50 @@ defmodule SymphonyElixir.AgentRunner do
 
   @type worker_host :: String.t() | nil
 
+  @doc """
+  Prepare the workspace-bound launch contract before a worker process starts.
+
+  The workspace is created once here and passed into the runner.  This keeps
+  contract compilation and verification on the pre-dispatch side of the task
+  boundary without making the runner create a second workspace.
+  """
+  @spec prepare_launch(Issue.t(), worker_host(), keyword()) ::
+          {:ok, %{workspace: String.t(), task_contract: TaskLaunchContract.t() | nil}} | {:error, term()}
+  def prepare_launch(issue, worker_host, opts \\ [])
+
+  def prepare_launch(%Issue{} = issue, worker_host, opts) when is_list(opts) do
+    with {:ok, workspace} <- Workspace.create_for_issue(issue, worker_host),
+         {:ok, contract} <- TaskLaunchContract.from_runtime(issue, workspace, opts) do
+      {:ok, %{workspace: workspace, task_contract: contract}}
+    end
+  end
+
+  def prepare_launch(_, _, _), do: {:error, :invalid_launch_preparation}
+
+  @doc """
+  Steer the active turn owned by a worker runner.
+
+  The runner validates that the turn is still active and accepts at most one
+  steering request for that turn. The returned result is authoritative: a
+  provider rejection remains an error.
+  """
+  @spec steer(pid(), String.t(), timeout()) :: {:ok, term()} | {:error, term()}
+  def steer(runner_pid, input, timeout \\ 5_000)
+
+  def steer(runner_pid, input, timeout)
+      when is_pid(runner_pid) and is_binary(input) and byte_size(input) > 0 do
+    ref = make_ref()
+    send(runner_pid, {:symphony_steer, self(), ref, input})
+
+    receive do
+      {:symphony_steer_result, ^ref, result} -> result
+    after
+      timeout -> {:error, :steer_timeout}
+    end
+  end
+
+  def steer(_runner_pid, _input, _timeout), do: {:error, :invalid_steer_request}
+
   @doc false
   @spec continue_with_issue_for_test(Issue.t(), ([String.t()] -> term())) ::
           {:continue, Issue.t()} | {:done, Issue.t()} | {:error, term()}
@@ -38,13 +82,16 @@ defmodule SymphonyElixir.AgentRunner do
   defp run_on_worker_host(issue, codex_update_recipient, opts, worker_host) do
     Logger.info("Starting worker attempt for #{issue_context(issue)} worker_host=#{worker_host_for_log(worker_host)}")
 
-    case Workspace.create_for_issue(issue, worker_host) do
-      {:ok, workspace} ->
+    prepared = Keyword.get(opts, :prepared_launch)
+
+    case prepared_workspace(prepared, issue, worker_host) do
+      {:ok, workspace, task_contract} ->
         send_worker_runtime_info(codex_update_recipient, issue, worker_host, workspace)
 
         try do
-          with :ok <- Workspace.run_before_run_hook(workspace, issue, worker_host) do
-            run_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host)
+          with :ok <- Workspace.run_before_run_hook(workspace, issue, worker_host),
+               :ok <- TaskLaunchContract.verify_workspace(task_contract, workspace) do
+            run_codex_turns(workspace, issue, codex_update_recipient, Keyword.put(opts, :task_contract, task_contract), worker_host)
           end
         after
           Workspace.run_after_run_hook(workspace, issue, worker_host)
@@ -54,6 +101,29 @@ defmodule SymphonyElixir.AgentRunner do
         {:error, reason}
     end
   end
+
+  defp prepared_workspace(%{workspace: workspace, task_contract: contract}, _issue, _worker_host)
+       when is_binary(workspace) do
+    with {:ok, verified} <- verify_prepared_contract(contract) do
+      {:ok, workspace, verified}
+    end
+  end
+
+  defp prepared_workspace(_prepared, issue, worker_host) do
+    case Workspace.create_for_issue(issue, worker_host) do
+      {:ok, workspace} ->
+        case TaskLaunchContract.from_runtime(issue, workspace, []) do
+          {:ok, contract} -> {:ok, workspace, contract}
+          {:error, reason} -> {:error, reason}
+        end
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp verify_prepared_contract(nil), do: {:ok, nil}
+  defp verify_prepared_contract(contract), do: TaskLaunchContract.verify(contract)
 
   defp codex_message_handler(recipient, issue) do
     fn message ->
@@ -76,7 +146,8 @@ defmodule SymphonyElixir.AgentRunner do
       {:worker_runtime_info, issue_id,
        %{
          worker_host: worker_host,
-         workspace_path: workspace
+         workspace_path: workspace,
+         runner_pid: self()
        }}
     )
 
@@ -89,7 +160,7 @@ defmodule SymphonyElixir.AgentRunner do
     max_turns = Keyword.get(opts, :max_turns, Config.settings!().agent.max_turns)
     issue_state_fetcher = Keyword.get(opts, :issue_state_fetcher, &Tracker.fetch_issues_by_ids/1)
 
-    with {:ok, contract} <- TaskLaunchContract.from_runtime(issue, workspace, opts),
+    with {:ok, contract} <- launch_contract(issue, workspace, opts),
          {:ok, session} <-
            AppServer.start_session(workspace, worker_host: worker_host, task_contract: contract) do
       try do
@@ -97,6 +168,14 @@ defmodule SymphonyElixir.AgentRunner do
       after
         AppServer.stop_session(session)
       end
+    end
+  end
+
+  defp launch_contract(issue, workspace, opts) do
+    case Keyword.fetch(opts, :task_contract) do
+      {:ok, nil} -> {:ok, nil}
+      {:ok, contract} -> TaskLaunchContract.verify(contract)
+      :error -> TaskLaunchContract.from_runtime(issue, workspace, opts)
     end
   end
 

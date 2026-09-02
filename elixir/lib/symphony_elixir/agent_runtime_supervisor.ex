@@ -40,7 +40,8 @@ defmodule SymphonyElixir.AgentRuntimeSupervisor do
     orchestrator_opts = [
       name: orchestrator_name,
       task_supervisor: task_supervisor_name,
-      action_ledger: if(ledger_enabled, do: ledger_name, else: nil)
+      action_ledger: if(ledger_enabled, do: ledger_name, else: nil),
+      require_work_pressure_authority: Keyword.get(opts, :require_work_pressure_authority, Mix.env() != :test)
     ]
 
     orchestrator_opts =

@@ -14,7 +14,8 @@ defmodule SymphonyElixir.Orchestrator do
     CoordinationAdapter,
     StatusDashboard,
     Tracker,
-    Workspace
+    Workspace,
+    WorkPressure
   }
 
   alias SymphonyElixir.Codex.{AppServer, CoordinationEffects, RecoveryInspector, TaskLaunchContract}
@@ -25,6 +26,9 @@ defmodule SymphonyElixir.Orchestrator do
   @failure_retry_base_ms 10_000
   # Slightly above the dashboard render interval so "checking now…" can render.
   @poll_transition_render_delay_ms 20
+  # Provider notifications and polling chatter are diagnostic activity, not
+  # proof that the worker has made durable progress.
+  @durable_progress_events [:turn_completed, :task_completed]
   @empty_codex_totals %{
     input_tokens: 0,
     output_tokens: 0,
@@ -54,7 +58,9 @@ defmodule SymphonyElixir.Orchestrator do
       blocked: %{},
       retry_attempts: %{},
       codex_totals: nil,
-      codex_rate_limits: nil
+      codex_rate_limits: nil,
+      work_pressure: nil,
+      require_work_pressure_authority: true
     ]
   end
 
@@ -99,7 +105,8 @@ defmodule SymphonyElixir.Orchestrator do
               Keyword.get(opts, :action_inspector, &RecoveryInspector.inspect/1)
             ),
           codex_totals: @empty_codex_totals,
-          codex_rate_limits: nil
+          codex_rate_limits: nil,
+          require_work_pressure_authority: Keyword.get(opts, :require_work_pressure_authority, Mix.env() != :test)
         }
 
         run_terminal_workspace_cleanup()
@@ -335,8 +342,7 @@ defmodule SymphonyElixir.Orchestrator do
       |> reconcile_blocked_issues()
 
     with :ok <- Config.validate!(),
-         {:ok, issues} <- Tracker.fetch_issues_by_states(Config.settings!().tracker.active_states),
-         true <- available_slots(state) > 0 do
+         {:ok, issues} <- Tracker.fetch_issues_by_states(Config.settings!().tracker.active_states) do
       choose_issues(issues, state)
     else
       {:error, :missing_linear_api_token} ->
@@ -375,9 +381,6 @@ defmodule SymphonyElixir.Orchestrator do
 
       {:error, reason} ->
         Logger.error("Failed to fetch from issue tracker: #{inspect(reason)}")
-        state
-
-      false ->
         state
     end
   end
@@ -661,10 +664,11 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp reconcile_stalled_running_issues(%State{} = state) do
-    timeout_ms = Config.settings!().codex.stall_timeout_ms
+    codex_config = Config.settings!().codex
+    default_timeout_ms = codex_config.stall_timeout_ms
 
     cond do
-      timeout_ms <= 0 ->
+      default_timeout_ms <= 0 and map_size(codex_config.stall_timeout_ms_by_role || %{}) == 0 ->
         state
 
       map_size(state.running) == 0 ->
@@ -674,6 +678,7 @@ defmodule SymphonyElixir.Orchestrator do
         now = DateTime.utc_now()
 
         Enum.reduce(state.running, state, fn {issue_id, running_entry}, state_acc ->
+          timeout_ms = stall_timeout_for(running_entry, codex_config)
           maybe_restart_stalled_issue(state_acc, issue_id, running_entry, now, timeout_ms)
         end)
     end
@@ -703,22 +708,105 @@ defmodule SymphonyElixir.Orchestrator do
         |> record_session_completion_totals(running_entry)
         |> stop_and_block_issue(issue_id, running_entry, error)
       else
-        Logger.warning("Issue stalled: issue_id=#{issue_id} issue_identifier=#{identifier} session_id=#{session_id} elapsed_ms=#{elapsed_ms}; restarting with backoff")
+        case {Map.get(running_entry, :recovery_enabled, false), Map.get(running_entry, :recovery_stage)} do
+          {false, _} ->
+            # Preserve the legacy test/integration shape for externally
+            # injected entries that predate the staged controller.
+            retry_stalled_issue(state, issue_id, running_entry, identifier, elapsed_ms)
 
-        next_attempt = next_retry_attempt_from_running(running_entry)
+          {true, stage} when stage in [nil, :observing] ->
+            # First expiry is an observation checkpoint. Do not kill a worker
+            # before we have attempted the bounded recovery protocol.
+            inspection = stalled_worker_inspection(running_entry)
+            Logger.warning("Issue stalled; recording inspection checkpoint: issue_id=#{issue_id} issue_identifier=#{identifier} elapsed_ms=#{elapsed_ms} inspection=#{inspect(inspection)}")
+            emit_recovery_event(:inspected, issue_id, running_entry)
 
-        state
-        |> terminate_running_issue(issue_id, false)
-        |> schedule_issue_retry(issue_id, next_attempt, %{
-          identifier: identifier,
-          issue_url: running_entry.issue.url,
-          error: "stalled for #{elapsed_ms}ms without codex activity"
-        })
+            state.running[issue_id]
+            |> Map.merge(%{recovery_stage: :inspected, recovery_started_at: DateTime.utc_now(), inspection: inspection})
+            |> then(&%{state | running: Map.put(state.running, issue_id, &1)})
+
+          {true, :inspected} ->
+            case Map.get(running_entry, :pid) do
+              pid when is_pid(pid) ->
+                steer_stalled_worker(state, running_entry, pid, issue_id, identifier)
+
+              _ ->
+                retry_stalled_issue(state, issue_id, running_entry, identifier, elapsed_ms)
+            end
+
+          {true, :steered} when is_pid(running_entry.pid) ->
+            if Process.alive?(running_entry.pid) and not recovery_window_expired?(running_entry, now, timeout_ms) do
+              Logger.warning("Holding stalled issue until steered worker is terminal: issue_id=#{issue_id} issue_identifier=#{identifier}")
+              state
+            else
+              retry_stalled_issue(state, issue_id, running_entry, identifier, elapsed_ms)
+            end
+
+          {true, _} ->
+            retry_stalled_issue(state, issue_id, running_entry, identifier, elapsed_ms)
+        end
       end
     else
       state
     end
   end
+
+  defp steer_stalled_worker(state, _running_entry, pid, issue_id, identifier) do
+    case AgentRunner.steer(pid, "Continue from the current state; make one durable progress step and report the result.") do
+      {:ok, _provider_result} ->
+        Logger.info("Issued one bounded stall recovery steer: issue_id=#{issue_id} issue_identifier=#{identifier}")
+        emit_recovery_event(:steered, issue_id, state.running[issue_id])
+
+        state.running[issue_id]
+        |> Map.merge(%{recovery_stage: :steered, recovery_started_at: DateTime.utc_now()})
+        |> then(&%{state | running: Map.put(state.running, issue_id, &1)})
+
+      {:error, reason} ->
+        Logger.warning("Stall recovery steer was rejected or unavailable: issue_id=#{issue_id} reason=#{inspect(reason)}")
+        state
+    end
+  end
+
+  defp stalled_worker_inspection(running_entry) do
+    %{
+      worker_alive: is_pid(Map.get(running_entry, :pid)) and Process.alive?(running_entry.pid),
+      session_present: is_binary(Map.get(running_entry, :session_id)),
+      workspace_present: is_binary(Map.get(running_entry, :workspace_path)),
+      thread_present: is_binary(Map.get(running_entry, :thread_id)),
+      turn_present: is_binary(Map.get(running_entry, :turn_id))
+    }
+  end
+
+  defp recovery_window_expired?(running_entry, now, timeout_ms) do
+    case Map.get(running_entry, :recovery_started_at) do
+      %DateTime{} = started_at -> DateTime.diff(now, started_at, :millisecond) > timeout_ms
+      _ -> false
+    end
+  end
+
+  defp retry_stalled_issue(state, issue_id, running_entry, identifier, elapsed_ms) do
+    session_id = running_entry_session_id(running_entry)
+    Logger.warning("Issue stalled: issue_id=#{issue_id} issue_identifier=#{identifier} session_id=#{session_id} elapsed_ms=#{elapsed_ms}; restarting with backoff")
+    emit_recovery_event(:superseded, issue_id, running_entry)
+
+    next_attempt = next_retry_attempt_from_running(running_entry)
+
+    state
+    |> terminate_running_issue(issue_id, false)
+    |> schedule_issue_retry(issue_id, next_attempt, %{
+      identifier: identifier,
+      issue_url: running_entry.issue.url,
+      error: "stalled for #{elapsed_ms}ms without codex activity"
+    })
+  end
+
+  defp stall_timeout_for(running_entry, %{stall_timeout_ms: default, stall_timeout_ms_by_role: by_role}) do
+    role = running_entry |> Map.get(:role, Map.get(running_entry, :task_role)) |> normalize_role()
+    Map.get(by_role || %{}, role, default)
+  end
+
+  defp normalize_role(role) when is_binary(role), do: role |> String.trim() |> String.downcase()
+  defp normalize_role(_), do: nil
 
   defp stall_elapsed_ms(running_entry, now) do
     running_entry
@@ -733,7 +821,7 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp last_activity_timestamp(running_entry) when is_map(running_entry) do
-    Map.get(running_entry, :last_codex_timestamp) || Map.get(running_entry, :started_at)
+    Map.get(running_entry, :last_durable_progress_at) || Map.get(running_entry, :started_at)
   end
 
   defp last_activity_timestamp(_running_entry), do: nil
@@ -872,15 +960,207 @@ defmodule SymphonyElixir.Orchestrator do
     active_states = active_state_set()
     terminal_states = terminal_state_set()
 
+    if state.require_work_pressure_authority do
+      choose_issues_authoritative(issues, state, active_states, terminal_states)
+    else
+      legacy_choose_issues(issues, state, active_states, terminal_states)
+    end
+  end
+
+  defp choose_issues_authoritative(issues, state, active_states, terminal_states) do
+    with {:ok, project_id} <- work_pressure_project_id(state),
+         :ok <- work_pressure_ledger_available?(state) do
+      choose_issues_with_authority(issues, state, active_states, terminal_states, project_id)
+    else
+      {:error, reason} ->
+        Logger.warning("Work pressure authority unavailable: #{inspect(reason)}")
+        %{state | work_pressure: %{error: reason}}
+    end
+  end
+
+  defp legacy_choose_issues(issues, state, active_states, terminal_states) do
     issues
     |> sort_issues_for_dispatch()
     |> Enum.reduce(state, fn issue, state_acc ->
-      if should_dispatch_issue?(issue, state_acc, active_states, terminal_states) do
-        dispatch_issue(state_acc, issue)
-      else
-        state_acc
-      end
+      if should_dispatch_issue?(issue, state_acc, active_states, terminal_states), do: dispatch_issue(state_acc, issue), else: state_acc
     end)
+  end
+
+  defp choose_issues_with_authority(issues, state, active_states, terminal_states, project_id) do
+    ready =
+      issues
+      |> sort_issues_for_dispatch()
+      |> Enum.filter(&dispatch_candidate?(&1, state, active_states, terminal_states))
+
+    active =
+      state.running
+      |> Map.values()
+      |> Enum.map(&work_pressure_item_from_running(&1, project_id))
+      |> Enum.reject(&is_nil/1)
+      |> Enum.sort_by(&{&1.issue_id, &1.task_id, &1.idempotency_key})
+
+    decision_revision = work_pressure_revision(ready, active)
+
+    case WorkPressure.select(
+           Enum.map(ready, &work_pressure_item_from_issue(&1, project_id)),
+           active,
+           work_pressure_limits(),
+           decision_revision
+         ) do
+      {:ok, result} ->
+        case record_work_pressure_constructor(state, result) do
+          {:ok, state} ->
+            state = %{state | work_pressure: result}
+            selected_ids = MapSet.new(result.selected, & &1.issue_id)
+
+            Enum.reduce(ready, state, fn issue, state_acc ->
+              if MapSet.member?(selected_ids, issue.id) and should_dispatch_issue?(issue, state_acc, active_states, terminal_states),
+                do: dispatch_issue(state_acc, issue),
+                else: state_acc
+            end)
+
+          {:error, state} ->
+            %{state | work_pressure: %{error: :constructor_not_durable, decision_revision: decision_revision}}
+        end
+
+      {:error, reason} ->
+        Logger.error("Work pressure selection failed: #{inspect(reason)}")
+        %{state | work_pressure: %{error: reason, decision_revision: decision_revision}}
+    end
+  end
+
+  defp work_pressure_item_from_issue(%Issue{} = issue, project_id) do
+    %{
+      issue_id: issue.id,
+      task_id: issue.id,
+      project_id: project_id,
+      repository: issue_repository(issue),
+      write_domain: issue.branch_name || issue.identifier,
+      role: "implementation worker",
+      authority_revision: issue_checkpoint(issue),
+      idempotency_key: "dispatch-#{issue.id}-#{issue_checkpoint(issue)}",
+      priority: 6 - priority_rank(issue.priority)
+    }
+  end
+
+  defp work_pressure_item_from_running(%{issue: %Issue{} = issue} = entry, project_id) do
+    item = work_pressure_item_from_issue(issue, project_id)
+    Map.put(item, :host, Map.get(entry, :worker_host) || "local")
+  end
+
+  defp work_pressure_item_from_running(_, _project_id), do: nil
+
+  defp work_pressure_project_id(_state) do
+    case Config.settings!().codex.project_binding do
+      binding when is_map(binding) ->
+        id = Map.get(binding, :native_project_id, Map.get(binding, "native_project_id"))
+        if is_binary(id) and String.trim(id) != "", do: {:ok, id}, else: {:error, :project_binding_missing}
+
+      _ ->
+        {:error, :project_binding_missing}
+    end
+  end
+
+  defp work_pressure_ledger_available?(%State{require_work_pressure_authority: false}), do: :ok
+  defp work_pressure_ledger_available?(%State{action_ledger: ledger}) when not is_nil(ledger), do: :ok
+  defp work_pressure_ledger_available?(_state), do: {:error, :action_ledger_missing}
+
+  defp work_pressure_limits do
+    config = Config.settings!()
+    host_limit = config.worker.max_concurrent_agents_per_host
+
+    %{
+      global: config.agent.max_concurrent_agents,
+      host: if(is_integer(host_limit) and host_limit > 0, do: host_limit, else: %{}),
+      project: config.agent.max_concurrent_agents,
+      repository: config.agent.max_concurrent_agents,
+      write_domain: 1
+    }
+  end
+
+  defp work_pressure_revision(ready, active) do
+    :crypto.hash(:sha256, :erlang.term_to_binary({ready, active}, [:deterministic]))
+    |> Base.encode16(case: :lower)
+  end
+
+  defp record_work_pressure_constructor(%State{action_ledger: nil} = state, _result), do: {:ok, state}
+
+  defp record_work_pressure_constructor(%State{} = state, result) do
+    intent = %{
+      kind: :task_creation,
+      source: %{
+        task_id: "work-pressure",
+        issue_id: result.constructor_action_id,
+        revision: result.decision_revision,
+        role: "constructor"
+      },
+      target: %{type: "work_pressure_constructor"},
+      purpose: "work-pressure.constructor.#{result.decision_revision}",
+      checkpoint: result.decision_revision,
+      expected_postcondition: "work_pressure.selected",
+      policy_fingerprint: ActionLedger.policy_fingerprint("symphony.work-pressure.v1")
+    }
+
+    case ActionLedger.plan(state.action_ledger, intent) do
+      {:ok, action, disposition} ->
+        case action.state do
+          :planned ->
+            case ActionLedger.transition(state.action_ledger, action.id, :dispatched, %{"disposition" => "selected"}) do
+              {:ok, _} ->
+                case ActionLedger.transition(state.action_ledger, action.id, :succeeded, %{"disposition" => "selected"}) do
+                  {:ok, _} ->
+                    if disposition == :new, do: emit_work_pressure_decision(result)
+                    {:ok, state}
+
+                  {:error, reason} ->
+                    Logger.warning("Unable to settle work pressure constructor: #{inspect(reason)}")
+                    {:error, state}
+                end
+
+              {:error, reason} ->
+                Logger.warning("Unable to settle work pressure constructor: #{inspect(reason)}")
+                {:error, state}
+            end
+
+          _ ->
+            {:ok, state}
+        end
+
+      {:error, reason} ->
+        Logger.warning("Unable to record work pressure constructor: #{inspect(reason)}")
+        {:error, state}
+    end
+  end
+
+  defp emit_work_pressure_decision(result) do
+    :telemetry.execute(
+      [:symphony, :work_pressure, :decision],
+      %{
+        count: 1,
+        selected_count: length(result.selected),
+        held_count: length(result.held),
+        target: result.target,
+        available: result.available
+      },
+      %{
+        constructor_action_id: result.constructor_action_id,
+        decision_revision: result.decision_revision
+      }
+    )
+  end
+
+  defp emit_recovery_event(stage, issue_id, running_entry) do
+    :telemetry.execute(
+      [:symphony, :work_pressure, :recovery],
+      %{count: 1},
+      %{
+        stage: stage,
+        issue_id: issue_id,
+        role: Map.get(running_entry || %{}, :role),
+        attempt: Map.get(running_entry || %{}, :retry_attempt, 0),
+        action_id: Map.get(running_entry || %{}, :action_id)
+      }
+    )
   end
 
   defp sort_issues_for_dispatch(issues) when is_list(issues) do
@@ -919,6 +1199,15 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp should_dispatch_issue?(_issue, _state, _active_states, _terminal_states), do: false
+
+  defp dispatch_candidate?(%Issue{} = issue, %State{running: running, claimed: claimed, blocked: blocked}, active_states, terminal_states) do
+    candidate_issue?(issue, active_states, terminal_states) and
+      !MapSet.member?(claimed, issue.id) and
+      !Map.has_key?(running, issue.id) and
+      !Map.has_key?(blocked, issue.id)
+  end
+
+  defp dispatch_candidate?(_issue, _state, _active_states, _terminal_states), do: false
 
   defp state_slots_available?(%Issue{state: issue_state}, running) when is_map(running) do
     limit = Config.max_concurrent_agents_for_state(issue_state)
@@ -1060,21 +1349,38 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp default_worker_starter(task_supervisor, issue, attempt, recipient, worker_host) do
-    task_fun = fn ->
-      AgentRunner.run(issue, recipient, attempt: attempt, worker_host: worker_host)
-    end
+    # Operational repository dispatch is already gated by the required project
+    # binding in the authoritative work-pressure path. Keep the historical
+    # non-operational/test runner available when that binding is deliberately
+    # disabled.
+    launch_opts = [
+      attempt: attempt,
+      worker_host: worker_host,
+      repository_task: TaskLaunchContract.project_binding_enabled?()
+    ]
 
-    case Task.Supervisor.start_child(task_supervisor, task_fun) do
-      {:ok, pid} ->
-        {:ok, pid,
-         %{
-           "worker_host" => worker_host,
-           "workspace_key" => Workspace.workspace_key(issue),
-           "disposition" => "worker_spawned"
-         }}
+    case AgentRunner.prepare_launch(issue, worker_host, launch_opts) do
+      {:ok, prepared_launch} ->
+        task_fun = fn ->
+          AgentRunner.run(issue, recipient, launch_opts ++ [prepared_launch: prepared_launch])
+        end
+
+        case Task.Supervisor.start_child(task_supervisor, task_fun) do
+          {:ok, pid} ->
+            {:ok, pid,
+             %{
+               "worker_host" => worker_host,
+               "workspace_key" => Workspace.workspace_key(issue),
+               "disposition" => "worker_spawned"
+             }}
+
+          {:error, reason} ->
+            {:error, reason, :retryable_failure}
+        end
 
       {:error, reason} ->
-        {:error, reason, :retryable_failure}
+        Logger.warning("Launch contract preflight rejected #{issue_context(issue)}: #{inspect(reason)}")
+        {:error, {:launch_contract_preflight_failed, reason}, :retryable_failure}
     end
   end
 
@@ -1156,6 +1462,10 @@ defmodule SymphonyElixir.Orchestrator do
       last_codex_message: nil,
       last_codex_timestamp: nil,
       last_codex_event: nil,
+      last_durable_progress_at: DateTime.utc_now(),
+      recovery_stage: :observing,
+      recovery_enabled: true,
+      role: "implementation worker",
       codex_app_server_pid: nil,
       codex_input_tokens: 0,
       codex_output_tokens: 0,
@@ -1584,6 +1894,18 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  @doc false
+  @spec stall_elapsed_ms_for_test(map(), DateTime.t()) :: non_neg_integer() | nil
+  def stall_elapsed_ms_for_test(running_entry, now), do: stall_elapsed_ms(running_entry, now)
+
+  @doc false
+  @spec integrate_codex_update_for_test(map(), map()) :: {map(), map()}
+  def integrate_codex_update_for_test(running_entry, update), do: integrate_codex_update(running_entry, update)
+
+  @doc false
+  @spec stall_timeout_for_test(map(), map()) :: non_neg_integer()
+  def stall_timeout_for_test(running_entry, codex_config), do: stall_timeout_for(running_entry, codex_config)
+
   @impl true
   def handle_call({:fork_thread, intent, workspace, opts}, _from, state)
       when is_map(intent) and is_binary(workspace) and is_list(opts) do
@@ -1661,6 +1983,9 @@ defmodule SymphonyElixir.Orchestrator do
           last_codex_timestamp: metadata.last_codex_timestamp,
           last_codex_message: metadata.last_codex_message,
           last_codex_event: metadata.last_codex_event,
+          recovery_stage: Map.get(metadata, :recovery_stage),
+          recovery_started_at: Map.get(metadata, :recovery_started_at),
+          inspection: Map.get(metadata, :inspection),
           runtime_seconds: running_seconds(metadata.started_at, now)
         }
       end)
@@ -1708,6 +2033,7 @@ defmodule SymphonyElixir.Orchestrator do
        action_ledger: action_ledger_snapshot(state.action_ledger),
        codex_totals: state.codex_totals,
        rate_limits: Map.get(state, :codex_rate_limits),
+       work_pressure: work_pressure_snapshot(state.work_pressure),
        polling: %{
          checking?: state.poll_check_in_progress == true,
          next_poll_in_ms: next_poll_in_ms(state.next_poll_due_at_ms, now_ms),
@@ -1715,6 +2041,29 @@ defmodule SymphonyElixir.Orchestrator do
        }
      }, state}
   end
+
+  defp work_pressure_snapshot(nil), do: nil
+
+  defp work_pressure_snapshot(%{selected: selected, held: held} = result) do
+    %{
+      constructor_action_id: result.constructor_action_id,
+      decision_revision: result.decision_revision,
+      target: result.target,
+      available: result.available,
+      selected_count: length(selected),
+      held_count: length(held),
+      selected_issue_ids: Enum.map(selected, & &1.issue_id),
+      held_issue_ids: Enum.map(held, & &1.item.issue_id),
+      held_reasons: Enum.map(held, &Atom.to_string(&1.reason)),
+      capacity_held_count: Enum.count(held, &(&1.reason == :capacity_held)),
+      write_domain_held_count: Enum.count(held, &(&1.reason == :write_domain_held))
+    }
+  end
+
+  defp work_pressure_snapshot(%{error: reason, decision_revision: revision}),
+    do: %{error: reason, decision_revision: revision}
+
+  defp work_pressure_snapshot(_), do: nil
 
   def handle_call(:request_refresh, _from, state) do
     now_ms = System.monotonic_time(:millisecond)
@@ -1779,6 +2128,9 @@ defmodule SymphonyElixir.Orchestrator do
     {
       Map.merge(running_entry, %{
         last_codex_timestamp: timestamp,
+        last_durable_progress_at: durable_progress_timestamp(running_entry, event, timestamp),
+        recovery_stage: recovery_stage_after_progress(running_entry, event),
+        recovery_started_at: recovery_started_at_after_progress(running_entry, event),
         last_codex_message: summarize_codex_update(update),
         session_id: session_id_for_update(running_entry.session_id, update),
         thread_id: correlation_value(running_entry, update, :thread_id),
@@ -1796,6 +2148,22 @@ defmodule SymphonyElixir.Orchestrator do
       token_delta
     }
   end
+
+  defp durable_progress_timestamp(_running_entry, event, timestamp)
+       when event in @durable_progress_events and is_struct(timestamp, DateTime), do: timestamp
+
+  defp durable_progress_timestamp(running_entry, _event, _timestamp),
+    do: Map.get(running_entry, :last_durable_progress_at)
+
+  defp recovery_stage_after_progress(running_entry, event) when event in @durable_progress_events,
+    do: if(Map.get(running_entry, :recovery_stage) == :steered, do: :observing, else: Map.get(running_entry, :recovery_stage))
+
+  defp recovery_stage_after_progress(running_entry, _event), do: Map.get(running_entry, :recovery_stage)
+
+  defp recovery_started_at_after_progress(running_entry, event) when event in @durable_progress_events,
+    do: if(Map.get(running_entry, :recovery_stage) == :steered, do: nil, else: Map.get(running_entry, :recovery_started_at))
+
+  defp recovery_started_at_after_progress(running_entry, _event), do: Map.get(running_entry, :recovery_started_at)
 
   defp codex_app_server_pid_for_update(_existing, %{codex_app_server_pid: pid})
        when is_binary(pid),

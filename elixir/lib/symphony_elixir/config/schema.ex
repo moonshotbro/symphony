@@ -176,6 +176,8 @@ defmodule SymphonyElixir.Config.Schema do
     use Ecto.Schema
     import Ecto.Changeset
 
+    alias SymphonyElixir.Config.Schema
+
     @primary_key false
 
     defmodule ProjectBinding do
@@ -258,6 +260,7 @@ defmodule SymphonyElixir.Config.Schema do
       field(:turn_timeout_ms, :integer, default: 3_600_000)
       field(:read_timeout_ms, :integer, default: 5_000)
       field(:stall_timeout_ms, :integer, default: 300_000)
+      field(:stall_timeout_ms_by_role, :map, default: %{})
       embeds_one(:project_binding, ProjectBinding, on_replace: :update)
     end
 
@@ -273,7 +276,8 @@ defmodule SymphonyElixir.Config.Schema do
           :turn_sandbox_policy,
           :turn_timeout_ms,
           :read_timeout_ms,
-          :stall_timeout_ms
+          :stall_timeout_ms,
+          :stall_timeout_ms_by_role
         ],
         empty_values: []
       )
@@ -288,6 +292,8 @@ defmodule SymphonyElixir.Config.Schema do
       |> validate_number(:turn_timeout_ms, greater_than: 0)
       |> validate_number(:read_timeout_ms, greater_than: 0)
       |> validate_number(:stall_timeout_ms, greater_than_or_equal_to: 0)
+      |> update_change(:stall_timeout_ms_by_role, &Schema.normalize_stall_timeout_limits/1)
+      |> Schema.validate_stall_timeout_limits(:stall_timeout_ms_by_role)
       |> cast_embed(:project_binding, with: &ProjectBinding.changeset/2)
     end
   end
@@ -465,6 +471,35 @@ defmodule SymphonyElixir.Config.Schema do
   def normalize_state_limits(limits) when is_map(limits) do
     Enum.reduce(limits, %{}, fn {state_name, limit}, acc ->
       Map.put(acc, normalize_issue_state(to_string(state_name)), limit)
+    end)
+  end
+
+  @doc false
+  @spec normalize_stall_timeout_limits(nil | map()) :: map()
+  def normalize_stall_timeout_limits(nil), do: %{}
+
+  def normalize_stall_timeout_limits(limits) when is_map(limits) do
+    Enum.reduce(limits, %{}, fn {role, timeout_ms}, acc ->
+      Map.put(acc, role |> to_string() |> String.trim() |> String.downcase(), timeout_ms)
+    end)
+  end
+
+  @doc false
+  @spec validate_stall_timeout_limits(Ecto.Changeset.t(), atom()) :: Ecto.Changeset.t()
+  def validate_stall_timeout_limits(changeset, field) do
+    validate_change(changeset, field, fn ^field, limits ->
+      Enum.flat_map(limits, fn {role, timeout_ms} ->
+        cond do
+          String.trim(to_string(role)) == "" ->
+            [{field, "role aliases must not be blank"}]
+
+          not is_integer(timeout_ms) or timeout_ms < 0 ->
+            [{field, "stall timeouts must be nonnegative integers"}]
+
+          true ->
+            []
+        end
+      end)
     end)
   end
 
