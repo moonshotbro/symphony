@@ -1,4 +1,4 @@
-# credo:disable-for-this-file Credo.Check.Warning.StructFieldCount
+# credo:disable-for-this-file Credo.Check.Warning.StructFieldAmount
 defmodule SymphonyElixir.Codex.TaskLaunchContract do
   @moduledoc """
   Pure compiler for the bounded identity carried by a Codex task launch.
@@ -135,7 +135,7 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
           accountability: map()
         }
 
-  # credo:disable-for-next-line Credo.Check.Warning.StructFieldCount
+  # credo:disable-for-next-line Credo.Check.Warning.StructFieldAmount
   defstruct [
     :contract_id,
     :programme,

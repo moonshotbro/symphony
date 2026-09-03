@@ -1,6 +1,8 @@
 defmodule SymphonyElixir.AppServerTest do
   use SymphonyElixir.TestSupport
 
+  alias SymphonyElixir.Codex.TaskLaunchContract
+
   test "steering is routed through the active session owner and preserves provider response" do
     test_pid = self()
 
@@ -44,7 +46,7 @@ defmodule SymphonyElixir.AppServerTest do
       File.chmod!(codex_binary, 0o755)
       write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root, codex_command: "#{codex_binary} app-server")
 
-      contract = %SymphonyElixir.Codex.TaskLaunchContract{project: %{native_project_id: "project-39"}}
+      contract = %TaskLaunchContract{project: %{native_project_id: "project-39"}}
 
       assert {:error, :invalid_task_launch_contract} =
                AppServer.fork_thread("parent-39", workspace, task_contract: contract)
@@ -1671,17 +1673,25 @@ defmodule SymphonyElixir.AppServerTest do
             case "$line" in *'"model":"gpt-terra"'*) ;; *) exit 14;; esac
             case "$line" in *'"modelProvider":"sysmiq-azure-foundry"'*) ;; *) exit 15;; esac
             printf '%s\\n' '{"id":3,"result":{"turn":{"id":"bound-turn"}}}'
+            printf '%s\\n' '{"id":44,"method":"item/commandExecution/requestApproval","params":{"command":"git status","cwd":"WORKSPACE","reason":"verify worker state"}}' | sed "s|WORKSPACE|$PWD|"
+            printf '%s\\n' '{"id":102,"method":"item/tool/call","params":{"name":"linear_graphql","callId":"bound-call","threadId":"bound-thread","turnId":"bound-turn","arguments":{"query":"query Viewer { viewer { id } }"}}}'
             printf '%s\\n' '{"method":"item/completed","usage":{"input_tokens":12,"cached_input_tokens":3,"output_tokens":4}}'
-            printf '%s\\n' '{"method":"turn/completed"}' ;;
+            ;;
+          8) printf '%s\\n' '{"method":"turn/completed"}' ;;
         esac
       done
       """)
 
       File.chmod!(binary, 0o755)
-      write_workflow_file!(Workflow.workflow_file_path(), workspace_root: Path.join(root, "workspaces"), codex_command: "#{binary} app-server")
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: Path.join(root, "workspaces"),
+        codex_command: "#{binary} app-server",
+        codex_approval_policy: "never"
+      )
 
       assert {:ok, contract} =
-               SymphonyElixir.Codex.TaskLaunchContract.compile(%{
+               TaskLaunchContract.compile(%{
                  programme: "build-toscanini",
                  repository: "moonshotbro/sysmiq-symphony",
                  issue_or_pr: "SYS-50",
@@ -1723,6 +1733,7 @@ defmodule SymphonyElixir.AppServerTest do
       assert {:ok, %{result: :turn_completed}} =
                AppServer.run(workspace, "bound", issue,
                  task_contract: contract,
+                 tool_executor: fn _tool, _arguments -> %{"success" => true, "output" => "ok"} end,
                  on_message: &send(parent, {:wire_event, &1})
                )
 
@@ -1736,6 +1747,22 @@ defmodule SymphonyElixir.AppServerTest do
                       }}
 
       assert digest == String.duplicate("d", 64)
+
+      assert_receive {:wire_event,
+                      %{
+                        event: :approval_auto_approved,
+                        model_provider: "sysmiq-azure-foundry",
+                        model_deployment: "gpt-terra",
+                        provider_allocation_digest: ^digest
+                      }}
+
+      assert_receive {:wire_event,
+                      %{
+                        event: :tool_call_completed,
+                        model_provider: "sysmiq-azure-foundry",
+                        model_deployment: "gpt-terra",
+                        provider_allocation_digest: ^digest
+                      }}
     after
       File.rm_rf(root)
     end
@@ -1814,7 +1841,7 @@ defmodule SymphonyElixir.AppServerTest do
       File.chmod!(binary, 0o755)
       write_workflow_file!(Workflow.workflow_file_path(), workspace_root: Path.join(root, "workspaces"), codex_command: "#{binary} app-server")
 
-      contract = %SymphonyElixir.Codex.TaskLaunchContract{
+      contract = %TaskLaunchContract{
         title: "Implementation SYS-50: bound",
         executing_identity: %{model: :"gpt-5.6-terra", effort: :medium, role: :implementation, title: "Implementation SYS-50: bound"},
         project: %{native_project_id: "01a04aab-c77c-79b0-ab09-65187353bb4b"}
@@ -2099,7 +2126,7 @@ defmodule SymphonyElixir.AppServerTest do
       File.chmod!(binary, 0o755)
       write_workflow_file!(Workflow.workflow_file_path(), workspace_root: Path.join(root, "workspaces"), codex_command: "#{binary} app-server")
 
-      contract = %SymphonyElixir.Codex.TaskLaunchContract{
+      contract = %TaskLaunchContract{
         title: "Implementation SYS-50: bound",
         executing_identity: %{model: :"gpt-5.6-terra", effort: :medium, role: :implementation, title: "Implementation SYS-50: bound"},
         project: %{native_project_id: "01a04aab-c77c-79b0-ab09-65187353bb4b"}
@@ -2116,7 +2143,7 @@ defmodule SymphonyElixir.AppServerTest do
   end
 
   defp project_wire_contract(workspace) do
-    SymphonyElixir.Codex.TaskLaunchContract.compile(%{
+    TaskLaunchContract.compile(%{
       programme: "build-toscanini",
       repository: "moonshotbro/sysmiq-symphony",
       issue_or_pr: "SYS-50",
@@ -2180,7 +2207,7 @@ defmodule SymphonyElixir.AppServerTest do
       File.chmod!(binary, 0o755)
       write_workflow_file!(Workflow.workflow_file_path(), workspace_root: Path.join(root, "workspaces"), codex_command: "#{binary} app-server")
 
-      contract = %SymphonyElixir.Codex.TaskLaunchContract{
+      contract = %TaskLaunchContract{
         title: "Implementation SYS-50: bound",
         executing_identity: %{model: :"gpt-5.6-terra", effort: :medium, role: :implementation, title: "Implementation SYS-50: bound"},
         project: %{native_project_id: "01a04aab-c77c-79b0-ab09-65187353bb4b"}
