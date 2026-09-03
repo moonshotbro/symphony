@@ -1440,6 +1440,47 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert settings.workspace.root == Path.join(System.tmp_dir!(), "symphony_workspaces")
   end
 
+  test "codex provider allocation validation is strict and fail closed" do
+    assert {:ok, settings} =
+             Schema.parse(%{
+               codex: %{
+                 model_provider: "sysmiq-azure-foundry",
+                 model_deployment: "gpt-luna",
+                 provider_allocation_digest: String.duplicate("a", 64)
+               }
+             })
+
+    assert settings.codex.model_provider == "sysmiq-azure-foundry"
+    assert settings.codex.model_deployment == "gpt-luna"
+
+    assert {:error, {:invalid_workflow_config, provider_error}} =
+             Schema.parse(%{codex: %{model_provider: "openai"}})
+
+    assert provider_error =~ "must be sysmiq-azure-foundry"
+
+    assert {:error, {:invalid_workflow_config, deployment_error}} =
+             Schema.parse(%{
+               codex: %{
+                 model_provider: "sysmiq-azure-foundry",
+                 model_deployment: "unknown",
+                 provider_allocation_digest: String.duplicate("b", 64)
+               }
+             })
+
+    assert deployment_error =~ "must be one of gpt, gpt-terra, or gpt-luna"
+
+    assert {:error, {:invalid_workflow_config, digest_error}} =
+             Schema.parse(%{
+               codex: %{
+                 model_provider: "sysmiq-azure-foundry",
+                 model_deployment: "gpt",
+                 provider_allocation_digest: "not-a-digest"
+               }
+             })
+
+    assert digest_error =~ "must be a SHA-256 digest"
+  end
+
   test "schema resolves sandbox policies from explicit and default workspaces" do
     explicit_policy = %{"type" => "workspaceWrite", "writableRoots" => ["/tmp/explicit"]}
 

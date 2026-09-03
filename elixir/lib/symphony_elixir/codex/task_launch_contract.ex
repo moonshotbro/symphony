@@ -1,4 +1,4 @@
-# credo:disable-for-this-file Credo.Check.Warning.StructFieldCount
+# credo:disable-for-this-file Credo.Check.Warning.StructFieldAmount
 defmodule SymphonyElixir.Codex.TaskLaunchContract do
   @moduledoc """
   Pure compiler for the bounded identity carried by a Codex task launch.
@@ -22,6 +22,12 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
     :acceptance
   ]
   @models ~w(gpt-5.6-sol gpt-5.6-terra gpt-5.6-luna)a
+  @model_providers ~w(sysmiq-azure-foundry)a
+  @model_deployments %{
+    "gpt-5.6-sol": "gpt",
+    "gpt-5.6-terra": "gpt-terra",
+    "gpt-5.6-luna": "gpt-luna"
+  }
   @goal_policies ~w(none worker programme)a
   @worker_goal_roles ~w(implementation recovery research)a
   @write_domains ~w(none product review merge recovery evidence programme)a
@@ -55,6 +61,9 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
           task: String.t(),
           title: String.t(),
           model: atom(),
+          model_provider: :"sysmiq-azure-foundry",
+          model_deployment: String.t(),
+          provider_allocation_digest: String.t(),
           effort: atom(),
           role: role(),
           issue_or_pr: String.t(),
@@ -104,7 +113,9 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
           risk_assurance: map() | nil,
           write_boundary: atom(),
           evidence: [String.t()],
-          model: atom(),
+          model_provider: :"sysmiq-azure-foundry",
+          model_deployment: String.t(),
+          provider_allocation_digest: String.t(),
           effort: atom(),
           trigger: atom(),
           goal_policy: goal_policy(),
@@ -124,6 +135,7 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
           accountability: map()
         }
 
+  # credo:disable-for-next-line Credo.Check.Warning.StructFieldAmount
   defstruct [
     :contract_id,
     :programme,
@@ -137,7 +149,9 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
     :risk_assurance,
     :write_boundary,
     :evidence,
-    :model,
+    :model_provider,
+    :model_deployment,
+    :provider_allocation_digest,
     :effort,
     :trigger,
     :goal_policy,
@@ -162,6 +176,12 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
 
   @spec supported_models() :: [atom()]
   def supported_models, do: @models
+
+  @spec deployment_for_model(atom()) :: String.t() | nil
+  def deployment_for_model(model), do: Map.get(@model_deployments, model)
+
+  @spec supported_deployments() :: [String.t()]
+  def supported_deployments, do: Map.values(@model_deployments)
 
   @spec project_binding_enabled?() :: boolean()
   def project_binding_enabled?, do: binding_enabled?(Config.settings!().codex.project_binding)
@@ -190,7 +210,9 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
         :risk_assurance,
         :write_boundary,
         :evidence,
-        :model,
+        :model_provider,
+        :model_deployment,
+        :provider_allocation_digest,
         :effort,
         :trigger,
         :goal_policy,
@@ -206,6 +228,7 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
         :supersedes,
         :project
       ])
+      |> Map.put(:model, get_in(contract.executing_identity || %{}, [:model]))
       |> Map.merge(Map.take(contract.accountability || %{}, ~w(
         registry_id registry_version primary_role domain_alias authority_revision
         canonical_digest work_character permission_envelope execution_principal
@@ -364,7 +387,9 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
          risk_assurance: values["risk_assurance"],
          write_boundary: values["write_boundary"],
          evidence: values["evidence"],
-         model: values["model"],
+         model_provider: values["model_provider"],
+         model_deployment: values["model_deployment"],
+         provider_allocation_digest: values["provider_allocation_digest"],
          effort: values["effort"],
          trigger: values["trigger"],
          goal_policy: values["goal_policy"],
@@ -411,7 +436,7 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
 
   defp validate(attrs) do
     required =
-      ~w(programme repository issue_or_pr role task fence exact_revision write_boundary evidence model effort goal_policy dependencies permissions evidence_gates stall_policy closeout_policy idempotency_identity conflict_identity project)
+      ~w(programme repository issue_or_pr role task fence exact_revision write_boundary evidence model model_provider model_deployment provider_allocation_digest effort goal_policy dependencies permissions evidence_gates stall_policy closeout_policy idempotency_identity conflict_identity project)
 
     missing = Enum.filter(required, &blank?(attrs[&1]))
 
@@ -428,11 +453,26 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
       role = normalize_atom(attrs["role"])
       trigger = normalize_atom(attrs["trigger"] || "bounded")
       model = normalize_atom(attrs["model"])
+      model_provider = normalize_atom(attrs["model_provider"])
       effort = normalize_atom(attrs["effort"])
       goal = normalize_atom(attrs["goal_policy"])
       boundary = normalize_atom(attrs["write_boundary"])
       attempt = attrs["attempt"] || 0
-      errors = validation_errors(role, model, effort, trigger, goal, boundary, attempt, attrs)
+
+      errors =
+        validation_errors(
+          %{
+            role: role,
+            model: model,
+            model_provider: model_provider,
+            effort: effort,
+            trigger: trigger,
+            goal: goal,
+            boundary: boundary,
+            attempt: attempt
+          },
+          attrs
+        )
 
       case errors do
         [] ->
@@ -440,6 +480,9 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
            Map.merge(attrs, %{
              "role" => role,
              "model" => model,
+             "model_provider" => model_provider,
+             "model_deployment" => attrs["model_deployment"],
+             "provider_allocation_digest" => attrs["provider_allocation_digest"],
              "effort" => effort,
              "trigger" => trigger,
              "goal_policy" => goal,
@@ -464,7 +507,7 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
   end
 
   # credo:disable-for-next-line Credo.Check.Refactor.CyclomaticComplexity
-  defp validation_errors(role, model, effort, trigger, goal, boundary, attempt, attrs) do
+  defp validation_errors(%{role: role, model: model, model_provider: model_provider, effort: effort, trigger: trigger, goal: goal, boundary: boundary, attempt: attempt}, attrs) do
     []
     |> add_unless(
       Enum.all?(~w(programme repository issue_or_pr task fence exact_revision idempotency_identity conflict_identity), &(is_binary(attrs[&1]) and String.trim(attrs[&1]) != "")),
@@ -472,6 +515,10 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
     )
     |> add_unless(role in @roles, {:unsupported_role, role})
     |> add_unless(model in @models, {:unsupported_model, model})
+    |> add_unless(model_provider in @model_providers, {:unsupported_model_provider, model_provider})
+    |> add_unless(nonblank_string?(attrs["model_deployment"]), :invalid_model_deployment)
+    |> add_unless(Map.get(@model_deployments, model) == attrs["model_deployment"], :model_deployment_mismatch)
+    |> add_unless(receipt_digest?(attrs["provider_allocation_digest"]), :invalid_provider_allocation_digest)
     |> add_unless(effort in @efforts, {:unsupported_effort, effort})
     |> add_unless(trigger in (@luna_triggers ++ @terra_triggers ++ @sol_triggers), {:unsupported_trigger, trigger})
     |> add_unless(model_for_trigger?(model, effort, trigger), :model_trigger_mismatch)
@@ -587,6 +634,9 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
           values["write_boundary"],
           values["fence"],
           values["model"],
+          values["model_provider"],
+          values["model_deployment"],
+          values["provider_allocation_digest"],
           values["effort"],
           values["trigger"],
           values["goal_policy"],
@@ -659,7 +709,7 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
     length(keys) != length(Enum.uniq(normalized)) or
       Enum.any?(
         normalized,
-        &(&1 not in ~w(programme repository issue_or_pr role task attempt fence execution_fence exact_revision risk_assurance write_boundary evidence model effort trigger goal_policy dependencies permissions evidence_gates stall_policy closeout_policy idempotency_identity conflict_identity commissioning_identity escalation supersedes project registry_id registry_version primary_role domain_alias authority_revision canonical_digest work_character permission_envelope execution_principal reviewer_principal integrator_principal candidate_id verdict_candidate_id verdict_attempt verdict_exact_revision verdict_fence accepted_verdict receipt_identity receipt_fence handoff))
+        &(&1 not in ~w(programme repository issue_or_pr role task attempt fence execution_fence exact_revision risk_assurance write_boundary evidence model model_provider model_deployment provider_allocation_digest effort trigger goal_policy dependencies permissions evidence_gates stall_policy closeout_policy idempotency_identity conflict_identity commissioning_identity escalation supersedes project registry_id registry_version primary_role domain_alias authority_revision canonical_digest work_character permission_envelope execution_principal reviewer_principal integrator_principal candidate_id verdict_candidate_id verdict_attempt verdict_exact_revision verdict_fence accepted_verdict receipt_identity receipt_fence handoff))
       )
   end
 
@@ -667,7 +717,7 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
 
   # credo:disable-for-next-line Credo.Check.Readability.MaxLineLength
   defp normalize_atom(value) when is_binary(value) do
-    supported = @roles ++ @models ++ @goal_policies ++ @write_domains ++ @efforts
+    supported = @roles ++ @models ++ @model_providers ++ @goal_policies ++ @write_domains ++ @efforts
     supported = supported ++ @stall_policies ++ @closeout_policies
     supported = supported ++ @luna_triggers ++ @terra_triggers ++ @sol_triggers
     Enum.find(supported, &(to_string(&1) == value))
@@ -824,6 +874,9 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
       task: values["task"],
       title: title,
       model: values["model"],
+      model_provider: values["model_provider"],
+      model_deployment: values["model_deployment"],
+      provider_allocation_digest: values["provider_allocation_digest"],
       effort: values["effort"],
       role: values["role"],
       issue_or_pr: values["issue_or_pr"],
@@ -892,6 +945,9 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
     escalation = Keyword.get(opts, :escalation)
     supersedes = Keyword.get(opts, :supersedes)
     {model, effort} = model_for_trigger(trigger)
+    model_provider = Config.settings!().codex.model_provider
+    model_deployment = deployment_for_model(model)
+    provider_allocation_digest = Config.settings!().codex.provider_allocation_digest
 
     if is_binary(identifier) and is_binary(title) and is_integer(attempt) and attempt >= 0 do
       {:ok,
@@ -908,6 +964,9 @@ defmodule SymphonyElixir.Codex.TaskLaunchContract do
          write_boundary: :product,
          evidence: ["change_record", "test_or_quality_evidence"],
          model: model,
+         model_provider: model_provider,
+         model_deployment: model_deployment,
+         provider_allocation_digest: provider_allocation_digest,
          effort: effort,
          trigger: trigger,
          goal_policy: if(role in @worker_goal_roles, do: :worker, else: :none),

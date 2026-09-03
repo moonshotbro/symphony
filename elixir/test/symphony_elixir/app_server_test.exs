@@ -1,6 +1,8 @@
 defmodule SymphonyElixir.AppServerTest do
   use SymphonyElixir.TestSupport
 
+  alias SymphonyElixir.Codex.TaskLaunchContract
+
   test "steering is routed through the active session owner and preserves provider response" do
     test_pid = self()
 
@@ -44,7 +46,7 @@ defmodule SymphonyElixir.AppServerTest do
       File.chmod!(codex_binary, 0o755)
       write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root, codex_command: "#{codex_binary} app-server")
 
-      contract = %SymphonyElixir.Codex.TaskLaunchContract{project: %{native_project_id: "project-39"}}
+      contract = %TaskLaunchContract{project: %{native_project_id: "project-39"}}
 
       assert {:error, :invalid_task_launch_contract} =
                AppServer.fork_thread("parent-39", workspace, task_contract: contract)
@@ -1659,29 +1661,157 @@ defmodule SymphonyElixir.AppServerTest do
           2) ;;
           3)
             case "$line" in *'"projectId":"01a04aab-c77c-79b0-ab09-65187353bb4b"'*) ;; *) exit 9;; esac
-            case "$line" in *'"model":"gpt-5.6-terra"'*) ;; *) exit 11;; esac
+            case "$line" in *'"model":"gpt-terra"'*) ;; *) exit 11;; esac
+            case "$line" in *'"modelProvider":"sysmiq-azure-foundry"'*) ;; *) exit 13;; esac
             case "$line" in *'"model_reasoning_effort":"medium"'*) ;; *) exit 12;; esac
             case "$line" in *'"effort"'*) exit 10;; esac
-            printf '%s\\n' '{"id":2,"result":{"model":"gpt-5.6-terra","reasoningEffort":"medium","instructionSources":["project"],"thread":{"id":"bound-thread","sessionId":"bound-session","projectId":"01a04aab-c77c-79b0-ab09-65187353bb4b","cwd":"WORKSPACE","ephemeral":false}}}' | sed "s|WORKSPACE|$PWD|" ;;
+            printf '%s\\n' '{"id":2,"result":{"model":"gpt-terra","modelProvider":"sysmiq-azure-foundry","reasoningEffort":"medium","instructionSources":["project"],"thread":{"id":"bound-thread","sessionId":"bound-session","projectId":"01a04aab-c77c-79b0-ab09-65187353bb4b","cwd":"WORKSPACE","model":"gpt-terra","modelProvider":"sysmiq-azure-foundry","ephemeral":false,"gitInfo":{"sha":"3d3ee035725b0728f041d8d10fc29f5c8adc42c0","originUrl":"https://github.com/moonshotbro/sysmiq-symphony.git"}}}}' | sed "s|WORKSPACE|$PWD|" ;;
           4) printf '%s\\n' '{"id":6,"result":{}}' ;;
-          5) printf '%s\\n' '{"id":4,"result":{"thread":{"id":"bound-thread","sessionId":"bound-session","projectId":"01a04aab-c77c-79b0-ab09-65187353bb4b","cwd":"WORKSPACE","name":"Implementation SYS-50: bound","ephemeral":false}}}' | sed "s|WORKSPACE|$PWD|" ;;
+          5) printf '%s\\n' '{"id":4,"result":{"thread":{"id":"bound-thread","sessionId":"bound-session","projectId":"01a04aab-c77c-79b0-ab09-65187353bb4b","cwd":"WORKSPACE","name":"Implementation SYS-50: bound","model":"gpt-terra","modelProvider":"sysmiq-azure-foundry","ephemeral":false,"gitInfo":{"sha":"3d3ee035725b0728f041d8d10fc29f5c8adc42c0","originUrl":"https://github.com/moonshotbro/sysmiq-symphony.git"}}}}' | sed "s|WORKSPACE|$PWD|" ;;
           6) printf '%s\\n' '{"id":5,"result":{"data":[]}}' ;;
-          7) printf '%s\\n' '{"id":3,"result":{"turn":{"id":"bound-turn"}}}'; printf '%s\\n' '{"method":"turn/completed"}' ;;
+          7)
+            case "$line" in *'"model":"gpt-terra"'*) ;; *) exit 14;; esac
+            case "$line" in *'"modelProvider":"sysmiq-azure-foundry"'*) ;; *) exit 15;; esac
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"bound-turn"}}}'
+            printf '%s\\n' '{"id":44,"method":"item/commandExecution/requestApproval","params":{"command":"git status","cwd":"WORKSPACE","reason":"verify worker state"}}' | sed "s|WORKSPACE|$PWD|"
+            printf '%s\\n' '{"id":102,"method":"item/tool/call","params":{"name":"linear_graphql","callId":"bound-call","threadId":"bound-thread","turnId":"bound-turn","arguments":{"query":"query Viewer { viewer { id } }"}}}'
+            printf '%s\\n' '{"method":"item/completed","usage":{"input_tokens":12,"cached_input_tokens":3,"output_tokens":4}}'
+            ;;
+          8) printf '%s\\n' '{"method":"turn/completed"}' ;;
         esac
       done
       """)
 
       File.chmod!(binary, 0o755)
-      write_workflow_file!(Workflow.workflow_file_path(), workspace_root: Path.join(root, "workspaces"), codex_command: "#{binary} app-server")
 
-      contract = %SymphonyElixir.Codex.TaskLaunchContract{
-        title: "Implementation SYS-50: bound",
-        executing_identity: %{model: :"gpt-5.6-terra", effort: :medium, role: :implementation, title: "Implementation SYS-50: bound"},
-        project: %{native_project_id: "01a04aab-c77c-79b0-ab09-65187353bb4b"}
-      }
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: Path.join(root, "workspaces"),
+        codex_command: "#{binary} app-server",
+        codex_approval_policy: "never"
+      )
+
+      assert {:ok, contract} =
+               TaskLaunchContract.compile(%{
+                 programme: "build-toscanini",
+                 repository: "moonshotbro/sysmiq-symphony",
+                 issue_or_pr: "SYS-50",
+                 role: :implementation,
+                 task: "bound",
+                 attempt: 0,
+                 fence: "lease-50-1",
+                 exact_revision: "3d3ee035725b0728f041d8d10fc29f5c8adc42c0",
+                 write_boundary: :product,
+                 evidence: ["issue-50"],
+                 model: :"gpt-5.6-terra",
+                 model_provider: :"sysmiq-azure-foundry",
+                 model_deployment: "gpt-terra",
+                 provider_allocation_digest: String.duplicate("d", 64),
+                 effort: :medium,
+                 trigger: :integration_design,
+                 goal_policy: :worker,
+                 dependencies: [],
+                 permissions: ["workspace-write"],
+                 evidence_gates: ["tests"],
+                 stall_policy: :fail_closed,
+                 closeout_policy: :reconcile,
+                 idempotency_identity: "issue-50/implementation/sha",
+                 conflict_identity: "moonshotbro/sysmiq-symphony:SYS-50:implementation",
+                 commissioning_identity: %{kind: "human", authority: "programme"},
+                 project: %{
+                   saved_project_id: "b12752f9-9a65-4194-bc49-77808b21d767",
+                   native_project_id: "01a04aab-c77c-79b0-ab09-65187353bb4b",
+                   programme: "build-toscanini",
+                   repository: "moonshotbro/sysmiq-symphony",
+                   root: workspace
+                 }
+               })
 
       issue = %Issue{id: "sys-50", identifier: "SYS-50", title: "bound", state: "In Progress"}
-      assert {:error, :invalid_task_launch_contract} = AppServer.run(workspace, "bound", issue, task_contract: contract)
+
+      parent = self()
+
+      assert {:ok, %{result: :turn_completed}} =
+               AppServer.run(workspace, "bound", issue,
+                 task_contract: contract,
+                 tool_executor: fn _tool, _arguments -> %{"success" => true, "output" => "ok"} end,
+                 on_message: &send(parent, {:wire_event, &1})
+               )
+
+      assert_receive {:wire_event,
+                      %{
+                        event: :notification,
+                        model_provider: "sysmiq-azure-foundry",
+                        model_deployment: "gpt-terra",
+                        provider_allocation_digest: digest,
+                        usage: %{"input_tokens" => 12, "cached_input_tokens" => 3, "output_tokens" => 4}
+                      }}
+
+      assert digest == String.duplicate("d", 64)
+
+      assert_receive {:wire_event,
+                      %{
+                        event: :approval_auto_approved,
+                        model_provider: "sysmiq-azure-foundry",
+                        model_deployment: "gpt-terra",
+                        provider_allocation_digest: ^digest
+                      }}
+
+      assert_receive {:wire_event,
+                      %{
+                        event: :tool_call_completed,
+                        model_provider: "sysmiq-azure-foundry",
+                        model_deployment: "gpt-terra",
+                        provider_allocation_digest: ^digest
+                      }}
+    after
+      File.rm_rf(root)
+    end
+  end
+
+  test "project-bound readback rejects missing provider and mismatched deployment" do
+    root = Path.join(System.tmp_dir!(), "symphony-project-readback-#{System.unique_integer([:positive])}")
+    workspace = Path.join(root, "workspaces/SYS-50")
+    binary = Path.join(root, "fake-codex")
+    File.mkdir_p!(workspace)
+
+    try do
+      File.write!(binary, """
+      #!/bin/sh
+      mode="$2"
+      count=0
+      while IFS= read -r line; do
+        count=$((count + 1))
+        case "$count" in
+          1) printf '%s\\n' '{"id":1,"result":{}}' ;;
+          2) ;;
+          3) printf '%s\\n' '{"id":2,"result":{"model":"gpt-terra","modelProvider":"sysmiq-azure-foundry","reasoningEffort":"medium","instructionSources":["project"],"thread":{"id":"bound-thread","sessionId":"bound-session","projectId":"01a04aab-c77c-79b0-ab09-65187353bb4b","cwd":"WORKSPACE","model":"gpt-terra","modelProvider":"sysmiq-azure-foundry","ephemeral":false,"gitInfo":{"sha":"3d3ee035725b0728f041d8d10fc29f5c8adc42c0","originUrl":"https://github.com/moonshotbro/sysmiq-symphony.git"}}}}' | sed "s|WORKSPACE|$PWD|" ;;
+          4) printf '%s\\n' '{"id":6,"result":{}}' ;;
+          5)
+            if [ "$mode" = "missing-provider" ]; then
+              printf '%s\\n' '{"id":4,"result":{"thread":{"id":"bound-thread","sessionId":"bound-session","projectId":"01a04aab-c77c-79b0-ab09-65187353bb4b","cwd":"WORKSPACE","name":"Implementation SYS-50: bound","model":"gpt-terra","ephemeral":false,"gitInfo":{"sha":"3d3ee035725b0728f041d8d10fc29f5c8adc42c0","originUrl":"https://github.com/moonshotbro/sysmiq-symphony.git"}}}}' | sed "s|WORKSPACE|$PWD|"
+            else
+              printf '%s\\n' '{"id":4,"result":{"thread":{"id":"bound-thread","sessionId":"bound-session","projectId":"01a04aab-c77c-79b0-ab09-65187353bb4b","cwd":"WORKSPACE","name":"Implementation SYS-50: bound","model":"gpt-luna","modelProvider":"sysmiq-azure-foundry","ephemeral":false,"gitInfo":{"sha":"3d3ee035725b0728f041d8d10fc29f5c8adc42c0","originUrl":"https://github.com/moonshotbro/sysmiq-symphony.git"}}}}' | sed "s|WORKSPACE|$PWD|"
+            fi ;;
+          6) printf '%s\\n' '{"id":5,"result":{"data":[]}}' ;;
+        esac
+      done
+      """)
+
+      File.chmod!(binary, 0o755)
+      assert {:ok, contract} = project_wire_contract(workspace)
+
+      for {mode, reason} <- [
+            {"missing-provider", :thread_model_provider_mismatch},
+            {"mismatched-deployment", :thread_model_mismatch}
+          ] do
+        write_workflow_file!(Workflow.workflow_file_path(),
+          workspace_root: Path.join(root, "workspaces"),
+          codex_command: "#{binary} app-server #{mode}"
+        )
+
+        assert {:error, {:project_bound_thread_unverified, %{verification_reason: ^reason}}} =
+                 AppServer.start_session(workspace, task_contract: contract)
+      end
     after
       File.rm_rf(root)
     end
@@ -1711,7 +1841,7 @@ defmodule SymphonyElixir.AppServerTest do
       File.chmod!(binary, 0o755)
       write_workflow_file!(Workflow.workflow_file_path(), workspace_root: Path.join(root, "workspaces"), codex_command: "#{binary} app-server")
 
-      contract = %SymphonyElixir.Codex.TaskLaunchContract{
+      contract = %TaskLaunchContract{
         title: "Implementation SYS-50: bound",
         executing_identity: %{model: :"gpt-5.6-terra", effort: :medium, role: :implementation, title: "Implementation SYS-50: bound"},
         project: %{native_project_id: "01a04aab-c77c-79b0-ab09-65187353bb4b"}
@@ -1996,7 +2126,7 @@ defmodule SymphonyElixir.AppServerTest do
       File.chmod!(binary, 0o755)
       write_workflow_file!(Workflow.workflow_file_path(), workspace_root: Path.join(root, "workspaces"), codex_command: "#{binary} app-server")
 
-      contract = %SymphonyElixir.Codex.TaskLaunchContract{
+      contract = %TaskLaunchContract{
         title: "Implementation SYS-50: bound",
         executing_identity: %{model: :"gpt-5.6-terra", effort: :medium, role: :implementation, title: "Implementation SYS-50: bound"},
         project: %{native_project_id: "01a04aab-c77c-79b0-ab09-65187353bb4b"}
@@ -2010,6 +2140,43 @@ defmodule SymphonyElixir.AppServerTest do
     after
       File.rm_rf(root)
     end
+  end
+
+  defp project_wire_contract(workspace) do
+    TaskLaunchContract.compile(%{
+      programme: "build-toscanini",
+      repository: "moonshotbro/sysmiq-symphony",
+      issue_or_pr: "SYS-50",
+      role: :implementation,
+      task: "bound",
+      attempt: 0,
+      fence: "lease-50-1",
+      exact_revision: "3d3ee035725b0728f041d8d10fc29f5c8adc42c0",
+      write_boundary: :product,
+      evidence: ["issue-50"],
+      model: :"gpt-5.6-terra",
+      model_provider: :"sysmiq-azure-foundry",
+      model_deployment: "gpt-terra",
+      provider_allocation_digest: String.duplicate("d", 64),
+      effort: :medium,
+      trigger: :integration_design,
+      goal_policy: :worker,
+      dependencies: [],
+      permissions: ["workspace-write"],
+      evidence_gates: ["tests"],
+      stall_policy: :fail_closed,
+      closeout_policy: :reconcile,
+      idempotency_identity: "issue-50/implementation/sha",
+      conflict_identity: "moonshotbro/sysmiq-symphony:SYS-50:implementation",
+      commissioning_identity: %{kind: "human", authority: "programme"},
+      project: %{
+        saved_project_id: "b12752f9-9a65-4194-bc49-77808b21d767",
+        native_project_id: "01a04aab-c77c-79b0-ab09-65187353bb4b",
+        programme: "build-toscanini",
+        repository: "moonshotbro/sysmiq-symphony",
+        root: workspace
+      }
+    })
   end
 
   defp assert_read_id_mismatch_hold do
@@ -2040,7 +2207,7 @@ defmodule SymphonyElixir.AppServerTest do
       File.chmod!(binary, 0o755)
       write_workflow_file!(Workflow.workflow_file_path(), workspace_root: Path.join(root, "workspaces"), codex_command: "#{binary} app-server")
 
-      contract = %SymphonyElixir.Codex.TaskLaunchContract{
+      contract = %TaskLaunchContract{
         title: "Implementation SYS-50: bound",
         executing_identity: %{model: :"gpt-5.6-terra", effort: :medium, role: :implementation, title: "Implementation SYS-50: bound"},
         project: %{native_project_id: "01a04aab-c77c-79b0-ab09-65187353bb4b"}

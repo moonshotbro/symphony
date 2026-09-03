@@ -126,7 +126,7 @@ defmodule SymphonyElixir.Codex.TaskLaunchContractTest do
     assert {:error, errors} = TaskLaunchContract.compile(Map.merge(valid_attrs(), %{model: :"gpt-5.6-terra", trigger: :integration_design}))
     assert :escalation_link_required in errors
 
-    assert {:ok, terra} = TaskLaunchContract.compile(Map.merge(valid_attrs(), %{model: :"gpt-5.6-terra", trigger: :integration_design, escalation: link}))
+    assert {:ok, terra} = TaskLaunchContract.compile(Map.merge(valid_attrs(), %{model: :"gpt-5.6-terra", model_deployment: "gpt-terra", trigger: :integration_design, escalation: link}))
     assert terra.executing_identity.model == :"gpt-5.6-terra"
     assert terra.executing_identity.contract_id == terra.contract_id
 
@@ -155,6 +155,43 @@ defmodule SymphonyElixir.Codex.TaskLaunchContractTest do
 
     assert {:error, errors} = TaskLaunchContract.compile(%{valid_attrs() | exact_revision: String.duplicate("a", 39)})
     assert :invalid_exact_revision in errors
+  end
+
+  test "binds the Foundry allocation immutably and fails closed for another route" do
+    assert {:ok, contract} = TaskLaunchContract.compile(valid_attrs())
+    assert contract.executing_identity.model_provider == :"sysmiq-azure-foundry"
+    assert contract.executing_identity.provider_allocation_digest == String.duplicate("d", 64)
+
+    assert {:error, errors} = TaskLaunchContract.compile(%{valid_attrs() | model_provider: "codex_subscription"})
+    assert {:unsupported_model_provider, nil} in errors
+
+    assert {:error, errors} = TaskLaunchContract.compile(%{valid_attrs() | provider_allocation_digest: "unpriced"})
+    assert :invalid_provider_allocation_digest in errors
+
+    assert {:ok, changed} =
+             TaskLaunchContract.compile(%{valid_attrs() | provider_allocation_digest: String.duplicate("e", 64)})
+
+    refute changed.contract_id == contract.contract_id
+  end
+
+  test "uses the immutable Foundry deployment route for every supported model" do
+    for {model, deployment} <- [
+          {:"gpt-5.6-luna", "gpt-luna"},
+          {:"gpt-5.6-terra", "gpt-terra"},
+          {:"gpt-5.6-sol", "gpt"}
+        ] do
+      assert TaskLaunchContract.deployment_for_model(model) == deployment
+    end
+
+    assert {:ok, contract} = TaskLaunchContract.compile(valid_attrs())
+    assert contract.executing_identity.model_deployment == "gpt-luna"
+
+    assert {:error, errors} = TaskLaunchContract.compile(Map.delete(valid_attrs(), :model_deployment))
+    assert {:missing, :model_deployment} in errors
+    assert {:error, errors} = TaskLaunchContract.compile(%{valid_attrs() | model_deployment: "gpt-terra"})
+    assert :model_deployment_mismatch in errors
+    assert {:error, errors} = TaskLaunchContract.compile(%{valid_attrs() | model: :"gpt-5.6-sol", model_deployment: "gpt-luna"})
+    assert :model_deployment_mismatch in errors
   end
 
   test "enforces role and goal policy boundaries" do
@@ -240,6 +277,7 @@ defmodule SymphonyElixir.Codex.TaskLaunchContractTest do
              TaskLaunchContract.compile(
                Map.merge(valid_attrs(), %{
                  model: :"gpt-5.6-terra",
+                 model_deployment: "gpt-terra",
                  trigger: :scope_discovery,
                  commissioning_identity: %{kind: "human", authority: "programme"}
                })
@@ -276,6 +314,9 @@ defmodule SymphonyElixir.Codex.TaskLaunchContractTest do
       write_boundary: :product,
       evidence: ["issue-50"],
       model: :"gpt-5.6-luna",
+      model_provider: :"sysmiq-azure-foundry",
+      model_deployment: "gpt-luna",
+      provider_allocation_digest: String.duplicate("d", 64),
       effort: :medium,
       goal_policy: :worker,
       dependencies: [],

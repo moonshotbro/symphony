@@ -256,6 +256,10 @@ defmodule SymphonyElixir.Config.Schema do
       )
 
       field(:thread_sandbox, :string, default: "workspace-write")
+      field(:model_provider, :string)
+      field(:model_deployments, :map, default: %{"gpt-5.6-luna" => "gpt-luna", "gpt-5.6-terra" => "gpt-terra", "gpt-5.6-sol" => "gpt"})
+      field(:model_deployment, :string)
+      field(:provider_allocation_digest, :string)
       field(:turn_sandbox_policy, :map)
       field(:turn_timeout_ms, :integer, default: 3_600_000)
       field(:read_timeout_ms, :integer, default: 5_000)
@@ -273,6 +277,10 @@ defmodule SymphonyElixir.Config.Schema do
           :command,
           :approval_policy,
           :thread_sandbox,
+          :model_provider,
+          :model_deployments,
+          :model_deployment,
+          :provider_allocation_digest,
           :turn_sandbox_policy,
           :turn_timeout_ms,
           :read_timeout_ms,
@@ -282,6 +290,7 @@ defmodule SymphonyElixir.Config.Schema do
         empty_values: []
       )
       |> validate_required([:command])
+      |> validate_provider_allocation()
       |> validate_change(:command, fn :command, command ->
         if command != "" and String.trim(command) == "" do
           [command: "can't be blank"]
@@ -295,6 +304,28 @@ defmodule SymphonyElixir.Config.Schema do
       |> update_change(:stall_timeout_ms_by_role, &Schema.normalize_stall_timeout_limits/1)
       |> Schema.validate_stall_timeout_limits(:stall_timeout_ms_by_role)
       |> cast_embed(:project_binding, with: &ProjectBinding.changeset/2)
+    end
+
+    defp validate_provider_allocation(changeset) do
+      provider = get_field(changeset, :model_provider)
+      digest = get_field(changeset, :provider_allocation_digest)
+
+      cond do
+        is_nil(provider) and is_nil(digest) ->
+          changeset
+
+        provider != "sysmiq-azure-foundry" ->
+          add_error(changeset, :model_provider, "must be sysmiq-azure-foundry")
+
+        get_field(changeset, :model_deployment) not in ["gpt", "gpt-terra", "gpt-luna"] ->
+          add_error(changeset, :model_deployment, "must be one of gpt, gpt-terra, or gpt-luna")
+
+        is_binary(digest) and Regex.match?(~r/^[0-9a-f]{64}$/, digest) ->
+          changeset
+
+        true ->
+          add_error(changeset, :provider_allocation_digest, "must be a SHA-256 digest")
+      end
     end
   end
 
