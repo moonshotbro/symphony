@@ -182,7 +182,7 @@ defmodule SymphonyElixir.Codex.AppServer do
           metadata
         )
 
-        case await_turn_completion(port, thread_id, turn_id, owner, on_message, tool_executor, auto_approve_requests) do
+        case await_turn_completion(port, thread_id, turn_id, owner, on_message, tool_executor, auto_approve_requests, metadata) do
           {:ok, result} ->
             Logger.info("Codex session completed for #{issue_context(issue)} session_id=#{session_id}")
 
@@ -877,7 +877,7 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   defp thread_not_loaded_error?(_error, _thread_id), do: false
 
-  defp await_turn_completion(port, thread_id, turn_id, owner, on_message, tool_executor, auto_approve_requests) do
+  defp await_turn_completion(port, thread_id, turn_id, owner, on_message, tool_executor, auto_approve_requests, metadata) do
     receive_loop(
       port,
       thread_id,
@@ -888,13 +888,14 @@ defmodule SymphonyElixir.Codex.AppServer do
       "",
       tool_executor,
       auto_approve_requests,
-      false
+      false,
+      metadata
     )
   end
 
   # The protocol loop keeps transport state explicit so recursive transitions cannot lose a field.
   # credo:disable-for-next-line Credo.Check.Refactor.FunctionArity
-  defp receive_loop(port, thread_id, turn_id, owner, on_message, timeout_ms, pending_line, tool_executor, auto_approve_requests, steer_used) do
+  defp receive_loop(port, thread_id, turn_id, owner, on_message, timeout_ms, pending_line, tool_executor, auto_approve_requests, steer_used, metadata) do
     receive do
       {:symphony_steer, caller, ref, input} when is_pid(caller) and is_reference(ref) ->
         result =
@@ -916,7 +917,8 @@ defmodule SymphonyElixir.Codex.AppServer do
           pending_line,
           tool_executor,
           auto_approve_requests,
-          true
+          true,
+          metadata
         )
 
       {^port, {:data, {:eol, chunk}}} ->
@@ -932,7 +934,8 @@ defmodule SymphonyElixir.Codex.AppServer do
           timeout_ms,
           tool_executor,
           auto_approve_requests,
-          steer_used
+          steer_used,
+          metadata
         )
 
       {^port, {:data, {:noeol, chunk}}} ->
@@ -946,7 +949,8 @@ defmodule SymphonyElixir.Codex.AppServer do
           pending_line <> to_string(chunk),
           tool_executor,
           auto_approve_requests,
-          steer_used
+          steer_used,
+          metadata
         )
 
       {^port, {:exit_status, status}} ->
@@ -958,12 +962,12 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   # credo:disable-for-next-line Credo.Check.Refactor.FunctionArity
-  defp handle_incoming(port, thread_id, turn_id, owner, on_message, data, timeout_ms, tool_executor, auto_approve_requests, steer_used) do
+  defp handle_incoming(port, thread_id, turn_id, owner, on_message, data, timeout_ms, tool_executor, auto_approve_requests, steer_used, metadata) do
     payload_string = to_string(data)
 
     case Jason.decode(payload_string) do
       {:ok, %{"method" => "turn/completed"} = payload} ->
-        emit_turn_event(on_message, :turn_completed, payload, payload_string, port, payload)
+        emit_turn_event(on_message, :turn_completed, payload, payload_string, port, payload, metadata)
         {:ok, :turn_completed}
 
       {:ok, %{"method" => "turn/failed", "params" => _} = payload} ->
@@ -973,7 +977,8 @@ defmodule SymphonyElixir.Codex.AppServer do
           payload,
           payload_string,
           port,
-          Map.get(payload, "params")
+          Map.get(payload, "params"),
+          metadata
         )
 
         {:error, {:turn_failed, Map.get(payload, "params")}}
@@ -985,7 +990,8 @@ defmodule SymphonyElixir.Codex.AppServer do
           payload,
           payload_string,
           port,
-          Map.get(payload, "params")
+          Map.get(payload, "params"),
+          metadata
         )
 
         {:error, {:turn_cancelled, Map.get(payload, "params")}}
@@ -1004,7 +1010,8 @@ defmodule SymphonyElixir.Codex.AppServer do
           timeout_ms,
           tool_executor,
           auto_approve_requests,
-          steer_used
+          steer_used,
+          metadata
         )
 
       {:ok, payload} ->
@@ -1015,7 +1022,7 @@ defmodule SymphonyElixir.Codex.AppServer do
             payload: payload,
             raw: payload_string
           },
-          metadata_from_message(port, payload)
+          metadata_from_message(port, payload, metadata)
         )
 
         receive_loop(
@@ -1028,7 +1035,8 @@ defmodule SymphonyElixir.Codex.AppServer do
           "",
           tool_executor,
           auto_approve_requests,
-          steer_used
+          steer_used,
+          metadata
         )
 
       {:error, _reason} ->
@@ -1042,7 +1050,7 @@ defmodule SymphonyElixir.Codex.AppServer do
               payload: payload_string,
               raw: payload_string
             },
-            metadata_from_message(port, %{raw: payload_string})
+            metadata_from_message(port, %{raw: payload_string}, metadata)
           )
         end
 
@@ -1056,12 +1064,13 @@ defmodule SymphonyElixir.Codex.AppServer do
           "",
           tool_executor,
           auto_approve_requests,
-          steer_used
+          steer_used,
+          metadata
         )
     end
   end
 
-  defp emit_turn_event(on_message, event, payload, payload_string, port, payload_details) do
+  defp emit_turn_event(on_message, event, payload, payload_string, port, payload_details, metadata) do
     emit_message(
       on_message,
       event,
@@ -1070,7 +1079,7 @@ defmodule SymphonyElixir.Codex.AppServer do
         raw: payload_string,
         details: payload_details
       },
-      metadata_from_message(port, payload)
+      metadata_from_message(port, payload, metadata)
     )
   end
 
@@ -1087,9 +1096,10 @@ defmodule SymphonyElixir.Codex.AppServer do
          timeout_ms,
          tool_executor,
          auto_approve_requests,
-         steer_used
+         steer_used,
+         session_metadata
        ) do
-    metadata = metadata_from_message(port, payload)
+    metadata = metadata_from_message(port, payload, session_metadata)
 
     case maybe_handle_approval_request(
            port,
@@ -1122,7 +1132,8 @@ defmodule SymphonyElixir.Codex.AppServer do
           "",
           tool_executor,
           auto_approve_requests,
-          steer_used
+          steer_used,
+          session_metadata
         )
 
       :approval_required ->
@@ -1168,7 +1179,8 @@ defmodule SymphonyElixir.Codex.AppServer do
             "",
             tool_executor,
             auto_approve_requests,
-            steer_used
+            steer_used,
+            session_metadata
           )
         end
     end
@@ -1596,8 +1608,11 @@ defmodule SymphonyElixir.Codex.AppServer do
     on_message.(message)
   end
 
-  defp metadata_from_message(port, payload) do
-    port |> port_metadata(nil) |> maybe_set_usage(payload)
+  defp metadata_from_message(port, payload, session_metadata) do
+    port
+    |> port_metadata(nil)
+    |> Map.merge(session_metadata)
+    |> maybe_set_usage(payload)
   end
 
   defp maybe_set_usage(metadata, payload) when is_map(payload) do
