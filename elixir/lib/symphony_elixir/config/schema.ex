@@ -257,6 +257,8 @@ defmodule SymphonyElixir.Config.Schema do
 
       field(:thread_sandbox, :string, default: "workspace-write")
       field(:model_provider, :string)
+      field(:model_deployments, :map, default: %{"gpt-5.6-luna" => "gpt-luna", "gpt-5.6-terra" => "gpt-terra", "gpt-5.6-sol" => "gpt"})
+      field(:model_deployment, :string)
       field(:provider_allocation_digest, :string)
       field(:turn_sandbox_policy, :map)
       field(:turn_timeout_ms, :integer, default: 3_600_000)
@@ -276,6 +278,8 @@ defmodule SymphonyElixir.Config.Schema do
           :approval_policy,
           :thread_sandbox,
           :model_provider,
+          :model_deployments,
+          :model_deployment,
           :provider_allocation_digest,
           :turn_sandbox_policy,
           :turn_timeout_ms,
@@ -307,10 +311,20 @@ defmodule SymphonyElixir.Config.Schema do
       digest = get_field(changeset, :provider_allocation_digest)
 
       cond do
-        is_nil(provider) and is_nil(digest) -> changeset
-        provider != "foundry" -> add_error(changeset, :model_provider, "must be foundry")
-        is_binary(digest) and Regex.match?(~r/^[0-9a-f]{64}$/, digest) -> changeset
-        true -> add_error(changeset, :provider_allocation_digest, "must be a SHA-256 digest")
+        is_nil(provider) and is_nil(digest) ->
+          changeset
+
+        provider != "sysmiq-azure-foundry" ->
+          add_error(changeset, :model_provider, "must be sysmiq-azure-foundry")
+
+        get_field(changeset, :model_deployment) not in ["gpt", "gpt-terra", "gpt-luna"] ->
+          add_error(changeset, :model_deployment, "must be one of gpt, gpt-terra, or gpt-luna")
+
+        is_binary(digest) and Regex.match?(~r/^[0-9a-f]{64}$/, digest) ->
+          changeset
+
+        true ->
+          add_error(changeset, :provider_allocation_digest, "must be a SHA-256 digest")
       end
     end
   end

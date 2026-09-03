@@ -110,7 +110,9 @@ defmodule SymphonyElixir.TestSupport do
           codex_command: "codex app-server",
           codex_approval_policy: %{reject: %{sandbox_approval: true, rules: true, mcp_elicitations: true}},
           codex_thread_sandbox: "workspace-write",
-          codex_model_provider: "foundry",
+          codex_model_provider: "sysmiq-azure-foundry",
+          codex_model_deployments: %{"gpt-5.6-luna" => "gpt-luna", "gpt-5.6-terra" => "gpt-terra", "gpt-5.6-sol" => "gpt"},
+          codex_model_deployment: "gpt-luna",
           codex_provider_allocation_digest: String.duplicate("f", 64),
           codex_turn_sandbox_policy: nil,
           codex_turn_timeout_ms: 3_600_000,
@@ -155,6 +157,8 @@ defmodule SymphonyElixir.TestSupport do
     codex_approval_policy = Keyword.get(config, :codex_approval_policy)
     codex_thread_sandbox = Keyword.get(config, :codex_thread_sandbox)
     codex_model_provider = Keyword.get(config, :codex_model_provider)
+    codex_model_deployment = Keyword.get(config, :codex_model_deployment)
+    codex_model_deployments = Keyword.get(config, :codex_model_deployments)
     codex_provider_allocation_digest = Keyword.get(config, :codex_provider_allocation_digest)
     codex_turn_sandbox_policy = Keyword.get(config, :codex_turn_sandbox_policy)
     codex_turn_timeout_ms = Keyword.get(config, :codex_turn_timeout_ms)
@@ -203,6 +207,8 @@ defmodule SymphonyElixir.TestSupport do
         "  approval_policy: #{yaml_value(codex_approval_policy)}",
         "  thread_sandbox: #{yaml_value(codex_thread_sandbox)}",
         "  model_provider: #{yaml_value(codex_model_provider)}",
+        "  model_deployment: #{yaml_value(codex_model_deployment)}",
+        "  model_deployments: #{yaml_value(codex_model_deployments)}",
         "  provider_allocation_digest: #{yaml_value(codex_provider_allocation_digest)}",
         "  turn_sandbox_policy: #{yaml_value(codex_turn_sandbox_policy)}",
         "  turn_timeout_ms: #{yaml_value(codex_turn_timeout_ms)}",

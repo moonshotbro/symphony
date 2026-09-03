@@ -1659,11 +1659,11 @@ defmodule SymphonyElixir.AppServerTest do
           2) ;;
           3)
             case "$line" in *'"projectId":"01a04aab-c77c-79b0-ab09-65187353bb4b"'*) ;; *) exit 9;; esac
-            case "$line" in *'"model":"gpt-5.6-terra"'*) ;; *) exit 11;; esac
-            case "$line" in *'"modelProvider":"foundry"'*) ;; *) exit 13;; esac
+            case "$line" in *'"model":"gpt-terra"'*) ;; *) exit 11;; esac
+            case "$line" in *'"modelProvider":"sysmiq-azure-foundry"'*) ;; *) exit 13;; esac
             case "$line" in *'"model_reasoning_effort":"medium"'*) ;; *) exit 12;; esac
             case "$line" in *'"effort"'*) exit 10;; esac
-            printf '%s\\n' '{"id":2,"result":{"model":"gpt-5.6-terra","reasoningEffort":"medium","instructionSources":["project"],"thread":{"id":"bound-thread","sessionId":"bound-session","projectId":"01a04aab-c77c-79b0-ab09-65187353bb4b","cwd":"WORKSPACE","ephemeral":false}}}' | sed "s|WORKSPACE|$PWD|" ;;
+            printf '%s\\n' '{"id":2,"result":{"model":"gpt-terra","reasoningEffort":"medium","instructionSources":["project"],"thread":{"id":"bound-thread","sessionId":"bound-session","projectId":"01a04aab-c77c-79b0-ab09-65187353bb4b","cwd":"WORKSPACE","ephemeral":false}}}' | sed "s|WORKSPACE|$PWD|" ;;
           4) printf '%s\\n' '{"id":6,"result":{}}' ;;
           5) printf '%s\\n' '{"id":4,"result":{"thread":{"id":"bound-thread","sessionId":"bound-session","projectId":"01a04aab-c77c-79b0-ab09-65187353bb4b","cwd":"WORKSPACE","name":"Implementation SYS-50: bound","ephemeral":false}}}' | sed "s|WORKSPACE|$PWD|" ;;
           6) printf '%s\\n' '{"id":5,"result":{"data":[]}}' ;;
@@ -1688,7 +1688,8 @@ defmodule SymphonyElixir.AppServerTest do
                  write_boundary: :product,
                  evidence: ["issue-50"],
                  model: :"gpt-5.6-terra",
-                 model_provider: :foundry,
+                 model_provider: :"sysmiq-azure-foundry",
+                 model_deployment: "gpt-terra",
                  provider_allocation_digest: String.duplicate("d", 64),
                  effort: :medium,
                  trigger: :integration_design,

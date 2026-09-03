@@ -53,7 +53,9 @@ defmodule SymphonyElixir.Codex.AppServer do
     with {:ok, contract} <- validate_launch_contract(Keyword.get(opts, :task_contract), workspace),
          {:ok, expanded_workspace} <- validate_workspace_cwd(workspace, worker_host),
          {:ok, port} <- start_port(expanded_workspace, worker_host, dynamic_tool_binding) do
-      metadata = port_metadata(port, worker_host)
+      metadata =
+        port_metadata(port, worker_host)
+        |> Map.merge(contract_attribution(contract))
 
       with {:ok, session_policies} <- session_policies(expanded_workspace, worker_host),
            {:ok, thread_id} <-
@@ -490,6 +492,19 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
+  defp contract_attribution(nil), do: %{}
+
+  defp contract_attribution(contract) do
+    identity = contract.executing_identity
+
+    %{
+      model: Atom.to_string(identity.model),
+      model_provider: Atom.to_string(identity.model_provider),
+      model_deployment: identity.model_deployment,
+      provider_allocation_digest: identity.provider_allocation_digest
+    }
+  end
+
   defp send_initialize(port) do
     payload = %{
       "method" => "initialize",
@@ -592,7 +607,7 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   defp executing_params(contract) do
     %{
-      "model" => Atom.to_string(contract.executing_identity.model),
+      "model" => contract.executing_identity.model_deployment,
       "modelProvider" => Atom.to_string(contract.executing_identity.model_provider),
       "config" => %{"model_reasoning_effort" => Atom.to_string(contract.executing_identity.effort)},
       "projectId" => contract.project.native_project_id
@@ -641,7 +656,7 @@ defmodule SymphonyElixir.Codex.AppServer do
   # credo:disable-for-next-line Credo.Check.Refactor.CyclomaticComplexity
   defp verify_start_response(thread, response, workspace, contract) do
     cond do
-      Map.get(response, "model") != Atom.to_string(contract.executing_identity.model) -> {:error, :start_model_mismatch}
+      Map.get(response, "model") != contract.executing_identity.model_deployment -> {:error, :start_model_mismatch}
       Map.get(response, "modelProvider") != Atom.to_string(contract.executing_identity.model_provider) -> {:error, :start_model_provider_mismatch}
       Map.get(response, "reasoningEffort") != Atom.to_string(contract.executing_identity.effort) -> {:error, :start_effort_mismatch}
       not instruction_sources?(response) -> {:error, :instruction_sources_missing}
@@ -663,6 +678,7 @@ defmodule SymphonyElixir.Codex.AppServer do
     cond do
       cwd != workspace -> {:error, :cwd_mismatch}
       Map.get(thread, "projectId") != contract.project.native_project_id -> {:error, :native_project_mismatch}
+      Map.get(thread, "model") != contract.executing_identity.model_deployment -> {:error, :thread_model_mismatch}
       Map.get(thread, "modelProvider") != Atom.to_string(contract.executing_identity.model_provider) -> {:error, :thread_model_provider_mismatch}
       Map.get(thread, "ephemeral") != false -> {:error, :thread_persistence_unverified}
       not valid_session_id?(Map.get(thread, "sessionId")) -> {:error, :session_id_missing}
@@ -704,7 +720,16 @@ defmodule SymphonyElixir.Codex.AppServer do
       "sandboxPolicy" => turn_sandbox_policy
     }
 
-    params = if contract, do: Map.merge(params, %{"model" => Atom.to_string(contract.executing_identity.model), "effort" => Atom.to_string(contract.executing_identity.effort)}), else: params
+    params =
+      if contract do
+        Map.merge(params, %{
+          "model" => contract.executing_identity.model_deployment,
+          "modelProvider" => Atom.to_string(contract.executing_identity.model_provider),
+          "effort" => Atom.to_string(contract.executing_identity.effort)
+        })
+      else
+        params
+      end
 
     send_message(port, %{
       "method" => "turn/start",
