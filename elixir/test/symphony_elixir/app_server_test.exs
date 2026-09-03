@@ -1660,6 +1660,7 @@ defmodule SymphonyElixir.AppServerTest do
           3)
             case "$line" in *'"projectId":"01a04aab-c77c-79b0-ab09-65187353bb4b"'*) ;; *) exit 9;; esac
             case "$line" in *'"model":"gpt-5.6-terra"'*) ;; *) exit 11;; esac
+            case "$line" in *'"modelProvider":"foundry"'*) ;; *) exit 13;; esac
             case "$line" in *'"model_reasoning_effort":"medium"'*) ;; *) exit 12;; esac
             case "$line" in *'"effort"'*) exit 10;; esac
             printf '%s\\n' '{"id":2,"result":{"model":"gpt-5.6-terra","reasoningEffort":"medium","instructionSources":["project"],"thread":{"id":"bound-thread","sessionId":"bound-session","projectId":"01a04aab-c77c-79b0-ab09-65187353bb4b","cwd":"WORKSPACE","ephemeral":false}}}' | sed "s|WORKSPACE|$PWD|" ;;
@@ -1674,14 +1675,45 @@ defmodule SymphonyElixir.AppServerTest do
       File.chmod!(binary, 0o755)
       write_workflow_file!(Workflow.workflow_file_path(), workspace_root: Path.join(root, "workspaces"), codex_command: "#{binary} app-server")
 
-      contract = %SymphonyElixir.Codex.TaskLaunchContract{
-        title: "Implementation SYS-50: bound",
-        executing_identity: %{model: :"gpt-5.6-terra", effort: :medium, role: :implementation, title: "Implementation SYS-50: bound"},
-        project: %{native_project_id: "01a04aab-c77c-79b0-ab09-65187353bb4b"}
-      }
+      assert {:ok, contract} =
+               SymphonyElixir.Codex.TaskLaunchContract.compile(%{
+                 programme: "build-toscanini",
+                 repository: "moonshotbro/sysmiq-symphony",
+                 issue_or_pr: "SYS-50",
+                 role: :implementation,
+                 task: "bound",
+                 attempt: 0,
+                 fence: "lease-50-1",
+                 exact_revision: "3d3ee035725b0728f041d8d10fc29f5c8adc42c0",
+                 write_boundary: :product,
+                 evidence: ["issue-50"],
+                 model: :"gpt-5.6-terra",
+                 model_provider: :foundry,
+                 provider_allocation_digest: String.duplicate("d", 64),
+                 effort: :medium,
+                 trigger: :integration_design,
+                 goal_policy: :worker,
+                 dependencies: [],
+                 permissions: ["workspace-write"],
+                 evidence_gates: ["tests"],
+                 stall_policy: :fail_closed,
+                 closeout_policy: :reconcile,
+                 idempotency_identity: "issue-50/implementation/sha",
+                 conflict_identity: "moonshotbro/sysmiq-symphony:SYS-50:implementation",
+                 commissioning_identity: %{kind: "human", authority: "programme"},
+                 project: %{
+                   saved_project_id: "b12752f9-9a65-4194-bc49-77808b21d767",
+                   native_project_id: "01a04aab-c77c-79b0-ab09-65187353bb4b",
+                   programme: "build-toscanini",
+                   repository: "moonshotbro/sysmiq-symphony",
+                   root: workspace
+                 }
+               })
 
       issue = %Issue{id: "sys-50", identifier: "SYS-50", title: "bound", state: "In Progress"}
-      assert {:error, :invalid_task_launch_contract} = AppServer.run(workspace, "bound", issue, task_contract: contract)
+
+      assert {:error, {:project_bound_thread_unverified, %{verification_reason: :start_model_provider_mismatch}}} =
+               AppServer.run(workspace, "bound", issue, task_contract: contract)
     after
       File.rm_rf(root)
     end

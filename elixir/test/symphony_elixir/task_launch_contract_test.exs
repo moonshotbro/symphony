@@ -157,6 +157,23 @@ defmodule SymphonyElixir.Codex.TaskLaunchContractTest do
     assert :invalid_exact_revision in errors
   end
 
+  test "binds the Foundry allocation immutably and fails closed for another route" do
+    assert {:ok, contract} = TaskLaunchContract.compile(valid_attrs())
+    assert contract.executing_identity.model_provider == :foundry
+    assert contract.executing_identity.provider_allocation_digest == String.duplicate("d", 64)
+
+    assert {:error, errors} = TaskLaunchContract.compile(%{valid_attrs() | model_provider: "codex_subscription"})
+    assert {:unsupported_model_provider, nil} in errors
+
+    assert {:error, errors} = TaskLaunchContract.compile(%{valid_attrs() | provider_allocation_digest: "unpriced"})
+    assert :invalid_provider_allocation_digest in errors
+
+    assert {:ok, changed} =
+             TaskLaunchContract.compile(%{valid_attrs() | provider_allocation_digest: String.duplicate("e", 64)})
+
+    refute changed.contract_id == contract.contract_id
+  end
+
   test "enforces role and goal policy boundaries" do
     assert {:error, errors} = TaskLaunchContract.compile(%{valid_attrs() | role: :landing, goal_policy: :worker})
     assert :role_requires_no_goal in errors
@@ -276,6 +293,8 @@ defmodule SymphonyElixir.Codex.TaskLaunchContractTest do
       write_boundary: :product,
       evidence: ["issue-50"],
       model: :"gpt-5.6-luna",
+      model_provider: :foundry,
+      provider_allocation_digest: String.duplicate("d", 64),
       effort: :medium,
       goal_policy: :worker,
       dependencies: [],

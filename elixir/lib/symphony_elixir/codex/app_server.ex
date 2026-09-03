@@ -593,6 +593,7 @@ defmodule SymphonyElixir.Codex.AppServer do
   defp executing_params(contract) do
     %{
       "model" => Atom.to_string(contract.executing_identity.model),
+      "modelProvider" => Atom.to_string(contract.executing_identity.model_provider),
       "config" => %{"model_reasoning_effort" => Atom.to_string(contract.executing_identity.effort)},
       "projectId" => contract.project.native_project_id
     }
@@ -641,6 +642,7 @@ defmodule SymphonyElixir.Codex.AppServer do
   defp verify_start_response(thread, response, workspace, contract) do
     cond do
       Map.get(response, "model") != Atom.to_string(contract.executing_identity.model) -> {:error, :start_model_mismatch}
+      Map.get(response, "modelProvider") != Atom.to_string(contract.executing_identity.model_provider) -> {:error, :start_model_provider_mismatch}
       Map.get(response, "reasoningEffort") != Atom.to_string(contract.executing_identity.effort) -> {:error, :start_effort_mismatch}
       not instruction_sources?(response) -> {:error, :instruction_sources_missing}
       true -> verify_thread_authority(thread, workspace, nil, contract, false)
@@ -661,6 +663,7 @@ defmodule SymphonyElixir.Codex.AppServer do
     cond do
       cwd != workspace -> {:error, :cwd_mismatch}
       Map.get(thread, "projectId") != contract.project.native_project_id -> {:error, :native_project_mismatch}
+      Map.get(thread, "modelProvider") != Atom.to_string(contract.executing_identity.model_provider) -> {:error, :thread_model_provider_mismatch}
       Map.get(thread, "ephemeral") != false -> {:error, :thread_persistence_unverified}
       not valid_session_id?(Map.get(thread, "sessionId")) -> {:error, :session_id_missing}
       not exact_git_identity?(git_info, contract) -> {:error, :thread_revision_or_repository_mismatch}

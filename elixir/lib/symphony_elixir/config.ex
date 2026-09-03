@@ -23,6 +23,8 @@ defmodule SymphonyElixir.Config do
   @type codex_runtime_settings :: %{
           approval_policy: String.t() | map(),
           thread_sandbox: String.t(),
+          model_provider: String.t() | nil,
+          provider_allocation_digest: String.t() | nil,
           turn_sandbox_policy: map(),
           project_binding: map() | nil
         }
@@ -115,6 +117,8 @@ defmodule SymphonyElixir.Config do
          %{
            approval_policy: settings.codex.approval_policy,
            thread_sandbox: settings.codex.thread_sandbox,
+           model_provider: settings.codex.model_provider,
+           provider_allocation_digest: settings.codex.provider_allocation_digest,
            turn_sandbox_policy: turn_sandbox_policy,
            project_binding: settings.codex.project_binding
          }}
